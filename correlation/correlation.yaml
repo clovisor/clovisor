@@ -1,0 +1,16 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: correlation
+  labels:
+    app: correlation
+spec:
+  template:
+    metadata:
+      labels:
+        app: correlation
+        version: v1
+    spec:
+      containers:
+      - name: correlation
+        image: s3wong/correlation
