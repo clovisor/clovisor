@@ -897,8 +897,9 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
     table := bcc.NewTable(bpf_mod.TableId("skb_events"), bpf_mod)
 
     skb_rev_chan := make(chan []byte)
+    lost_chan := make(chan uint64)
 
-    perfMap, err := bcc.InitPerfMap(table, skb_rev_chan)
+    perfMap, err := bcc.InitPerfMap(table, skb_rev_chan, lost_chan)
     if err != nil {
         fmt.Println(err)
         return nil, err

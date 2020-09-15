@@ -8,6 +8,7 @@
 package main
 
 import (
+    "context"
     "fmt"
     "io/ioutil"
     "os"
@@ -15,7 +16,7 @@ import (
     "path/filepath"
     "syscall"
 
-    clovisor "./libclovisor"
+    clovisor "github.com/clovisor/clovisor/libclovisor"
 )
 
 var podMonitoringMap map[string]*clovisor.ClovisorBCC
@@ -36,6 +37,8 @@ func main() {
         fmt.Printf("\n")
     }
 
+    ctx := context.Background()
+
     clovisor.Monitor_proto_plugin_cfg()
 
     clovisor.ClovisorPhyInfSetup()
@@ -49,7 +52,7 @@ func main() {
     }
     fmt.Printf("Clovisor got k8s client succeed\n")
 
-    monitoring_info_map, err := clovisor_k8s_client.Get_monitoring_info(node_name)
+    monitoring_info_map, err := clovisor_k8s_client.Get_monitoring_info(ctx, node_name)
     if err != nil {
         fmt.Printf("Clovisor getting monitoring info failed: %v\n", err)
         return

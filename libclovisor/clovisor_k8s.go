@@ -9,6 +9,7 @@ package clovisor
 
 import (
     "bytes"
+    "context"
     "errors"
     "fmt"
     "strconv"
@@ -60,8 +61,7 @@ func K8s_client_init(nodeName string) (*ClovisorK8s, error) {
     }, nil
 }
 
-func (client *ClovisorK8s) Get_monitoring_info(nodeName string) (map[string]*monitoring_info_t,
-                                               error) {
+func (client *ClovisorK8s) Get_monitoring_info(ctx context.Context, nodeName string) (map[string]*monitoring_info_t, error) {
 
     labels_list, err := get_cfg_labels(nodeName)
     if err != nil {
@@ -69,7 +69,7 @@ func (client *ClovisorK8s) Get_monitoring_info(nodeName string) (map[string]*mon
         return nil, err
     }
 
-    mon_info_map := client.get_monitoring_pods(nodeName, labels_list)
+    mon_info_map := client.get_monitoring_pods(ctx, nodeName, labels_list)
     if mon_info_map == nil {
         return nil, errors.New("monitoring info empty")
     }
@@ -77,17 +77,17 @@ func (client *ClovisorK8s) Get_monitoring_info(nodeName string) (map[string]*mon
     return mon_info_map, nil
 }
 
-func (client *ClovisorK8s) getPodsForSvc(svc *core_v1.Service,
+func (client *ClovisorK8s) getPodsForSvc(ctx context.Context, svc *core_v1.Service,
                                          namespace string) (*core_v1.PodList, error) {
     set := labels.Set(svc.Spec.Selector)
     //label := strings.Split(set.AsSelector().String(), ",")[0]
     //fmt.Printf("Trying to get pods for service %v with label %v from %v\n", svc.GetName(), label, set.AsSelector().String())
     listOptions := metav1.ListOptions{LabelSelector: set.AsSelector().String()}
     //listOptions := metav1.ListOptions{LabelSelector: label}
-    return client.client.CoreV1().Pods(namespace).List(listOptions)
+    return client.client.CoreV1().Pods(namespace).List(ctx, listOptions)
 }
 
-func (client *ClovisorK8s) get_monitoring_pods(nodeName string,
+func (client *ClovisorK8s) get_monitoring_pods(ctx context.Context, nodeName string,
                                                labels_list []string) (map[string]*monitoring_info_t) {
     /*
      * Three cases:
@@ -103,7 +103,7 @@ func (client *ClovisorK8s) get_monitoring_pods(nodeName string,
         //namespace = "linux-foundation-gke"
         namespace = "default"
         if svcs_list, err :=
-            client.client.CoreV1().Services(namespace).List(metav1.ListOptions{});
+            client.client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{});
                         err != nil {
             fmt.Printf("Error fetching service list for namespace %s\n",
                         namespace)
@@ -130,7 +130,7 @@ func (client *ClovisorK8s) get_monitoring_pods(nodeName string,
                 label_selector = fmt.Sprintf("%s=%s", key, value)
             }
             if svc_list, err :=
-                    client.client.CoreV1().Services(namespace).List(metav1.ListOptions{
+                    client.client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{
                         LabelSelector: label_selector,
                                 }); err != nil {
                 fmt.Printf("Error listing services with label %v:%v:%v - %v\n",
@@ -178,7 +178,7 @@ func (client *ClovisorK8s) get_monitoring_pods(nodeName string,
                     fmt.Printf("svc_port_map for service %v is %v\n", svc.GetName(), svc_port_map)
                 }
                 //fmt.Printf("Fetching pods for namespace %v service: %v\n", ns, svc.GetName())
-                pod_list, err := client.getPodsForSvc(&svc, ns)
+                pod_list, err := client.getPodsForSvc(ctx, &svc, ns)
                 if err != nil {
                     fmt.Print("Error fetching pods for %v:%v [%v]\n", ns, svc.GetName(), err)
                     continue
