@@ -10,14 +10,14 @@ kind: Pod
 metadata:
   labels:
     name: redis
-    redis-sentinel: "true"
-    role: master
   name: redis
   namespace: clovisor
 spec:
   containers:
     - name: redis
-      image: k8s.gcr.io/redis:v1
+      image: redis:5.0.4
+      command:
+        - redis-server
       env:
         - name: MASTER
           value: "true"
@@ -29,13 +29,6 @@ spec:
       volumeMounts:
         - mountPath: /redis-master-data
           name: data
-    - name: sentinel
-      image: kubernetes/redis:v1
-      env:
-        - name: SENTINEL
-          value: "true"
-      ports:
-        - containerPort: 26379
   volumes:
     - name: data
       emptyDir: {}

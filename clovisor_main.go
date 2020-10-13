@@ -10,10 +10,8 @@ package main
 import (
     "context"
     "fmt"
-    "io/ioutil"
     "os"
     "os/signal"
-    "path/filepath"
     "syscall"
 
     clovisor "github.com/clovisor/clovisor/libclovisor"
@@ -23,19 +21,6 @@ var podMonitoringMap map[string]*clovisor.ClovisorBCC
 
 func main() {
     node_name := os.Getenv("MY_NODE_NAME")
-
-    ex, err := os.Executable()
-    if err != nil {
-        fmt.Println(err.Error())
-    } else {
-        exPath := filepath.Dir(ex)
-        fmt.Printf("Current Working Directory is %v\n", exPath)
-        files, _ := ioutil.ReadDir(exPath)
-        for _, f := range files {
-            fmt.Printf("%v ",f.Name())
-        }
-        fmt.Printf("\n")
-    }
 
     ctx := context.Background()
 

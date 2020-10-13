@@ -20,7 +20,7 @@ import (
     "plugin"
     "strconv"
     "strings"
-    "time"
+    //"time"
 
     //"github.com/go-redis/redis"
     "github.com/google/gopacket"
@@ -907,14 +907,18 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
 
     stop := make(chan bool)
     go func() {
+        /*
         fmt.Printf("Start tracing to Jaeger with service %v\n", monitoring_info.svc_name)
         tracer, closer := initJaeger(monitoring_info.svc_name)
         tracerMap[monitoring_info.svc_name] = tracer
         ticker := time.NewTicker(500 * time.Millisecond)
+        */
         for {
             select {
+                /*
                 case <- ticker.C:
                     print_network_traces()
+                */
                 case data := <-skb_rev_chan:
                     err = handle_skb_event(&data, node_name, pod_name, session_table,
                                            monitoring_info, egress_match_list,
@@ -924,9 +928,9 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
                     }
                 case <- stop:
                     fmt.Printf("Receiving stop for pod %v\n", pod_name)
-                    ticker.Stop()
+                    //ticker.Stop()
                     perfMap.Stop()
-                    closer.Close()
+                    //closer.Close()
                     // TODO(s3wong): uncomment remove qdisc del once k8s watcher implemented
                     //netlink.QdiscDel(qdisc)
                     bpf_mod.Close()
