@@ -26,7 +26,7 @@ func main() {
 
     clovisor.Monitor_proto_plugin_cfg()
 
-    clovisor.ClovisorPhyInfSetup()
+    //clovisor.ClovisorPhyInfSetup()
 
     podMonitoringMap = make(map[string]*clovisor.ClovisorBCC)
 
@@ -52,6 +52,14 @@ func main() {
             continue
         }
         podMonitoringMap[pod] = podMon
+    }
+
+    // set up tracking on physical interfaces
+    intf_names, phy_bcc_list, err := clovisor.ClovisorPhyInfInit(node_name)
+    if err == nil {
+        for idx, intf := range intf_names {
+            podMonitoringMap[intf] = phy_bcc_list[idx]
+        }
     }
 
     sig := make(chan os.Signal, 1)

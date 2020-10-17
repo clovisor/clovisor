@@ -147,8 +147,12 @@ static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
     egress_match_t egress_match = {};
     policy_action_t *policy_ptr = NULL;
     app_proto_t ret = TCP;
+    unsigned short wildcard_port = 0;
 
     unsigned int *proto = dports2proto.lookup(&dest_port);
+    if (proto == NULL) {
+        proto = dports2proto.lookup(&wildcard_port);
+    }
     if (proto != NULL) {
         /*
         if (tcp_hdr->syn && !tcp_hdr->ack) {
@@ -170,6 +174,9 @@ static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
     } else {
         dest_port = htons(tcp_hdr->source);
         proto = dports2proto.lookup(&dest_port);
+        if (proto == NULL) {
+            proto = dports2proto.lookup(&wildcard_port);
+        }
         if (proto != NULL) {
             // clock response receiving time
             process_response(ntohl(ipv4_hdr->daddr),
@@ -211,8 +218,12 @@ static inline app_proto_t egress_tcp_parsing(struct tcphdr *tcp_hdr,
     app_proto_t ret = TCP;
     egress_match_t egress_match = {};
     policy_action_t *policy_ptr = NULL;
+    unsigned short wildcard_port = 0;
 
     unsigned int *proto = dports2proto.lookup(&src_port);
+    if (proto == NULL) {
+        proto = dports2proto.lookup(&wildcard_port);
+    }
 
     if (proto != NULL) {
         //if (tcp_hdr->fin || tcp_hdr->rst) {

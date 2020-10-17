@@ -63,8 +63,11 @@ type session_t struct {
 }
 
 type egress_match_t struct {
+//    src_ip      uint32
     dst_ip      uint32
+//    src_port    uint16
     dst_port    uint16
+//    flag        uint8
 }
 
 type egress_match_cfg struct {
@@ -264,11 +267,9 @@ func print_network_traces() {
 }
 
 func handle_skb_event(data *[]byte, node_name string, pod_name string,
-                      session_table *bcc.Table,
-                      monitoring_info *monitoring_info_t,
-                      egress_match_list []egress_match_t,
+                      session_table *bcc.Table, port_num uint16,
+                      protocols []string, egress_match_list []egress_match_t,
                       svc_name string) (error) {
-    //fmt.Printf("monitoring info has %v\n", monitoring_info)
     fmt.Printf("\n\nnode[%s] pod[%s]\n%s\n", node_name, pod_name, hex.Dump(*data))
     var ipproto layers.IPProtocol
     var src_ip, dst_ip uint32
@@ -320,7 +321,7 @@ func handle_skb_event(data *[]byte, node_name string, pod_name string,
             break
         }
     }
-    if dst_port == uint16(monitoring_info.port_num) || egress_port_req {
+    if dst_port == port_num || egress_port_req {
         is_req = true
     }
     if is_req {
@@ -397,7 +398,7 @@ func handle_skb_event(data *[]byte, node_name string, pod_name string,
         } else {
             dataptr = append(sess_map.respBuf, app_layer.Payload()...)
         }
-        for _, protocol := range monitoring_info.protocols {
+        for _, protocol := range protocols {
             if _, ok := protocolParser[protocol]; ok {
                 parser := protocolParser[protocol]
                 new_dataptr, parseMap := parser.Parse(session_key, is_req,
@@ -481,6 +482,7 @@ func handle_skb_event(data *[]byte, node_name string, pod_name string,
             }
             map_val["duration"] = fmt.Sprintf("%v usec", duration)
 
+            /*
             node, node_session, err := getNodeIntfSession(session_key)
             if err == nil {
                 map_val["node-interface"] = node
@@ -490,6 +492,7 @@ func handle_skb_event(data *[]byte, node_name string, pod_name string,
             } else {
                 fmt.Printf("Session not found in any node interface... posssibly local?")
             }
+            */
 
             if duration > 0 {
                 sess_map.done = true
@@ -542,7 +545,7 @@ func setEgressTable(egress_table *bcc.Table,
     return nil
 }
 
-var nodeintfFilterList = [...]string {"lo", "veth", "docker", "flannel"}
+var nodeintfFilterList = [...]string {"lo", "veth", "docker", "flannel", "cni"}
 
 func filterNodeIntf(intf string) bool {
     for _, substring := range nodeintfFilterList {
@@ -746,25 +749,12 @@ func delNodeIntfSession(node_iname string, key []byte) error {
     return err
 }
 
-func ClovisorNewPodInit(k8s_client *ClovisorK8s,
-                        node_name string,
-                        pod_name string,
-                        monitoring_info *monitoring_info_t) (*ClovisorBCC, error) {
-
-    output, err := k8s_client.exec_command(veth_ifidx_command, monitoring_info)
-    if err != nil {
-        return nil, err
-    }
-
-    ifindex , err := strconv.Atoi(output)
-    if err != nil {
-        fmt.Printf("Error converting %v to ifindex, error: %v\n", output, err.Error())
-        return nil, err
-    }
+func setupIntfBPF(ifindex int, name string, node_name string, svc_name string,
+                  port_num uint16, protocols []string) (*ClovisorBCC, error) {
 
     sessionMap = map[string]*session_info_t{};
 
-    fmt.Printf("Beginning network tracing for pod %v\n", pod_name)
+    fmt.Printf("Beginning network tracing for interface %v\n", name)
 
     buf, err := ioutil.ReadFile("libclovisor/ebpf/session_tracking.c")
     if err != nil {
@@ -796,14 +786,12 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
     fmt.Println("Loaded Egress func to structure")
 
     traffic_table := bcc.NewTable(bpf_mod.TableId("dports2proto"), bpf_mod)
-    if err := setTrafficTable(traffic_table, int(monitoring_info.port_num),
-                              monitoring_info.protocols[0], true);
-        err != nil {
+    if err := setTrafficTable(traffic_table, int(port_num), protocols[0], true); err != nil {
         fmt.Printf("Error on setting traffic port")
         return nil, err
     }
 
-    egress_match_list := get_egress_match_list(pod_name)
+    egress_match_list := get_egress_match_list(name)
 
     egress_table := bcc.NewTable(bpf_mod.TableId("egress_lookup_table"), bpf_mod)
     if egress_match_list != nil {
@@ -892,7 +880,7 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
         return nil, err
     }
 
-    setNodeIntfTrackingIP(ip2Long(monitoring_info.pod_ip))
+    //setNodeIntfTrackingIP(ip2Long(monitoring_info.pod_ip))
 
     table := bcc.NewTable(bpf_mod.TableId("skb_events"), bpf_mod)
 
@@ -920,14 +908,14 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
                     print_network_traces()
                 */
                 case data := <-skb_rev_chan:
-                    err = handle_skb_event(&data, node_name, pod_name, session_table,
-                                           monitoring_info, egress_match_list,
-                                           monitoring_info.svc_name)
+                    err = handle_skb_event(&data, node_name, name, session_table,
+                                           port_num, protocols, egress_match_list,
+                                           svc_name)
                     if err != nil {
                         fmt.Printf("failed to decode received data: %s\n", err)
                     }
                 case <- stop:
-                    fmt.Printf("Receiving stop for pod %v\n", pod_name)
+                    fmt.Printf("Receiving stop for %v\n", name)
                     //ticker.Stop()
                     perfMap.Stop()
                     //closer.Close()
@@ -944,6 +932,53 @@ func ClovisorNewPodInit(k8s_client *ClovisorK8s,
         stopChan:   stop,
         qdisc:      qdisc,
     }, nil
+}
+
+func ClovisorNewPodInit(k8s_client *ClovisorK8s,
+                        node_name string,
+                        pod_name string,
+                        monitoring_info *monitoring_info_t) (*ClovisorBCC, error) {
+
+    output, err := k8s_client.exec_command(veth_ifidx_command, monitoring_info)
+    if err != nil {
+        return nil, err
+    }
+
+    ifindex , err := strconv.Atoi(output)
+    if err != nil {
+        fmt.Printf("Error converting %v to ifindex, error: %v\n", output, err.Error())
+        return nil, err
+    }
+
+    return setupIntfBPF(ifindex, pod_name, node_name, monitoring_info.svc_name,
+                        uint16(monitoring_info.port_num), monitoring_info.protocols)
+}
+
+func ClovisorPhyInfInit(node_name string) ([]string, []*ClovisorBCC, error) {
+    var ret_key []string
+    var ret_val []*ClovisorBCC
+    interfaces, err := get_cfg_track_interfaces()
+    if err != nil {
+        fmt.Printf("Error: getting config track interfaces failed [%v]", err)
+        return nil, nil, err
+    }
+    protocols := []string{"http"}
+    for _, intf_name := range interfaces {
+        intf_info, err := net.InterfaceByName(intf_name)
+        if err != nil {
+            fmt.Printf("Error: get interface info for %v failed (%v)", intf_name, err)
+            continue
+        }
+        bcc_, err := setupIntfBPF(intf_info.Index, intf_name, node_name,
+                                  intf_name, 0, protocols)
+        if err != nil {
+            fmt.Printf("Error: set up BPF for intf %v failed[%v]", intf_name, err)
+            continue
+        }
+        ret_key = append(ret_key, intf_name)
+        ret_val = append(ret_val, bcc_)
+    }
+    return ret_key, ret_val, nil
 }
 
 func (clovBcc *ClovisorBCC) StopPod() {

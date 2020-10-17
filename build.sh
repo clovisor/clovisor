@@ -12,10 +12,10 @@ GOPATH=/home/s3wong/go
 
 SRCDIR=`pwd`
 
-#wget https://dl.google.com/go/go$GOVERSION.$OS-$ARCH.tar.gz
-#sudo tar -C /usr/local -xzf go$GOVERSION.$OS-$ARCH.tar.gz
-#export PATH=$PATH:/usr/local/go/bin
-#export PATH=$GOPATH/bin:$PATH
+wget https://dl.google.com/go/go$GOVERSION.$OS-$ARCH.tar.gz
+sudo tar -C /usr/local -xzf go$GOVERSION.$OS-$ARCH.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+export PATH=$GOPATH/bin:$PATH
 
 #sudo apt install -y gcc
 #sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys D4284CDD
@@ -27,7 +27,7 @@ SRCDIR=`pwd`
 /usr/local/go/bin/go get github.com/iovisor/gobpf
 /usr/local/go/bin/go get github.com/opentracing/opentracing-go
 /usr/local/go/bin/go get github.com/pkg/errors
-/usr/local/go/bin/go get github.com/go-redis/redis
+/usr/local/go/bin/go get github.com/go-redis/redis@master
 /usr/local/go/bin/go get github.com/uber/jaeger-client-go
 /usr/local/go/bin/go get github.com/vishvananda/netlink
 /usr/local/go/bin/go get github.com/vishvananda/netns

@@ -26,7 +26,7 @@ var redisServer string = "redis.clovisor"
 var jaegerCollector string = "jaeger-collector.clovisor:14268"
 var jaegerAgent string = "jaeger-agent.clovisor:6831"
 var ProtoCfg string = "clovisor_proto_cfg"
-var protoPluginCfgChan string = "clovisor_proto_plugin_cfg_chan"
+var clovisorCfgChan string = "clovisor_cfg_chan"
 
 /*
  * redisConnect: redis client connecting to redis server
@@ -167,23 +167,39 @@ func get_jaeger_server() (string, error) {
     return client.Get("clovisor_jaeger_server").Result()
 }
 
+func get_cfg_track_interfaces() ([]string, error) {
+    client := redisConnect()
+    defer client.Close()
+    return client.LRange("clovior_track_interfaces", 0, -1).Result()
+}
+
 func Monitor_proto_plugin_cfg() {
     client := redisConnect()
     //defer client.Close()
 
-    pubsub := client.Subscribe(protoPluginCfgChan)
+    pubsub := client.Subscribe(clovisorCfgChan)
     //defer pubsub.Close()
 
     go func() {
         for {
             msg, err := pubsub.ReceiveMessage()
             if err != nil {
-                fmt.Printf("Error getting protocol plugin configuration: %v\n", err)
+                fmt.Printf("Error getting clovisor configuration: %v\n", err)
                 return
             }
 
-            fmt.Printf("Update on protocol %v notification received\n", msg.Payload)
-            loadProtoParser(msg.Payload, true)
+            switch cfg := strings.Split(msg.Payload, ":"); cfg[0] {
+                case "proto_plugin":
+                    fmt.Printf("Update on protocol %v notification received\n", cfg[1])
+                    loadProtoParser(cfg[1], true)
+                /*
+                case "redirect":
+                    fmt.Printf("Redirect request: %v", cfg)
+                    setSessionRedirect(cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7])
+                */
+                default:
+                    fmt.Printf("Incorrect config %v", cfg[0])
+            }
         }
     }()
 }
