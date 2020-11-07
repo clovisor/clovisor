@@ -70,6 +70,15 @@ type egress_match_t struct {
 //    flag        uint8
 }
 
+type redirect_action_t struct {
+    ingress     uint32
+    to_ifidx    uint32
+    src_ip      uint32
+    dst_ip      uint32
+    src_mac     [6]byte
+    dst_mac     [6]byte
+}
+
 type egress_match_cfg struct {
     egress_match    egress_match_t
     action          string
@@ -83,6 +92,12 @@ type session_info_t struct {
     traces      []map[string]string
     reqBuf      []byte
     respBuf     []byte
+}
+
+type bpfTables struct {
+    trafficTable    *bcc.Table
+    egressTable     *bcc.Table
+    redirectTable   *bcc.Table
 }
 
 const (
@@ -110,6 +125,8 @@ var protocolMap = map[string]int{
 }
 
 var traceTable string = "NetworkTraces"
+
+var perIntfTablesMap = map[string]bpfTables{};
 
 /*
  * redisConnect: redis client connecting to redis server
@@ -800,6 +817,8 @@ func setupIntfBPF(ifindex int, name string, node_name string, svc_name string,
         }
     }
 
+    redirect_table := bcc.NewTable(bpf_mod.TableId("redirect_lookup_table"), bpf_mod)
+
     session_table := bcc.NewTable(bpf_mod.TableId("sessions"), bpf_mod)
 
     // check if qdisc clsact filter for this interface already exists
@@ -881,6 +900,12 @@ func setupIntfBPF(ifindex int, name string, node_name string, svc_name string,
     }
 
     //setNodeIntfTrackingIP(ip2Long(monitoring_info.pod_ip))
+    table_ref := bpfTables{}
+    table_ref.trafficTable = traffic_table
+    table_ref.egressTable = egress_table
+    table_ref.redirectTable = redirect_table
+
+    perIntfTablesMap[name] = table_ref
 
     table := bcc.NewTable(bpf_mod.TableId("skb_events"), bpf_mod)
 
@@ -985,4 +1010,113 @@ func (clovBcc *ClovisorBCC) StopPod() {
     // TODO(s3wong): remove qdisc del once k8s watcher implemented
     netlink.QdiscDel(clovBcc.qdisc)
     clovBcc.stopChan <- true
+}
+
+func setRedirectSession(action string, from_intf string, to_intf string,
+                        key_src_ip string, key_src_port string,
+                        key_dst_ip string, key_dst_port string, val_src_ip string,
+                        val_dst_ip string, val_src_mac string, val_dst_mac string,
+                        ingress string) error {
+
+    table, ok := perIntfTablesMap[from_intf]
+    if !ok {
+        return errors.New(fmt.Sprintf("Uninitialized interface or pod %s", from_intf))
+    }
+    switch action {
+        case "add":
+            fmt.Printf("Redirect add from %v to %v %v:%v:%v:%v to key %v:%v:%v:%v\n",
+                        from_intf, to_intf, val_src_ip, val_dst_ip, val_src_mac,
+                        val_dst_mac, key_src_ip, key_src_port, key_dst_ip, key_dst_port)
+            var from_intf_idx, to_intf_idx int
+            if intf_info, err := net.InterfaceByName(from_intf); err != nil {
+                fmt.Printf("Error: get interface info for %v failed (%v)", from_intf, err)
+                return err
+            } else {
+                from_intf_idx = intf_info.Index
+            }
+            if intf_info, err := net.InterfaceByName(to_intf); err != nil {
+                fmt.Printf("Error: get interface info for %v failed (%v)", to_intf, err)
+                return err
+            } else {
+                to_intf_idx = intf_info.Index
+            }
+            return setRedirectTable(table.redirectTable, from_intf_idx, to_intf_idx,
+                                    key_src_ip, key_dst_ip, key_src_port,
+                                    key_dst_port, val_src_ip, val_dst_ip,
+                                    val_src_mac, val_dst_mac, ingress, true, true)
+        case "delete":
+            fmt.Printf("Redirect delete key from %v %v:%v:%v:%v %v\n", from_intf, key_src_ip, key_dst_ip, key_src_port, key_dst_port, ingress)
+            return setRedirectTable(table.redirectTable, 0, 0, key_src_ip, key_dst_ip,
+                                    key_src_port, key_dst_port, val_src_ip, val_dst_ip,
+                                    val_src_mac, val_dst_mac, ingress, false, true)
+        default:
+            fmt.Printf("Error: unsupported action %v\n", action)
+            return errors.New(fmt.Sprintf("Unknown redirect action %s", action))
+    }
+    return nil
+}
+
+func setRedirectTable(redirect_table *bcc.Table,
+                      from_intf_idx int, to_intf_idx int,
+                      key_src_ip string, key_dst_ip string, key_src_port string,
+                      key_dst_port string, val_src_ip string, val_dst_ip string,
+                      val_src_mac string, val_dst_mac string, ingress string,
+                      is_add bool, dump_table bool) error {
+    key_buf := &bytes.Buffer{}
+    val_buf := &bytes.Buffer{}
+    src_port_key, _ := strconv.ParseUint(key_src_port, 10, 16)
+    dst_port_key, _ := strconv.ParseUint(key_dst_port, 10, 16)
+    table_key := session_key_t{
+        src_ip:     ip2Long(key_src_ip),
+        dst_ip:     ip2Long(key_dst_ip),
+        src_port:   uint16(src_port_key),
+        dst_port:   uint16(dst_port_key),
+    }
+
+    fmt.Printf("set redirect table entry w/ key %v\n", table_key)
+
+    if err := binary.Write(key_buf, binary.LittleEndian, table_key); err != nil {
+        fmt.Printf("Error converting key %v into binary: %v\n", table_key, err)
+        return err
+    }
+    key := append([]byte(nil), key_buf.Bytes()...)
+
+    if !is_add {
+        if err := redirect_table.Delete(key); err != nil {
+            fmt.Printf("Error deleting key %v from redirect table\n", table_key, err)
+            return err
+        }
+    } else {
+        // TODO(s3wong): input parsing for boolean string
+        is_ingress, _ := strconv.ParseUint(ingress, 10, 32)
+        src_mac_, _ := net.ParseMAC(val_src_mac)
+        src_mac := [6]byte{src_mac_[0], src_mac_[1], src_mac_[2], src_mac_[3], src_mac_[4], src_mac_[5]}
+        dst_mac_, _ := net.ParseMAC(val_dst_mac)
+        dst_mac := [6]byte{dst_mac_[0], dst_mac_[1], dst_mac_[2], dst_mac_[3], dst_mac_[4], dst_mac_[5]}
+        table_value := redirect_action_t{
+            ingress:    uint32(is_ingress),
+            to_ifidx:   uint32(to_intf_idx),
+            src_ip:     ip2Long(val_src_ip),
+            dst_ip:     ip2Long(val_dst_ip),
+            src_mac:    src_mac,
+            dst_mac:    dst_mac,
+        }
+
+        fmt.Printf("Writing table value %v\n", table_value)
+
+        if err := binary.Write(val_buf, binary.LittleEndian, table_value); err != nil {
+            fmt.Printf("Error converting value %v into binary: %v\n", table_value, err)
+            return err
+        }
+        value := append([]byte(nil), val_buf.Bytes()...)
+
+        if err := redirect_table.Set(key, value); err != nil {
+            fmt.Printf("Failed to add key %v:%v to redirect table: %v\n", key,value,err)
+            return err
+        }
+    }
+    if dump_table {
+        dumpBPFTable(redirect_table)
+    }
+    return nil
 }

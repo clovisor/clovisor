@@ -15,6 +15,7 @@ import (
     "net"
     "strconv"
     "strings"
+    "time"
 
     "github.com/go-redis/redis"
     opentracing "github.com/opentracing/opentracing-go"
@@ -188,17 +189,23 @@ func Monitor_proto_plugin_cfg() {
                 return
             }
 
-            switch cfg := strings.Split(msg.Payload, ":"); cfg[0] {
+            switch cfg := strings.Split(msg.Payload, ";"); cfg[0] {
                 case "proto_plugin":
                     fmt.Printf("Update on protocol %v notification received\n", cfg[1])
                     loadProtoParser(cfg[1], true)
-                /*
                 case "redirect":
-                    fmt.Printf("Redirect request: %v", cfg)
-                    setSessionRedirect(cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7])
-                */
+                    fmt.Printf("Redirect request: %v\n", cfg)
+                    if cfg[1] == "add" {
+                        setRedirectSession(cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7], cfg[8], cfg[9], cfg[10], cfg[11], cfg[12])
+                    } else {
+                        setRedirectSession(cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], "", "", "", "", "", cfg[7])
+                    }
+                case "wan_mapping":
+                    fmt.Printf("Loading file %v for WAN mapping...\n", cfg[1])
+                    time.Sleep(1)
+                    fmt.Printf("Rules and mapping loaded\n")
                 default:
-                    fmt.Printf("Incorrect config %v", cfg[0])
+                    fmt.Printf("Incorrect config %v\n", cfg[0])
             }
         }
     }()

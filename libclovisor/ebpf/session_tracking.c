@@ -16,12 +16,15 @@
 #define HTTP_HDR_MIN_LEN 7
 #define MAX_SESSION_TABLE_ENTRIES 8192
 
+#define bpf_memcpy __builtin_memcpy
+
 typedef enum {
     UNDEFINED = 0,
     HTTP = 1,
     HTTP2 = 2,
     TCP = 3,
     UDP = 4,
+    REDIRECTED = 5,
 } app_proto_t;
 
 typedef struct session_key_ {
@@ -45,16 +48,32 @@ typedef enum policy_action_ {
     RECORD = 1,
 } policy_action_t;
 
+typedef struct redirect_action_ {
+    u32 ingress;
+    u32 to_ifidx;
+    u32 src_ip;
+    u32 dst_ip;
+    unsigned char src_mac[ETH_ALEN];
+    unsigned char dst_mac[ETH_ALEN];
+} redirect_action_t;
+
 BPF_PERF_OUTPUT(skb_events);
 BPF_HASH(dports2proto, u16, u32);
 BPF_HASH(egress_lookup_table, egress_match_t, policy_action_t);
 BPF_HASH(sessions, session_key_t, session_t, MAX_SESSION_TABLE_ENTRIES);
+BPF_HASH(redirect_lookup_table, session_key_t, redirect_action_t);
 
 struct eth_hdr {
 	unsigned char   h_dest[ETH_ALEN];
 	unsigned char   h_source[ETH_ALEN];
 	unsigned short  h_proto;
 };
+
+#define TCP_CSUM_OFF (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, check))
+#define IP_SRC_OFF (ETH_HLEN + offsetof(struct iphdr, saddr))
+#define IP_DST_OFF (ETH_HLEN + offsetof(struct iphdr, daddr))
+#define IP_CSUM_OFFSET (ETH_HLEN + offsetof(struct iphdr, check))
+#define IS_PSEUDO 0x10
 
 static inline int ipv4_hdrlen(struct iphdr *ip4)
 {
@@ -139,7 +158,92 @@ static inline void process_request(u32 src_ip, u32 dst_ip, u16 src_port,
     */
 }
 
-static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
+static inline int mac_compare(u8 *addr1, u8 *addr2)
+{
+    int i;
+    for (i = 0; i < ETH_ALEN; i++) {
+        if (addr1[i] != addr2[i]) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static inline app_proto_t redirect(struct __sk_buff *skb,
+                                   session_key_t *redirect_lookup_key,
+                                   struct tcphdr *tcp_hdr,
+                                   struct iphdr *ipv4_hdr,
+                                   void *data_end)
+{
+    redirect_action_t *redirect_action_ptr = NULL;
+
+    redirect_action_ptr = redirect_lookup_table.lookup(redirect_lookup_key);
+    if (redirect_action_ptr != NULL) {
+        char zero[ETH_ALEN] = { 0 };
+        char src_mac[ETH_ALEN] = { 0 };
+        char dst_mac[ETH_ALEN] = { 0 };
+        int ret;
+	    void *data = (void *)(long)skb->data;
+	    struct eth_hdr *eth = data;
+        /*
+	    if (data + sizeof(*eth) + sizeof(*ipv4_hdr) + sizeof(*tcp_hdr) > data_end)
+		    return TC_ACT_OK;
+        bpf_trace_printk("Original Source IP: 0x%x, dst IP 0x%x\n", ntohl(ipv4_hdr->saddr), ntohl(ipv4_hdr->daddr));
+        bpf_trace_printk("with src mac %x:%x:%x:", eth->h_source[0], eth->h_source[1], eth->h_source[2]);
+        bpf_trace_printk("%x:%x:%x ", eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+        bpf_trace_printk("with dst mac %x:%x:%x:", eth->h_dest[0], eth->h_dest[1], eth->h_dest[2]);
+        bpf_trace_printk("%x:%x:%x ", eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+        bpf_trace_printk("redirect: ingrerss:%d to %d \n", redirect_action_ptr->ingress, redirect_action_ptr->to_ifidx);
+        bpf_trace_printk("with src mac %x:%x:%x:", redirect_action_ptr->src_mac[0], redirect_action_ptr->src_mac[1], redirect_action_ptr->src_mac[2]);
+        bpf_trace_printk("%x:%x:%x ", redirect_action_ptr->src_mac[3], redirect_action_ptr->src_mac[4], redirect_action_ptr->src_mac[5]);
+        bpf_trace_printk("dst mac %x:%x:%x:", redirect_action_ptr->dst_mac[0], redirect_action_ptr->dst_mac[1], redirect_action_ptr->dst_mac[2]);
+        bpf_trace_printk("%x:%x:%x ", redirect_action_ptr->dst_mac[3], redirect_action_ptr->dst_mac[4], redirect_action_ptr->dst_mac[5]);
+        bpf_trace_printk(" src ip: 0x%x\n", redirect_action_ptr->src_ip);
+        */
+        bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_source), src_mac, ETH_ALEN);
+        if (mac_compare(src_mac, zero) != 0) {
+            bpf_trace_printk("Change source mac\n");
+            bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_source),
+                                redirect_action_ptr->src_mac, ETH_ALEN, 0);
+        }
+        bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_dest), dst_mac, ETH_ALEN);
+        if (mac_compare(dst_mac, zero) != 0) {
+            bpf_trace_printk("Change dest mac\n");
+            bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest),
+                                redirect_action_ptr->dst_mac, ETH_ALEN, 0);
+        }
+        if (redirect_action_ptr->src_ip != 0) {
+            bpf_trace_printk("Change src ip\n");
+            u32 src_ip = 0, old_src_ip = 0;
+            bpf_skb_load_bytes(skb, IP_SRC_OFF, &old_src_ip, sizeof(old_src_ip));
+            src_ip = htonl(redirect_action_ptr->src_ip);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_src_ip, src_ip, IS_PSEUDO | sizeof(src_ip));
+            bpf_l3_csum_replace(skb, IP_CSUM_OFFSET, old_src_ip, src_ip, 4);
+            bpf_skb_store_bytes(skb, IP_SRC_OFF, &src_ip, sizeof(src_ip), 0);
+        }
+        if (redirect_action_ptr->dst_ip != 0) {
+            bpf_trace_printk("Change dst ip\n");
+            u32 dst_ip = 0, old_dst_ip = 0;
+            bpf_skb_load_bytes(skb, IP_DST_OFF, &old_dst_ip, sizeof(old_dst_ip));
+            dst_ip = htonl(redirect_action_ptr->dst_ip);
+            bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_dst_ip, dst_ip, IS_PSEUDO | sizeof(dst_ip));
+            bpf_l3_csum_replace(skb, IP_CSUM_OFFSET, old_dst_ip, dst_ip, 4);
+            bpf_skb_store_bytes(skb, IP_DST_OFF, &dst_ip, sizeof(dst_ip), 0);
+        }
+        if (redirect_action_ptr->ingress) {
+            bpf_trace_printk("redirect with ingress\n");
+            ret = bpf_clone_redirect(skb, redirect_action_ptr->to_ifidx, BPF_F_INGRESS);
+        } else {
+            bpf_trace_printk("redirect without ingress\n");
+            ret = bpf_clone_redirect(skb, redirect_action_ptr->to_ifidx, 0);
+        }
+        return REDIRECTED;
+    }
+    return UNDEFINED;
+}
+
+static inline app_proto_t ingress_tcp_parsing(struct __sk_buff *skb,
+                                              struct tcphdr *tcp_hdr,
                                               struct iphdr *ipv4_hdr,
                                               void *data_end)
 {
@@ -148,6 +252,16 @@ static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
     policy_action_t *policy_ptr = NULL;
     app_proto_t ret = TCP;
     unsigned short wildcard_port = 0;
+    session_key_t redirect_lookup_key = {};
+
+    // First, look up redirect on outbound
+    redirect_lookup_key.dst_ip = ntohl(ipv4_hdr->daddr);
+    redirect_lookup_key.dst_port = ntohs(tcp_hdr->dest);
+    redirect_lookup_key.src_ip = 0;
+    redirect_lookup_key.src_port = 0;
+    if (redirect(skb, &redirect_lookup_key, tcp_hdr, ipv4_hdr, data_end) == REDIRECTED) {
+        return REDIRECTED;
+    }
 
     unsigned int *proto = dports2proto.lookup(&dest_port);
     if (proto == NULL) {
@@ -190,6 +304,10 @@ static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
         if (policy_ptr == NULL) {
             egress_match.dst_ip = 0;
             policy_ptr = egress_lookup_table.lookup(&egress_match);
+            if (policy_ptr == NULL) {
+                egress_match.dst_port = 0;
+                policy_ptr = egress_lookup_table.lookup(&egress_match);
+            }
         }
 
         if (policy_ptr != NULL) {
@@ -210,7 +328,8 @@ static inline app_proto_t ingress_tcp_parsing(struct tcphdr *tcp_hdr,
     return ret;
 }
 
-static inline app_proto_t egress_tcp_parsing(struct tcphdr *tcp_hdr,
+static inline app_proto_t egress_tcp_parsing(struct __sk_buff *skb,
+                                             struct tcphdr *tcp_hdr,
                                              struct iphdr *ipv4_hdr,
                                              void *data_end)
 {
@@ -219,6 +338,15 @@ static inline app_proto_t egress_tcp_parsing(struct tcphdr *tcp_hdr,
     egress_match_t egress_match = {};
     policy_action_t *policy_ptr = NULL;
     unsigned short wildcard_port = 0;
+    session_key_t redirect_lookup_key = {};
+
+    redirect_lookup_key.src_ip = ntohl(ipv4_hdr->saddr);
+    redirect_lookup_key.src_port = ntohs(tcp_hdr->source);
+    redirect_lookup_key.dst_ip = 0;
+    redirect_lookup_key.dst_port = 0;
+    if (redirect(skb, &redirect_lookup_key, tcp_hdr, ipv4_hdr, data_end) == REDIRECTED) {
+        return REDIRECTED;
+    }
 
     unsigned int *proto = dports2proto.lookup(&src_port);
     if (proto == NULL) {
@@ -241,6 +369,10 @@ static inline app_proto_t egress_tcp_parsing(struct tcphdr *tcp_hdr,
         if (policy_ptr == NULL) {
             egress_match.dst_ip = 0;
             policy_ptr = egress_lookup_table.lookup(&egress_match);
+            if (policy_ptr == NULL) {
+                egress_match.dst_port = 0;
+                policy_ptr = egress_lookup_table.lookup(&egress_match);
+            }
         }
 
         if (policy_ptr != NULL) {
@@ -279,14 +411,16 @@ static inline int handle_packet(struct __sk_buff *skb, int is_ingress)
         return TC_ACT_OK;
 
     if (is_ingress == 1) {
-        proto = ingress_tcp_parsing(tcp_hdr, ipv4_hdr, data_end);
+        proto = ingress_tcp_parsing(skb, tcp_hdr, ipv4_hdr, data_end);
     } else{
-        proto = egress_tcp_parsing(tcp_hdr, ipv4_hdr, data_end);
+        proto = egress_tcp_parsing(skb, tcp_hdr, ipv4_hdr, data_end);
     }
 
 	if (proto == HTTP) {
         int offset = is_ingress;
 	    skb_events.perf_submit_skb(skb, skb->len, &offset, sizeof(offset));
+    } else if (proto == REDIRECTED) {
+        return TC_ACT_OK;
     }
 
 	return TC_ACT_OK;
