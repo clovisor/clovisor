@@ -13,9 +13,10 @@ import (
     "fmt"
     "io"
     "net"
+    "os"
     "strconv"
     "strings"
-    "time"
+    "gopkg.in/yaml.v2"
 
     "github.com/go-redis/redis"
     opentracing "github.com/opentracing/opentracing-go"
@@ -174,6 +175,67 @@ func get_cfg_track_interfaces() ([]string, error) {
     return client.LRange("clovior_track_interfaces", 0, -1).Result()
 }
 
+type WMConfig struct {
+    Kind string `yaml:"kind"`
+    Dest string `yaml:"dest"`
+    Port string `yaml:"port"`
+    User string `yaml:"user"`
+    Wan struct {
+        Interface string `yaml:"interface"`
+        Srcip string `yaml:"srcip"`
+        Dstip string `yaml:"dstip"`
+        Dstport string `yaml:"dstport"`
+        Smac string `yaml:"srcmac"`
+        Dmac string `yaml:"dstmac"`
+    } `yaml:"wan"`
+}
+
+func set_wan_mapping(cfg *WMConfig) error {
+    client := redisConnect()
+    defer client.Close()
+    key := cfg.Kind + ";" + cfg.Dest + ";" + cfg.User
+    wan := cfg.Wan
+    value := wan.Interface + ";" + wan.Srcip + ";" + wan.Dstip + ";" + wan.Dstport + ";" + wan.Smac + ";" + wan.Dmac
+
+    if _, err := client.HSet("clovisor_wan_mapping_cfg", key, value).Result(); err != nil {
+        return err
+    }
+    return nil
+}
+
+func get_wan_mapping(kind string, dest string, user string) (string, error) {
+    client := redisConnect()
+    defer client.Close()
+    key := kind + ";" + dest + ";" + user
+
+    if value, err := client.HGet("clovisor_wan_mapping_cfg", key).Result(); err != nil {
+        return "", err
+    } else {
+        return value, nil
+    }
+}
+
+func loadWANMapping(filename string) error {
+    wanConfig := &WMConfig{}
+    file, err := os.Open(filename)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    decoder := yaml.NewDecoder(file)
+
+    if err := decoder.Decode(&wanConfig); err != nil {
+        return err
+    }
+
+    // store in redis
+    if err := set_wan_mapping(wanConfig); err != nil {
+        return err
+    }
+    return nil
+}
+
 func Monitor_proto_plugin_cfg() {
     client := redisConnect()
     //defer client.Close()
@@ -202,8 +264,9 @@ func Monitor_proto_plugin_cfg() {
                     }
                 case "wan_mapping":
                     fmt.Printf("Loading file %v for WAN mapping...\n", cfg[1])
-                    time.Sleep(1)
-                    fmt.Printf("Rules and mapping loaded\n")
+                    if err := loadWANMapping(cfg[1]); err != nil {
+                        fmt.Printf("Error loading WAN mapping file %v: %v\n", cfg[1], err)
+                    }
                 default:
                     fmt.Printf("Incorrect config %v\n", cfg[0])
             }
