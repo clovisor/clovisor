@@ -1,0 +1,13 @@
+kind: VirtualService
+dest: httpbin
+port: 8000
+user: minion
+wan:
+    srcintf: enp0s8
+    interface: enp0s9
+    srcip: "10.0.2.3"
+    dstip: "10.2.1.50"
+    dstport: 15443
+    srcmac: "08:00:27:84:3a:08"
+    dstmac: "08:00:27:2e:13:c6"
+    origmac: "08:00:27:94:37:df"

@@ -181,21 +181,35 @@ type WMConfig struct {
     Port string `yaml:"port"`
     User string `yaml:"user"`
     Wan struct {
+        Srcintf string `yaml: "srcintf"`
         Interface string `yaml:"interface"`
         Srcip string `yaml:"srcip"`
         Dstip string `yaml:"dstip"`
         Dstport string `yaml:"dstport"`
         Smac string `yaml:"srcmac"`
         Dmac string `yaml:"dstmac"`
+        Origmac string `yaml:"origmac"`
     } `yaml:"wan"`
+}
+
+type Wan struct {
+    Srcintf string
+    Interface string
+    Srcip string
+    Dstip string
+    Dstport string
+    Smac string
+    Dmac string
+    Origmac string
 }
 
 func set_wan_mapping(cfg *WMConfig) error {
     client := redisConnect()
     defer client.Close()
-    key := cfg.Kind + ";" + cfg.Dest + ";" + cfg.User
+    //key := cfg.Kind + ";" + cfg.Dest + ";" + cfg.User
+    key := cfg.Dest + ";" + cfg.Port + ";" + cfg.User
     wan := cfg.Wan
-    value := wan.Interface + ";" + wan.Srcip + ";" + wan.Dstip + ";" + wan.Dstport + ";" + wan.Smac + ";" + wan.Dmac
+    value := wan.Interface + ";" + wan.Srcip + ";" + wan.Dstip + ";" + wan.Dstport + ";" + wan.Smac + ";" + wan.Dmac + ";" + wan.Origmac
 
     if _, err := client.HSet("clovisor_wan_mapping_cfg", key, value).Result(); err != nil {
         return err
@@ -203,15 +217,25 @@ func set_wan_mapping(cfg *WMConfig) error {
     return nil
 }
 
-func get_wan_mapping(kind string, dest string, user string) (string, error) {
+func get_wan_mapping(kind string, dest string, user string) (*Wan, error) {
     client := redisConnect()
     defer client.Close()
     key := kind + ";" + dest + ";" + user
 
     if value, err := client.HGet("clovisor_wan_mapping_cfg", key).Result(); err != nil {
-        return "", err
+        return nil, err
     } else {
-        return value, nil
+        val := strings.Split(value, ";")
+        return &Wan{
+                Srcintf: val[0],
+                Interface: val[1],
+                Srcip: val[2],
+                Dstip: val[3],
+                Dstport: val[4],
+                Smac: val[5],
+                Dmac: val[6],
+                Origmac: val[7],
+            }, nil
     }
 }
 
