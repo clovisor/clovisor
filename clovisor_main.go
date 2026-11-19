@@ -5,6 +5,9 @@
 // which accompanies this distribution, and is available at
 // http://www.apache.org/licenses/LICENSE-2.0
 
+//go:build bcc
+// +build bcc
+
 package main
 
 import (
