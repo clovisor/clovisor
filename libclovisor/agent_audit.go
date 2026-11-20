@@ -19,6 +19,7 @@ const (
 	EventConnect
 	EventRunStart // a run cgroup (agents/<name>) was created
 	EventRunEnd   // a run cgroup was removed; always the run's last event
+	EventDNS      // a resolver reply delivered to a socket in a run
 )
 
 // AuditEvent represents an audit event

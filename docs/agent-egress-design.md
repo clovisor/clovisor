@@ -1483,10 +1483,24 @@ Implemented:
     A restarted agent resumes them, marks the gap, and flags the run
     `complete: false`.
   - `agentctl events` lists runs; `agentctl events <id>` shows one timeline.
+- *Added 2026-11-20.* DNS events.
+  - A `cgroup_skb/ingress` program on `agents/` copies UDP replies from port 53
+    (first 1 KiB) to the node agent, which parses them in Go.
+  - A reply is attributed to the receiving socket's run cgroup, so it carries no
+    pid.
+  - Within a run, each connect is labelled with the looked-up name whose answer
+    returned that IP. The summary lists the names looked up, and the names
+    behind each destination.
+  - The labels are what learn mode will turn into host rules.
+  - Blind spots are expected until forced local DNS ([§6.8](#68-channels-connect4-does-not-see))
+    makes the resolver the only path:
+    - DNS over TCP, DoT and DoH;
+    - lookups that leave no packet in the run's sockets, such as
+      `nss-resolve` talking to systemd-resolved over varlink, or `nscd`;
+    - IPv6 replies with extension headers.
 
 Not yet done:
 
-- DNS events;
 - learn mode;
 - the node-agent-owned cgroup API ([§5.4](#54-the-injection-channel)).
   `agentctl` still creates cgroups directly, as root.

@@ -25,6 +25,11 @@
  *          through one ring buffer, so the rmdir event is always the last
  *          event of its run.
  *
+ * dns:     cgroup_skb/ingress on agents/ copies UDP datagrams from port 53
+ *          (resolver replies) to userspace, which parses them. The packet is
+ *          attributed to the receiving socket's cgroup, so no pid is known.
+ *          Always returns 1 (deliver).
+ *
  * Each event carries the leaf cgroup id and the run cgroup id (the
  * agents/run-<id> ancestor), so tool-call child cgroups roll up to the run.
  * All events go through a single ring buffer.
@@ -38,6 +43,12 @@
 #define MAX_PATH_LEN   256
 #define MAX_ARGS_LEN   512  /* power of two: used as a mask */
 #define MAX_CGPATH_LEN 128
+#define MAX_DNS_LEN    1024 /* power of two: used as a mask */
+
+#define ETH_P_IP     0x0800
+#define ETH_P_IPV6   0x86DD
+#define IPPROTO_UDP  17
+#define DNS_PORT     53
 
 #define AF_INET  2
 #define AF_INET6 10
@@ -46,6 +57,7 @@
 #define EVENT_CONNECT 1
 #define EVENT_RUN_START 2
 #define EVENT_RUN_END   3
+#define EVENT_DNS       4
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct linux_binprm {
@@ -107,6 +119,16 @@ struct connect_event {
 struct cgroup_event {
     struct event_hdr hdr;
     char path[MAX_CGPATH_LEN]; /* relative to the cgroup root, e.g. /agents/run-x */
+};
+
+struct dns_event {
+    struct event_hdr hdr;     /* pid is 0: softirq context */
+    __u16 family;
+    __u16 _pad;
+    __u32 len;                /* bytes of payload captured */
+    __u32 orig_len;           /* DNS message length on the wire */
+    __u8  saddr[16];          /* resolver that answered */
+    __u8  payload[MAX_DNS_LEN];
 };
 
 struct {
@@ -257,6 +279,90 @@ int on_cgroup_rmdir(__u64 *ctx)
 {
     emit_cgroup((struct cgroup *)ctx[0], (const char *)ctx[1], EVENT_RUN_END);
     return 0;
+}
+
+/*
+ * skb->data starts at the network header for cgroup_skb programs. Only
+ * plain UDP from port 53 is captured; IPv6 extension headers are not
+ * walked (resolver replies do not carry them).
+ */
+SEC("cgroup_skb/ingress")
+int on_ingress(struct __sk_buff *skb)
+{
+    __u32 zero = 0;
+    struct audit_config *cfg = bpf_map_lookup_elem(&config, &zero);
+    if (!cfg || cfg->agents_cgroup_id == 0)
+        return 1;
+
+    __u32 l4off;
+    __u16 family;
+    __u8 saddr[16] = {};
+
+    if (skb->protocol == bpf_htons(ETH_P_IP)) {
+        __u8 vihl, proto;
+        if (bpf_skb_load_bytes(skb, 0, &vihl, 1) < 0 ||
+            bpf_skb_load_bytes(skb, 9, &proto, 1) < 0)
+            return 1;
+        if (proto != IPPROTO_UDP)
+            return 1;
+        l4off = (vihl & 0x0f) * 4;
+        if (bpf_skb_load_bytes(skb, 12, saddr, 4) < 0)
+            return 1;
+        family = AF_INET;
+    } else if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+        __u8 nexthdr;
+        if (bpf_skb_load_bytes(skb, 6, &nexthdr, 1) < 0)
+            return 1;
+        if (nexthdr != IPPROTO_UDP)
+            return 1;
+        l4off = 40;
+        if (bpf_skb_load_bytes(skb, 8, saddr, 16) < 0)
+            return 1;
+        family = AF_INET6;
+    } else {
+        return 1;
+    }
+
+    __u16 udp[4]; /* sport, dport, len, csum */
+    if (bpf_skb_load_bytes(skb, l4off, udp, sizeof(udp)) < 0)
+        return 1;
+    if (udp[0] != bpf_htons(DNS_PORT))
+        return 1;
+
+    if (bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level) != cfg->agents_cgroup_id)
+        return 1;
+    __u64 run = bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level + 1);
+    if (run == 0)
+        return 1;
+
+    __u32 dnslen = bpf_ntohs(udp[2]);
+    if (dnslen <= 8 + 12) /* UDP header + DNS header */
+        return 1;
+    dnslen -= 8;
+
+    struct dns_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 1;
+
+    e->hdr.type = EVENT_DNS;
+    e->hdr.pid = 0;
+    e->hdr.timestamp_ns = bpf_ktime_get_boot_ns();
+    e->hdr.cgroup_id = bpf_skb_cgroup_id(skb);
+    e->hdr.run_cgroup_id = run;
+    e->family = family;
+    e->_pad = 0;
+    e->orig_len = dnslen;
+    __builtin_memcpy(e->saddr, saddr, sizeof(saddr));
+
+    __u32 len = dnslen > MAX_DNS_LEN ? MAX_DNS_LEN : dnslen;
+    if (bpf_skb_load_bytes(skb, l4off + 8, e->payload, len & (MAX_DNS_LEN - 1) ?: MAX_DNS_LEN) < 0) {
+        bpf_ringbuf_discard(e, 0);
+        return 1;
+    }
+    e->len = len;
+
+    bpf_ringbuf_submit(e, 0);
+    return 1;
 }
 
 SEC("cgroup/connect4")

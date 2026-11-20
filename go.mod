@@ -11,6 +11,7 @@ require (
 	github.com/sirupsen/logrus v1.10.2
 	github.com/uber/jaeger-client-go v2.30.0+incompatible
 	github.com/vishvananda/netlink v1.3.1
+	golang.org/x/net v0.23.0
 	golang.org/x/sys v0.26.0
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.28.0
@@ -46,7 +47,6 @@ require (
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
-	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/oauth2 v0.8.0 // indirect
 	golang.org/x/term v0.18.0 // indirect
 	golang.org/x/text v0.14.0 // indirect

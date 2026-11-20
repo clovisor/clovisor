@@ -95,7 +95,7 @@ func TestRunRecorderCompleteRun(t *testing.T) {
 	if want := []string{"/bin/sh", "/usr/bin/curl"}; !reflect.DeepEqual(tl.Summary.Binaries, want) {
 		t.Fatalf("binaries %v, want %v", tl.Summary.Binaries, want)
 	}
-	want := []Destination{{"TCP", "1.2.3.4", 443, 2}, {"TCP", "::1", 80, 1}}
+	want := []Destination{{Proto: "TCP", IP: "1.2.3.4", Port: 443, Count: 2}, {Proto: "TCP", IP: "::1", Port: 80, Count: 1}}
 	if !reflect.DeepEqual(tl.Summary.Destinations, want) {
 		t.Fatalf("destinations %v, want %v", tl.Summary.Destinations, want)
 	}

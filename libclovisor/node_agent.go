@@ -208,6 +208,10 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		fmt.Printf("%s [CONNECT] run=%d cgroup=%d pid=%d proto=%s dst=%s\n",
 			ts, event.RunCgroupID, event.CgroupID, event.PID, d.Protocol,
 			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))))
+	case EventDNS:
+		d := event.Data.(DNSData)
+		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v\n",
+			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs())
 	case EventRunStart:
 		fmt.Printf("%s [RUN START] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	case EventRunEnd:
@@ -223,8 +227,8 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		return
 	}
 	if tl != nil {
-		fmt.Printf("%s [TIMELINE] run %s: %d execs, %d connects, complete=%t -> %s\n",
-			ts, tl.RunID, tl.Summary.Execs, tl.Summary.Connects, tl.Complete,
+		fmt.Printf("%s [TIMELINE] run %s: %d execs, %d connects, %d dns, complete=%t -> %s\n",
+			ts, tl.RunID, tl.Summary.Execs, tl.Summary.Connects, tl.Summary.DNSReplies, tl.Complete,
 			TimelinePath(na.recorder.OutDir, tl.RunID))
 	}
 }

@@ -234,7 +234,7 @@ func listRuns(dir string) error {
 	sort.Slice(tls, func(i, j int) bool { return tls[i].StartedAt.Before(tls[j].StartedAt) })
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "RUN ID\tSTARTED\tDURATION\tEXIT\tEXECS\tCONNECTS\tCOMPLETE\tCOMMAND")
+	fmt.Fprintln(w, "RUN ID\tSTARTED\tDURATION\tEXIT\tEXECS\tCONNECTS\tDNS\tCOMPLETE\tCOMMAND")
 	for _, tl := range tls {
 		dur, exit := "running", "-"
 		if tl.EndedAt != nil {
@@ -243,9 +243,9 @@ func listRuns(dir string) error {
 		if tl.ExitCode != nil {
 			exit = strconv.Itoa(*tl.ExitCode)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%t\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%t\t%s\n",
 			tl.RunID, tl.StartedAt.Local().Format(time.DateTime), dur, exit,
-			tl.Summary.Execs, tl.Summary.Connects, tl.Complete, truncate(strings.Join(tl.Command, " "), 50))
+			tl.Summary.Execs, tl.Summary.Connects, tl.Summary.DNSReplies, tl.Complete, truncate(strings.Join(tl.Command, " "), 50))
 	}
 	return w.Flush()
 }
@@ -292,6 +292,21 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			}
 		case "connect":
 			detail = e.Proto + " " + net.JoinHostPort(e.DstIP, strconv.Itoa(int(e.DstPort)))
+			if e.DstName != "" {
+				detail += " (" + e.DstName + ")"
+			}
+		case "dns":
+			detail = fmt.Sprintf("%s %s %s from %s", e.Query, e.QType, e.RCode, e.Server)
+			var vals []string
+			for _, a := range e.Answers {
+				vals = append(vals, a.Value)
+			}
+			if len(vals) > 0 {
+				detail += " -> " + strings.Join(vals, ", ")
+			}
+			if e.Partial {
+				detail += " (reply cut off at capture limit)"
+			}
 		default:
 			detail = e.Note
 		}
@@ -303,9 +318,14 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	for _, b := range tl.Summary.Binaries {
 		fmt.Printf("  %s\n", b)
 	}
+	fmt.Printf("DNS names (%d)\n", len(tl.Summary.DNSNames))
+	for _, n := range tl.Summary.DNSNames {
+		fmt.Printf("  %s\n", n)
+	}
 	fmt.Printf("Destinations (%d)\n", len(tl.Summary.Destinations))
 	for _, d := range tl.Summary.Destinations {
-		fmt.Printf("  %-4s %-40s x%d\n", d.Proto, net.JoinHostPort(d.IP, strconv.Itoa(int(d.Port))), d.Count)
+		fmt.Printf("  %-4s %-40s x%-4d %s\n", d.Proto, net.JoinHostPort(d.IP, strconv.Itoa(int(d.Port))), d.Count,
+			strings.Join(d.Names, ", "))
 	}
 }
 

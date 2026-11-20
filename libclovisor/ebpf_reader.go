@@ -30,11 +30,13 @@ const (
 	MaxPathLen   = 256
 	maxArgsLen   = 512
 	maxCgPathLen = 128
+	maxDNSLen    = 1024
 
 	bpfEventExec     = 0
 	bpfEventConnect  = 1
 	bpfEventRunStart = 2
 	bpfEventRunEnd   = 3
+	bpfEventDNS      = 4
 
 	afInet  = 2
 	afInet6 = 10
@@ -63,6 +65,16 @@ type bpfExecEvent struct {
 	Args     [maxArgsLen]byte
 }
 
+type bpfDNSEvent struct {
+	Hdr     bpfEventHdr
+	Family  uint16
+	_       uint16
+	Len     uint32
+	OrigLen uint32
+	SAddr   [16]byte
+	Payload [maxDNSLen]byte
+}
+
 type bpfCgroupEvent struct {
 	Hdr  bpfEventHdr
 	Path [maxCgPathLen]byte
@@ -80,6 +92,7 @@ type bpfObjects struct {
 	ExecProg     *ebpf.Program `ebpf:"on_exec"`
 	MkdirProg    *ebpf.Program `ebpf:"on_cgroup_mkdir"`
 	RmdirProg    *ebpf.Program `ebpf:"on_cgroup_rmdir"`
+	IngressProg  *ebpf.Program `ebpf:"on_ingress"`
 	Connect4Prog *ebpf.Program `ebpf:"on_connect4"`
 	Connect6Prog *ebpf.Program `ebpf:"on_connect6"`
 	Config       *ebpf.Map     `ebpf:"config"`
@@ -87,7 +100,7 @@ type bpfObjects struct {
 }
 
 func (o *bpfObjects) Close() {
-	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.Connect4Prog, o.Connect6Prog, o.Config, o.Events} {
+	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg, o.Connect4Prog, o.Connect6Prog, o.Config, o.Events} {
 		if c != nil {
 			c.Close()
 		}
@@ -157,6 +170,7 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 	}{
 		{"connect4", ebpf.AttachCGroupInet4Connect, r.objs.Connect4Prog},
 		{"connect6", ebpf.AttachCGroupInet6Connect, r.objs.Connect6Prog},
+		{"ingress", ebpf.AttachCGroupInetIngress, r.objs.IngressProg},
 	} {
 		l, err := link.AttachCgroup(link.CgroupOptions{Path: agentsDir, Attach: c.typ, Program: c.prog})
 		if err != nil {
@@ -244,6 +258,24 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			PPID:       e.PPID,
 			Args:       splitArgs(e.Args[:min(int(e.ArgsLen), maxArgsLen)]),
 		}
+
+	case bpfEventDNS:
+		var e bpfDNSEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		n := min(int(e.Len), maxDNSLen)
+		d, err := parseDNSResponse(e.Payload[:n], e.OrigLen > uint32(n))
+		if err != nil {
+			return AuditEvent{}, fmt.Errorf("dns reply: %w", err)
+		}
+		server := e.SAddr[:4]
+		if e.Family == afInet6 {
+			server = e.SAddr[:]
+		}
+		d.Server = net.IP(append([]byte(nil), server...)).String()
+		ev.Type = EventDNS
+		ev.Data = d
 
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent

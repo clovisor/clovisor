@@ -48,7 +48,9 @@ type RunTimeline struct {
 type RunSummary struct {
 	Execs        int           `json:"execs"`
 	Connects     int           `json:"connects"`
+	DNSReplies   int           `json:"dns_replies"`
 	Binaries     []string      `json:"binaries"`
+	DNSNames     []string      `json:"dns_names"` // distinct names looked up
 	Destinations []Destination `json:"destinations"`
 }
 
@@ -58,21 +60,32 @@ type Destination struct {
 	IP    string `json:"ip"`
 	Port  uint16 `json:"port"`
 	Count int    `json:"count"`
+	// Names are the looked-up names that resolved to IP, within this run,
+	// before a connect to it. Empty if the run connected to a literal IP
+	// or resolved it some way DNS capture does not see.
+	Names []string `json:"names,omitempty"`
 }
 
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
-	Time     time.Time `json:"time"`
-	Type     string    `json:"type"` // exec, connect, gap
-	PID      uint32    `json:"pid,omitempty"`
-	PPID     uint32    `json:"ppid,omitempty"`
-	CgroupID uint64    `json:"cgroup_id,omitempty"`
-	Binary   string    `json:"binary,omitempty"`
-	Args     []string  `json:"args,omitempty"`
-	Proto    string    `json:"proto,omitempty"`
-	DstIP    string    `json:"dst_ip,omitempty"`
-	DstPort  uint16    `json:"dst_port,omitempty"`
-	Note     string    `json:"note,omitempty"`
+	Time     time.Time   `json:"time"`
+	Type     string      `json:"type"` // exec, connect, dns, gap
+	PID      uint32      `json:"pid,omitempty"`
+	PPID     uint32      `json:"ppid,omitempty"`
+	CgroupID uint64      `json:"cgroup_id,omitempty"`
+	Binary   string      `json:"binary,omitempty"`
+	Args     []string    `json:"args,omitempty"`
+	Proto    string      `json:"proto,omitempty"`
+	DstIP    string      `json:"dst_ip,omitempty"`
+	DstPort  uint16      `json:"dst_port,omitempty"`
+	DstName  string      `json:"dst_name,omitempty"` // from an earlier DNS reply
+	Query    string      `json:"query,omitempty"`
+	QType    string      `json:"qtype,omitempty"`
+	RCode    string      `json:"rcode,omitempty"`
+	Server   string      `json:"server,omitempty"`
+	Answers  []DNSAnswer `json:"answers,omitempty"`
+	Partial  bool        `json:"partial,omitempty"` // DNS reply cut off at capture limit
+	Note     string      `json:"note,omitempty"`
 }
 
 type destKey struct {
@@ -86,7 +99,16 @@ type runState struct {
 	sawStart bool
 	gap      bool
 	binaries map[string]struct{}
-	dests    map[destKey]int
+	dests    map[destKey]*destState
+	names    map[string]struct{}
+	// ipName maps an address to the name whose lookup most recently
+	// returned it in this run.
+	ipName map[string]string
+}
+
+type destState struct {
+	count int
+	names map[string]struct{}
 }
 
 // RunRecorder groups audit events by run and writes one timeline file per
@@ -185,7 +207,9 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			Events:     []TimelineEvent{},
 		},
 		binaries: make(map[string]struct{}),
-		dests:    make(map[destKey]int),
+		dests:    make(map[destKey]*destState),
+		names:    make(map[string]struct{}),
+		ipName:   make(map[string]string),
 	}
 	if ev.Type == EventRunStart {
 		st.sawStart = true
@@ -195,8 +219,16 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for _, b := range prev.Summary.Binaries {
 				st.binaries[b] = struct{}{}
 			}
+			for _, n := range prev.Summary.DNSNames {
+				st.names[n] = struct{}{}
+			}
 			for _, d := range prev.Summary.Destinations {
-				st.dests[destKey{d.Proto, d.IP, d.Port}] = d.Count
+				ds := &destState{count: d.Count, names: make(map[string]struct{})}
+				for _, n := range d.Names {
+					ds.names[n] = struct{}{}
+					st.ipName[d.IP] = n
+				}
+				st.dests[destKey{d.Proto, d.IP, d.Port}] = ds
 			}
 		}
 		st.gap = true
@@ -262,7 +294,17 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 		d := ev.Data.(ConnectData)
 		st := r.state(ev, "")
 		st.tl.Summary.Connects++
-		st.dests[destKey{d.Protocol, d.DstIP, d.DstPort}]++
+		k := destKey{d.Protocol, d.DstIP, d.DstPort}
+		ds := st.dests[k]
+		if ds == nil {
+			ds = &destState{names: make(map[string]struct{})}
+			st.dests[k] = ds
+		}
+		ds.count++
+		name := st.ipName[d.DstIP]
+		if name != "" {
+			ds.names[name] = struct{}{}
+		}
 		st.add(TimelineEvent{
 			Time:     ev.Timestamp,
 			Type:     "connect",
@@ -271,6 +313,29 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Proto:    d.Protocol,
 			DstIP:    d.DstIP,
 			DstPort:  d.DstPort,
+			DstName:  name,
+		}, r.MaxEvents)
+
+	case EventDNS:
+		d := ev.Data.(DNSData)
+		st := r.state(ev, "")
+		st.tl.Summary.DNSReplies++
+		if d.Query != "" {
+			st.names[d.Query] = struct{}{}
+			for _, ip := range d.Addrs() {
+				st.ipName[ip] = d.Query
+			}
+		}
+		st.add(TimelineEvent{
+			Time:     ev.Timestamp,
+			Type:     "dns",
+			CgroupID: ev.CgroupID,
+			Query:    d.Query,
+			QType:    d.QType,
+			RCode:    d.RCode,
+			Server:   d.Server,
+			Answers:  d.Answers,
+			Partial:  d.Partial,
 		}, r.MaxEvents)
 	}
 	return nil, nil
@@ -308,15 +373,18 @@ func (r *RunRecorder) finish(st *runState) (*RunTimeline, error) {
 
 func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl := st.tl
-	tl.Summary.Binaries = make([]string, 0, len(st.binaries))
-	for b := range st.binaries {
-		tl.Summary.Binaries = append(tl.Summary.Binaries, b)
-	}
-	sort.Strings(tl.Summary.Binaries)
+	tl.Summary.Binaries = sortedKeys(st.binaries)
+
+	tl.Summary.DNSNames = sortedKeys(st.names)
 
 	tl.Summary.Destinations = make([]Destination, 0, len(st.dests))
-	for k, n := range st.dests {
-		tl.Summary.Destinations = append(tl.Summary.Destinations, Destination{k.proto, k.ip, k.port, n})
+	for k, ds := range st.dests {
+		tl.Summary.Destinations = append(tl.Summary.Destinations, Destination{
+			Proto: k.proto, IP: k.ip, Port: k.port, Count: ds.count,
+		})
+		if len(ds.names) > 0 {
+			tl.Summary.Destinations[len(tl.Summary.Destinations)-1].Names = sortedKeys(ds.names)
+		}
 	}
 	sort.Slice(tl.Summary.Destinations, func(i, j int) bool {
 		a, b := tl.Summary.Destinations[i], tl.Summary.Destinations[j]
@@ -337,6 +405,15 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 		return nil, fmt.Errorf("failed to write timeline for run %s: %w", tl.RunID, err)
 	}
 	return tl, nil
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ReadRunTimeline reads an exported timeline file.
