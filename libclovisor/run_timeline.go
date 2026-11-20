@@ -33,6 +33,7 @@ type RunTimeline struct {
 	StartedAt  time.Time  `json:"started_at"`
 	EndedAt    *time.Time `json:"ended_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
+	Policy     *RunPolicy `json:"policy,omitempty"`
 
 	// Complete is true only if the node agent saw the run from cgroup
 	// creation to removal without interruption. Otherwise events may be
@@ -382,6 +383,9 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	tl.UID = &uid
 	if m.ExitCode != nil {
 		tl.ExitCode = m.ExitCode
+	}
+	if m.Policy != nil {
+		tl.Policy = m.Policy
 	}
 }
 

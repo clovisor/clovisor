@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	bpfObj = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object")
-	outDir = flag.String("out", clovisor.DefaultRunOutDir, "Directory for per-run timeline files")
-	socket = flag.String("socket", clovisor.DefaultRunAPISocket, "Unix socket for the run API used by agentctl")
+	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object")
+	outDir   = flag.String("out", clovisor.DefaultRunOutDir, "Directory for per-run timeline files")
+	socket   = flag.String("socket", clovisor.DefaultRunAPISocket, "Unix socket for the run API used by agentctl")
+	policies = flag.String("policy-dir", clovisor.DefaultPolicyDir, "Root-owned directory of profiles and ceilings; reloaded on SIGHUP")
 )
 
 func main() {
@@ -32,14 +33,16 @@ func main() {
 		BPFObjPath: *bpfObj,
 		OutDir:     *outDir,
 		SocketPath: *socket,
+		PolicyDir:  *policies,
 	})
+	// A policy that does not load is fatal at start: running without it
+	// would silently leave runs unprofiled.
 	if err != nil {
 		log.Fatalf("Failed to create node agent: %v", err)
 	}
 
-	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	// Run the agent in a goroutine so we can wait for signals
 	done := make(chan error)
@@ -47,14 +50,21 @@ func main() {
 		done <- agent.Run()
 	}()
 
-	// Wait for shutdown signal or done channel
-	select {
-	case err := <-done:
-		log.Infof("Agent finished: %v", err)
-		return
-	case <-sigChan:
-		log.Info("Shutdown signal received, stopping node agent...")
+	for {
+		select {
+		case err := <-done:
+			log.Infof("Agent finished: %v", err)
+			return
+		case sig := <-sigChan:
+			if sig == syscall.SIGHUP {
+				if err := agent.ReloadPolicy(); err != nil {
+					log.Errorf("policy reload failed; keeping the policy in force: %v", err)
+				}
+				continue
+			}
+			log.Info("Shutdown signal received, stopping node agent...")
+			agent.Stop()
+			return
+		}
 	}
-
-	agent.Stop()
 }

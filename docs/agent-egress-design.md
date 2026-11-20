@@ -1688,6 +1688,46 @@ Limitation carried to 2.3: runs that already use a proxy show only the
 loopback connection to it in Phase 1 timelines. The proxy's `http` events
 supply the real destinations.
 
+#### 2.2 status (2026-11-20)
+
+Done: profile binding ([§5.6](#56-profile-binding-names-with-a-trusted-ceiling)).
+
+- **Policy directory.** The node agent loads AgentProfiles and
+  ProfileCeilings from `/etc/clovisor/policy` (`-policy-dir`), compiled
+  together because posture is node-wide. Every file and the directory must be
+  root-owned, not group- or world-writable, and not symlinks: anyone who can
+  write a ceiling can grant themselves any profile.
+  - A policy that does not load is fatal at start, before BPF or the socket
+    is touched.
+  - `SIGHUP` reloads. A failed reload keeps the policy in force.
+  - Without the directory, runs are unprofiled, as in Phase 1.
+- **Ceilings on a host.** `appliesTo` takes `user`, `uid`, `group`, `gid` or
+  `any`. The caller is identified from `SO_PEERCRED` plus the kernel's group
+  list for the requesting process, never from the request.
+  - The most specific ceiling wins: uid, then group, then `any`. Two group
+    ceilings covering one caller are refused as ambiguous.
+  - `namespace` and `serviceAccount` are rejected until there is a Kubernetes
+    identity source.
+- **Resolution.** `agentctl run --profile p`.
+  - A profile the ceiling allows is granted.
+  - Otherwise the ceiling's `default` is granted, and `agentctl` prints a
+    warning with the reason.
+  - The ceiling's `clamp` is layered on.
+  - A caller no ceiling covers runs unprofiled. To make profiles mandatory,
+    add an `any` ceiling.
+- **Intersection.** A run's effective policy is its layers. An enforce-mode
+  deny in any layer blocks; an audit-mode deny is recorded as would-deny;
+  `tag-and-log` survives. This is the same rule §7.8 needs for sub-agents.
+- **Versioned binding.** Each layer is recorded as `name@sha256:…` with its
+  mode, source and time, in the run's timeline and `agentctl events`. Runs
+  keep the versions they were bound to across reloads.
+- **Out-of-band clamp.** `agentctl clamp <run> <profile>` and
+  `agentctl revoke <run>` (deny all egress, enforced, with its own narration)
+  add a layer to a live run. Adding a layer can only remove permissions, so the
+  run's owner may do it as well as root; other users are refused.
+- **For 2.3.** `RunAPIServer.EffectiveFor(cgroupID)` gives `ext_proc` a run's
+  current effective policy from the cgroup id it resolves via sock_diag.
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT

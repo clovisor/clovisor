@@ -7,3 +7,6 @@
 *.bak
 *.swp
 *~
+/agentctl
+/node-agent
+/audit-sink

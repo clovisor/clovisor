@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
 // NodeAgent is the main daemon for node-level agent egress tracking
@@ -27,6 +29,7 @@ type NodeAgent struct {
 	bpfReader *EBPFReader
 	recorder  *RunRecorder
 	api       *RunAPIServer
+	policyDir string
 	stopChan  chan bool
 	handled   chan struct{} // closed when handleEvents has drained
 	running   bool
@@ -37,6 +40,9 @@ type NodeAgentOptions struct {
 	BPFObjPath string
 	OutDir     string // finished timelines; DefaultRunOutDir if empty
 	SocketPath string // run API socket; DefaultRunAPISocket if empty
+	// PolicyDir holds profiles and ceilings. If it does not exist, runs
+	// are unprofiled, as in Phase 1.
+	PolicyDir string
 }
 
 // NewNodeAgent creates a new node agent
@@ -71,6 +77,15 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 	if opts.SocketPath == "" {
 		opts.SocketPath = DefaultRunAPISocket
 	}
+	if opts.PolicyDir == "" {
+		opts.PolicyDir = DefaultPolicyDir
+	}
+	// Load policy before touching the kernel or the socket: a policy that
+	// does not load is fatal, and failing here leaves nothing behind.
+	set, err := loadNodePolicy(opts.PolicyDir)
+	if err != nil {
+		return nil, err
+	}
 
 	cmgr, err := NewCgroupManager()
 	if err != nil {
@@ -103,17 +118,53 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		audit.reader.Close()
 		return nil, err
 	}
+	if set != nil {
+		api.SetPolicy(set)
+	}
 
 	na := &NodeAgent{
-		cmgr:     cmgr,
-		audit:    audit,
-		recorder: recorder,
-		api:      api,
-		stopChan: make(chan bool),
-		running:  false,
+		cmgr:      cmgr,
+		audit:     audit,
+		recorder:  recorder,
+		api:       api,
+		policyDir: opts.PolicyDir,
+		stopChan:  make(chan bool),
+		running:   false,
 	}
 
 	return na, nil
+}
+
+// ReloadPolicy (re)loads the policy directory. On failure the policy in
+// force stays, so a bad edit never leaves the node without policy; runs
+// already bound keep their versions either way.
+func (na *NodeAgent) ReloadPolicy() error {
+	set, err := loadNodePolicy(na.policyDir)
+	if err != nil {
+		return err
+	}
+	if set != nil {
+		na.api.SetPolicy(set)
+	}
+	return nil
+}
+
+// loadNodePolicy loads dir, or returns nil if it does not exist.
+func loadNodePolicy(dir string) (*policy.Set, error) {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
+		return nil, nil
+	}
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: policy.ExplicitProxy, Linux: true}, true)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, p := range set.Compiled.Profiles {
+		names = append(names, p.Name+"@"+p.Profile.ShortVersion())
+	}
+	fmt.Printf("policy: loaded %s: %s\n", dir, strings.Join(names, ", "))
+	return set, nil
 }
 
 // cgroupLevel returns the depth of path below the cgroup v2 root, as used

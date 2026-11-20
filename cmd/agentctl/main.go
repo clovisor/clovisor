@@ -33,7 +33,11 @@ func printUsage() {
 	fmt.Println("AgentCtl - Agent Cgroup Control Tool (Phase 1)")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  agentctl run <command> [args...]  Run a command in a new agent cgroup")
+	fmt.Println("  agentctl run [--profile p] [--] <command> [args...]")
+	fmt.Println("                                    Run a command as a governed run")
+	fmt.Println("  agentctl profiles                 Show which profiles you may request")
+	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
+	fmt.Println("  agentctl revoke <run-id>          Deny all further egress for a live run")
 	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
 	fmt.Println("  agentctl learn [-o file] [--name n] (--all | run-id...)")
 	fmt.Println("                                    Draft a profile from recorded runs")
@@ -80,7 +84,7 @@ func runShim(args []string) {
 // exec the command. So no command code ever runs outside the run (design
 // §5.2), and agentctl needs no privileges. clone3(CLONE_INTO_CGROUP)
 // would do this in one step but needs root (see libclovisor/run_api.go).
-func runCommand(args []string) (int, error) {
+func runCommand(args []string, profile string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
 	}
@@ -105,11 +109,14 @@ func runCommand(args []string) (int, error) {
 	defer api.Close()
 
 	cwd, _ := os.Getwd()
-	run, err := api.Create(args, cwd)
+	run, err := api.Create(args, cwd, profile)
 	if err != nil {
 		return 0, err
 	}
-	fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d)\n", run.RunID, run.CgroupID)
+	fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d), %s\n", run.RunID, run.CgroupID, describePolicy(run.Policy))
+	if run.Policy != nil && profile != "" && run.Policy.Layers[0].Profile != profile {
+		fmt.Fprintf(os.Stderr, "agentctl: WARNING: %s\n", run.Policy.Reason)
+	}
 
 	relR, relW, err := os.Pipe()
 	if err != nil {
@@ -170,6 +177,93 @@ func runCommand(args []string) (int, error) {
 			"(restarted?); its timeline will lack the exit code: %v\n", run.RunID, err)
 	}
 	return code, nil
+}
+
+// describePolicy renders a run's policy layers on one line.
+func describePolicy(rp *clovisor.RunPolicy) string {
+	if rp == nil {
+		return "unprofiled (audit only)"
+	}
+	var parts []string
+	for i, l := range rp.Layers {
+		s := l.Profile + "@" + l.Version
+		if l.Mode == "audit" {
+			s += " (audit)"
+		}
+		if i > 0 {
+			s = l.Source + " " + s
+		}
+		parts = append(parts, s)
+	}
+	return "profile " + strings.Join(parts, " + ")
+}
+
+// parseRunArgs splits "[--profile p] [--] command..." for agentctl run.
+func parseRunArgs(args []string) (profile string, cmd []string, err error) {
+	for len(args) > 0 {
+		a := args[0]
+		switch {
+		case a == "--":
+			return profile, args[1:], nil
+		case a == "--profile" || a == "-profile":
+			if len(args) < 2 {
+				return "", nil, fmt.Errorf("--profile needs a name")
+			}
+			profile, args = args[1], args[2:]
+		case strings.HasPrefix(a, "--profile="):
+			profile, args = strings.TrimPrefix(a, "--profile="), args[1:]
+		default:
+			return profile, args, nil
+		}
+	}
+	return profile, nil, nil
+}
+
+func listProfiles() error {
+	api, err := clovisor.DialRunAPI(socketPath())
+	if err != nil {
+		return err
+	}
+	defer api.Close()
+	r, err := api.Profiles()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Ceiling   %s\n", r.Ceiling)
+	fmt.Printf("Allowed   %s\n", strings.Join(r.Allow, ", "))
+	if r.Default != "" {
+		fmt.Printf("Default   %s (granted when you request nothing, or something not allowed)\n", r.Default)
+	}
+	if r.Clamp != "" {
+		fmt.Printf("Clamp     %s (intersected into every grant)\n", r.Clamp)
+	}
+	return nil
+}
+
+// clampRun layers a profile onto a live run, or revokes its egress.
+func clampRun(op string, args []string) error {
+	if (op == "clamp" && len(args) != 2) || (op == "revoke" && len(args) != 1) {
+		if op == "clamp" {
+			return fmt.Errorf("usage: agentctl clamp <run-id> <profile>")
+		}
+		return fmt.Errorf("usage: agentctl revoke <run-id>")
+	}
+	api, err := clovisor.DialRunAPI(socketPath())
+	if err != nil {
+		return err
+	}
+	defer api.Close()
+	var r clovisor.RunAPIResponse
+	if op == "clamp" {
+		r, err = api.Clamp(args[0], args[1])
+	} else {
+		r, err = api.Revoke(args[0])
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("run %s now: %s\n", r.RunID, describePolicy(r.Policy))
+	return nil
 }
 
 func exitCode(err error) (int, error) {
@@ -274,7 +368,7 @@ func listRuns(dir string) error {
 	sort.Slice(tls, func(i, j int) bool { return tls[i].StartedAt.Before(tls[j].StartedAt) })
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "RUN ID\tSTARTED\tDURATION\tEXIT\tEXECS\tCONNECTS\tDNS\tCOMPLETE\tCOMMAND")
+	fmt.Fprintln(w, "RUN ID\tSTARTED\tDURATION\tEXIT\tEXECS\tCONNECTS\tDNS\tCOMPLETE\tPROFILE\tCOMMAND")
 	for _, tl := range tls {
 		dur, exit := "running", "-"
 		if tl.EndedAt != nil {
@@ -283,9 +377,16 @@ func listRuns(dir string) error {
 		if tl.ExitCode != nil {
 			exit = strconv.Itoa(*tl.ExitCode)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%t\t%s\n",
+		prof := "-"
+		if tl.Policy != nil {
+			prof = tl.Policy.Layers[0].Profile
+			if n := len(tl.Policy.Layers); n > 1 {
+				prof += fmt.Sprintf("+%d", n-1)
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%t\t%s\t%s\n",
 			tl.RunID, tl.StartedAt.Local().Format(time.DateTime), dur, exit,
-			tl.Summary.Execs, tl.Summary.Connects, tl.Summary.DNSReplies, tl.Complete, truncate(strings.Join(tl.Command, " "), 50))
+			tl.Summary.Execs, tl.Summary.Connects, tl.Summary.DNSReplies, tl.Complete, prof, truncate(strings.Join(tl.Command, " "), 50))
 	}
 	return w.Flush()
 }
@@ -294,6 +395,14 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	fmt.Printf("Run       %s (cgroup %d, %s)\n", tl.RunID, tl.CgroupID, tl.CgroupPath)
 	if len(tl.Command) > 0 {
 		fmt.Printf("Command   %s\n", strings.Join(tl.Command, " "))
+	}
+	if tl.Policy == nil {
+		fmt.Println("Policy    unprofiled (audit only)")
+	} else {
+		fmt.Printf("Policy    ceiling %s: %s\n", tl.Policy.Ceiling, tl.Policy.Reason)
+		for _, l := range tl.Policy.Layers {
+			fmt.Printf("          %s@%s  mode %s  %s at %s\n", l.Profile, l.Version, l.Mode, l.Source, l.At.Local().Format(time.RFC3339))
+		}
 	}
 	fmt.Printf("Started   %s\n", tl.StartedAt.Local().Format(time.RFC3339Nano))
 	if tl.EndedAt != nil {
@@ -553,16 +662,27 @@ func main() {
 	switch command {
 	case "run":
 		// Pass remaining args to runCommand (skip "--" if present)
-		args := os.Args[2:]
-		if len(args) > 0 && args[0] == "--" {
-			args = args[1:]
+		profile, args, err := parseRunArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
-		code, err := runCommand(args)
+		code, err := runCommand(args, profile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(code)
+	case "profiles":
+		if err := listProfiles(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "clamp", "revoke":
+		if err := clampRun(command, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "cgroups":
 		if err := listCgroups(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

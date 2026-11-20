@@ -220,6 +220,9 @@ func (cp *CompiledProfile) defaultMessage(req Request) string {
 	if cp.DefaultAction != ActionDeny {
 		return ""
 	}
+	if cp.DefaultMessage != "" {
+		return cp.DefaultMessage
+	}
 	dest := req.Host
 	if dest == "" && req.IP.IsValid() {
 		dest = req.IP.String()

@@ -21,7 +21,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
 
 	"golang.org/x/sys/unix"
 )
@@ -55,18 +58,30 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end
+	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
+	// Profile is the profile requested for a new run. It is untrusted:
+	// the ceiling chosen by the caller's credentials decides (§5.6).
+	Profile string `json:"profile,omitempty"`
+	// RunID and ClampProfile target clamp and revoke.
+	RunID        string `json:"run_id,omitempty"`
+	ClampProfile string `json:"clamp_profile,omitempty"`
 }
 
 // RunAPIResponse is the agent's reply to each request.
 type RunAPIResponse struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
-	RunID    string `json:"run_id,omitempty"`
-	CgroupID uint64 `json:"cgroup_id,omitempty"`
+	OK       bool       `json:"ok"`
+	Error    string     `json:"error,omitempty"`
+	RunID    string     `json:"run_id,omitempty"`
+	CgroupID uint64     `json:"cgroup_id,omitempty"`
+	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
+	// profiles:
+	Ceiling string   `json:"ceiling,omitempty"`
+	Allow   []string `json:"allow,omitempty"`
+	Default string   `json:"default,omitempty"`
+	Clamp   string   `json:"clamp,omitempty"`
 }
 
 // RunRegistry holds metadata for runs created through the API until the
@@ -119,12 +134,40 @@ type RunAPIServer struct {
 	ln        *net.UnixListener
 	path      string
 
+	policy atomic.Pointer[policy.Set] // nil: no policy loaded; runs are unprofiled
+
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
 	active  map[string]bool // runs owned by a live connection
+	bound   map[string]*boundRun
+	byCg    map[uint64]*boundRun
 	closing bool
 	done    chan struct{}
 	wg      sync.WaitGroup
+}
+
+// boundRun is a live run's effective policy.
+type boundRun struct {
+	runID    string
+	uid      int
+	cgroupID uint64
+	eff      *policy.Effective // replaced, never mutated, under RunAPIServer.mu
+}
+
+// SetPolicy installs the policy used for new runs. Runs already bound
+// keep the versions they were bound to (§5.6, versioned binding).
+func (s *RunAPIServer) SetPolicy(set *policy.Set) { s.policy.Store(set) }
+
+// EffectiveFor returns the effective policy of the run whose cgroup is
+// cgroupID, for enforcement points (2.3).
+func (s *RunAPIServer) EffectiveFor(cgroupID uint64) (runID string, eff *policy.Effective, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.byCg[cgroupID]
+	if !ok {
+		return "", nil, false
+	}
+	return b.runID, b.eff, true
 }
 
 // reapInterval is how often orphaned run cgroups are checked.
@@ -165,6 +208,8 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		path:      path,
 		conns:     map[*net.UnixConn]struct{}{},
 		active:    map[string]bool{},
+		bound:     map[string]*boundRun{},
+		byCg:      map[uint64]*boundRun{},
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -424,6 +469,10 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		return ac.attach(fds[0])
 	case "end":
 		return ac.end(req.ExitCode)
+	case "profiles":
+		return ac.profiles()
+	case "clamp", "revoke":
+		return ac.clamp(req)
 	default:
 		return fail("unknown op %q", req.Op)
 	}
@@ -447,6 +496,25 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		return fail("caller is inside a run (%s); runs cannot create runs", cg)
 	}
 
+	// Bind the profile before the cgroup exists, so that no process ever
+	// runs in it without its policy (§5.6).
+	var binding *policy.Binding
+	if set := ac.s.policy.Load(); set != nil {
+		caller, err := ac.caller()
+		if err != nil {
+			return fail("%v", err)
+		}
+		binding, err = set.Resolve(caller, req.Profile)
+		if errors.Is(err, policy.ErrNoCeiling) {
+			binding, err = nil, nil // unprofiled: audit only, as in Phase 1
+		}
+		if err != nil {
+			return fail("%v", err)
+		}
+	} else if req.Profile != "" {
+		return fail("the node agent has no policy loaded, so it cannot grant profile %q", req.Profile)
+	}
+
 	runID, err := NewRunID()
 	if err != nil {
 		return fail("%v", err)
@@ -455,21 +523,154 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	path, id, err := ac.s.cm.CreateRunCgroup(runID)
 	if err == nil {
 		ac.s.active[runID] = true
+		if binding != nil {
+			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: binding.Effective}
+			ac.s.bound[runID] = b
+			ac.s.byCg[id] = b
+		}
 	}
 	ac.s.mu.Unlock()
 	if err != nil {
 		return fail("%v", err)
 	}
 	ac.runID, ac.runPath = runID, path
+	rp := runPolicyRecord(binding)
 	ac.s.reg.Put(RunMeta{
 		RunID:     runID,
 		Command:   req.Command,
 		Cwd:       req.Cwd,
 		UID:       int(ac.cred.Uid),
 		StartedAt: time.Now().UTC(),
+		Policy:    rp,
 	})
-	log.Printf("run api: run %s created for uid %d pid %d", runID, ac.cred.Uid, ac.cred.Pid)
-	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id}
+	granted := "unprofiled"
+	if rp != nil {
+		granted = rp.Layers[0].Profile + "@" + rp.Layers[0].Version + " (" + rp.Reason + ")"
+	}
+	log.Printf("run api: run %s created for uid %d pid %d: %s", runID, ac.cred.Uid, ac.cred.Pid, granted)
+	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp}
+}
+
+// caller is the requester's platform identity: uid from SO_PEERCRED,
+// groups from the kernel's view of the requesting process.
+func (ac *apiConn) caller() (policy.Caller, error) {
+	c := policy.Caller{UID: int(ac.cred.Uid), GIDs: []int{int(ac.cred.Gid)}}
+	groups, err := procGroups(int(ac.cred.Pid))
+	if err != nil {
+		return c, fmt.Errorf("cannot read caller's groups: %v", err)
+	}
+	c.GIDs = append(c.GIDs, groups...)
+	return c, nil
+}
+
+// procGroups returns a process's supplementary groups.
+func procGroups(pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "Groups:"); ok {
+			var gs []int
+			for _, f := range strings.Fields(v) {
+				g, err := strconv.Atoi(f)
+				if err != nil {
+					return nil, err
+				}
+				gs = append(gs, g)
+			}
+			return gs, nil
+		}
+	}
+	return nil, nil
+}
+
+func layerRecord(l policy.Layer, at time.Time) PolicyLayer {
+	return PolicyLayer{
+		Profile: l.Profile.Name,
+		Version: l.Profile.Profile.ShortVersion(),
+		Mode:    l.Profile.Mode,
+		Source:  l.Source,
+		At:      at,
+	}
+}
+
+func runPolicyRecord(b *policy.Binding) *RunPolicy {
+	if b == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	rp := &RunPolicy{Requested: b.Requested, Ceiling: b.Ceiling, Reason: b.Reason}
+	for _, l := range b.Effective.Layers {
+		rp.Layers = append(rp.Layers, layerRecord(l, now))
+	}
+	return rp
+}
+
+func (ac *apiConn) profiles() RunAPIResponse {
+	set := ac.s.policy.Load()
+	if set == nil {
+		return fail("the node agent has no policy loaded")
+	}
+	caller, err := ac.caller()
+	if err != nil {
+		return fail("%v", err)
+	}
+	name, allow, def, clamp, err := set.Allowed(caller)
+	if err != nil {
+		return fail("%v", err)
+	}
+	return RunAPIResponse{OK: true, Ceiling: name, Allow: allow, Default: def, Clamp: clamp}
+}
+
+// clamp layers a profile onto a live run, or revokes its egress. A layer
+// can only remove permissions, so the run's owner may do it as well as
+// root: it is the incident-response lever of §5.6.
+func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
+	runID := strings.TrimPrefix(req.RunID, RunPrefix)
+	var layer policy.Layer
+	who := fmt.Sprintf("uid %d", ac.cred.Uid)
+	if req.Op == "revoke" {
+		layer = policy.Layer{Profile: policy.RevokedProfile(), Source: "revoked by " + who}
+	} else {
+		set := ac.s.policy.Load()
+		if set == nil {
+			return fail("the node agent has no policy loaded")
+		}
+		cp := set.Profile(req.ClampProfile)
+		if cp == nil {
+			return fail("no profile named %q", req.ClampProfile)
+		}
+		layer = policy.Layer{Profile: cp, Source: "clamped by " + who}
+	}
+
+	ac.s.mu.Lock()
+	b, ok := ac.s.bound[runID]
+	if ok && ac.cred.Uid != 0 && int(ac.cred.Uid) != b.uid {
+		ac.s.mu.Unlock()
+		return fail("run %s belongs to another user", runID)
+	}
+	if ok {
+		b.eff = b.eff.With(layer)
+	}
+	ac.s.mu.Unlock()
+	if !ok {
+		return fail("no live profiled run %s", runID)
+	}
+
+	at := time.Now().UTC()
+	var rp *RunPolicy
+	ac.s.reg.Update(runID, func(m *RunMeta) {
+		if m.Policy != nil {
+			// Copy on write: the recorder may hold the old record.
+			np := *m.Policy
+			np.Layers = append(append([]PolicyLayer{}, m.Policy.Layers...), layerRecord(layer, at))
+			m.Policy = &np
+			rp = &np
+		}
+	})
+	log.Printf("run api: run %s: %s %s", runID, layer.Source, layer.Profile.Name)
+	return RunAPIResponse{OK: true, RunID: runID, Policy: rp}
 }
 
 // attach moves the process behind pidfd into the run. The process must be
@@ -554,6 +755,10 @@ func (ac *apiConn) finish(exitCode *int) {
 	}
 	ac.s.mu.Lock()
 	delete(ac.s.active, ac.runID)
+	if b, ok := ac.s.bound[ac.runID]; ok {
+		delete(ac.s.byCg, b.cgroupID)
+		delete(ac.s.bound, ac.runID)
+	}
 	ac.s.mu.Unlock()
 	ac.runID = ""
 }
@@ -603,9 +808,24 @@ func (rc *RunAPIClient) call(req RunAPIRequest, fds ...int) (RunAPIResponse, err
 	return resp, nil
 }
 
-// Create asks for a new run.
-func (rc *RunAPIClient) Create(command []string, cwd string) (RunAPIResponse, error) {
-	return rc.call(RunAPIRequest{Op: "create", Command: command, Cwd: cwd})
+// Create asks for a new run, optionally requesting a profile.
+func (rc *RunAPIClient) Create(command []string, cwd, profile string) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "create", Command: command, Cwd: cwd, Profile: profile})
+}
+
+// Profiles lists what the caller may request.
+func (rc *RunAPIClient) Profiles() (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "profiles"})
+}
+
+// Clamp layers a profile onto a live run.
+func (rc *RunAPIClient) Clamp(runID, profile string) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "clamp", RunID: runID, ClampProfile: profile})
+}
+
+// Revoke denies all further egress for a live run.
+func (rc *RunAPIClient) Revoke(runID string) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "revoke", RunID: runID})
 }
 
 // Attach moves the caller's child, identified by pidfd, into the run.

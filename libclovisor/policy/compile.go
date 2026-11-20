@@ -99,9 +99,12 @@ type CompiledProfile struct {
 	Version       string
 	Mode          string
 	DefaultAction string
-	Rules         []*compiledRule
-	Placements    []Placement
-	Profile       *AgentProfile
+	// DefaultMessage, if set, narrates default denies instead of the
+	// generated "No rule in profile ... allows ...".
+	DefaultMessage string
+	Rules          []*compiledRule
+	Placements     []Placement
+	Profile        *AgentProfile
 
 	exec *compiledExec
 }

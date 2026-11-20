@@ -27,6 +27,25 @@ type RunMeta struct {
 	StartedAt time.Time  `json:"started_at"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	ExitCode  *int       `json:"exit_code,omitempty"`
+	Policy    *RunPolicy `json:"policy,omitempty"`
+}
+
+// RunPolicy records which policy governed a run, by version (design
+// §5.6): the granted profile, then any clamps, in the order applied.
+type RunPolicy struct {
+	Requested string        `json:"requested,omitempty"`
+	Ceiling   string        `json:"ceiling"`
+	Reason    string        `json:"reason"`
+	Layers    []PolicyLayer `json:"layers"`
+}
+
+// PolicyLayer is one profile in a run's effective policy.
+type PolicyLayer struct {
+	Profile string    `json:"profile"`
+	Version string    `json:"version"` // sha256:<12 hex>
+	Mode    string    `json:"mode"`
+	Source  string    `json:"source"` // granted, ceiling clamp, clamped by ..., revoked by ...
+	At      time.Time `json:"at"`
 }
 
 // writeFileAtomic writes data to a temp file next to path and renames it
