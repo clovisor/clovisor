@@ -24,12 +24,16 @@ func TestParseRunArgs(t *testing.T) {
 		{[]string{"--profile=light", "curl", "-v"}, "light", []string{"curl", "-v"}},
 		{[]string{"curl", "--profile", "x"}, "", []string{"curl", "--profile", "x"}},
 	} {
-		p, _, cmd, err := parseRunArgs(tc.in)
+		o, cmd, err := parseRunArgs(tc.in)
+		p := o.profile
 		if err != nil || p != tc.profile || !reflect.DeepEqual(cmd, tc.cmd) {
 			t.Errorf("parseRunArgs(%q) = %q, %q, %v", tc.in, p, cmd, err)
 		}
 	}
-	if _, _, _, err := parseRunArgs([]string{"--profile"}); err == nil {
+	if o, cmd, err := parseRunArgs([]string{"--mcp-config", "m.json", "--no-proxy", "x"}); err != nil || o.mcpConfig != "m.json" || !o.noProxy || cmd[0] != "x" {
+		t.Errorf("mcp-config parse: %+v %v %v", o, cmd, err)
+	}
+	if _, _, err := parseRunArgs([]string{"--profile"}); err == nil {
 		t.Error("dangling --profile accepted")
 	}
 }

@@ -31,6 +31,7 @@ type NodeAgent struct {
 	recorder   *RunRecorder
 	api        *RunAPIServer
 	extproc    *ExtProcServer
+	mcp        *MCPGateway
 	httpEvents chan AuditEvent
 	policyDir  string
 	stopChan   chan bool
@@ -57,6 +58,11 @@ type NodeAgentOptions struct {
 	EnvoyUIDs     []uint32 // uids Envoy runs as, admitted to ext_proc (root always is)
 	// NonRunProxy lets processes outside any run use the proxy.
 	NonRunProxy bool
+
+	// MCPListen enables the local MCP gateway on a loopback address.
+	MCPListen netip.AddrPort
+	// MCPPins is the tool-definition pin store; /var/lib/clovisor/mcp-pins.json if empty.
+	MCPPins string
 }
 
 // NewNodeAgent creates a new node agent
@@ -180,7 +186,27 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		fmt.Printf("proxy: ext_proc on %s; Envoy bootstrap %s (proxy %s)\n", opts.ExtProcSocket, opts.EnvoyConfig, opts.ProxyListen)
 	}
 
+	var gw *MCPGateway
+	if opts.MCPListen.IsValid() {
+		if !opts.MCPListen.Addr().IsLoopback() {
+			return nil, fmt.Errorf("the MCP gateway must listen on loopback, not %s", opts.MCPListen)
+		}
+		if opts.MCPPins == "" {
+			opts.MCPPins = "/var/lib/clovisor/mcp-pins.json"
+		}
+		pins, err := OpenPinStore(opts.MCPPins)
+		if err != nil {
+			return nil, err
+		}
+		if gw, err = NewMCPGateway(api, opts.MCPListen, pins, httpEvents); err != nil {
+			return nil, err
+		}
+		api.MCP = gw
+		fmt.Printf("mcp: gateway on http://%s/mcp/<server>; pins in %s\n", opts.MCPListen, opts.MCPPins)
+	}
+
 	na := &NodeAgent{
+		mcp:        gw,
 		cmgr:       cmgr,
 		audit:      audit,
 		recorder:   recorder,
@@ -268,6 +294,9 @@ func (na *NodeAgent) Stop() error {
 	if na.extproc != nil {
 		na.extproc.Close()
 	}
+	if na.mcp != nil {
+		na.mcp.Close()
+	}
 	if na.api != nil {
 		na.api.Close()
 	}
@@ -309,6 +338,13 @@ func (na *NodeAgent) Run() error {
 		go func() {
 			if err := na.extproc.Serve(); err != nil {
 				fmt.Fprintf(os.Stderr, "ext_proc: %v\n", err)
+			}
+		}()
+	}
+	if na.mcp != nil {
+		go func() {
+			if err := na.mcp.Serve(); err != nil {
+				fmt.Fprintf(os.Stderr, "mcp gateway: %v\n", err)
 			}
 		}()
 	}
@@ -372,6 +408,19 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		d := event.Data.(DNSData)
 		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v\n",
 			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs())
+	case EventMCP:
+		d := event.Data.(MCPData)
+		extra := ""
+		if d.Layer != "" {
+			extra += " layer=" + d.Layer
+		}
+		if len(d.WouldDeny) > 0 {
+			extra += " would-deny=" + strings.Join(d.WouldDeny, ",")
+		}
+		if d.Reason != "" {
+			extra += " reason=" + strconv.Quote(d.Reason)
+		}
+		fmt.Printf("%s [MCP] run=%d %s %s %s decision=%s%s\n", ts, event.RunCgroupID, d.Server, d.Method, d.Name, d.Decision, extra)
 	case EventHTTP:
 		d := event.Data.(HTTPData)
 		what := d.Method + " " + net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))) + d.Path

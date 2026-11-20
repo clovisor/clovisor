@@ -107,6 +107,7 @@ type CompiledProfile struct {
 	Profile        *AgentProfile
 
 	exec *compiledExec
+	mcp  *MCP
 }
 
 // DestPosture is the TLS posture derived for one destination. Posture is
@@ -461,6 +462,7 @@ func (c *compiler) mcp(p *AgentProfile, cp *CompiledProfile) {
 	if m == nil {
 		return
 	}
+	cp.mcp = m
 	switch m.Default {
 	case ActionAllow, ActionDeny:
 	case "":

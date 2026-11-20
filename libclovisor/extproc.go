@@ -325,7 +325,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	ip, _ := netip.ParseAddr(host)
 
 	// Identity: the cgroup of the client's socket (Phase 2 finding 1).
-	runID, eff, isRun, cg := "", (*policy.Effective)(nil), false, uint64(0)
+	runID, eff, isRun, cg, runCg := "", (*policy.Effective)(nil), false, uint64(0), uint64(0)
 	src, err1 := attrAddrPort(req, "source.address", "source.port")
 	dst, err2 := attrAddrPort(req, "destination.address", "destination.port")
 	if err1 == nil && err2 == nil {
@@ -334,11 +334,11 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 		err = fmt.Errorf("no client address")
 	}
 	if err == nil {
-		runID, eff, isRun = s.api.RunFor(cg)
+		runID, runCg, eff, isRun = s.api.RunFor(cg)
 		if !isRun {
 			if p := findRunCgroupPath(s.agentsDir, cg); p != "" {
 				// A run from before this node agent started: unprofiled.
-				runID, isRun = strings.TrimPrefix(p[strings.LastIndex(p, "/")+1:], RunPrefix), true
+				runID, runCg, isRun = strings.TrimPrefix(p[strings.LastIndex(p, "/")+1:], RunPrefix), cg, true
 			}
 		}
 	}
@@ -356,7 +356,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	if reason := s.guard(ctx, host, ip); reason != "" {
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "guard: "+reason
 		d.Message = "Egress to " + net.JoinHostPort(host, strconv.Itoa(int(port))) + " is refused: " + reason + "."
-		s.record(cg, runID, d)
+		s.record(runCg, runID, d)
 		return s.deny(d, runID)
 	}
 
@@ -381,7 +381,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	} else {
 		d.Reason = "unprofiled run"
 	}
-	s.record(cg, runID, d)
+	s.record(runCg, runID, d)
 	if d.Decision == policy.ActionDeny && d.Enforced {
 		return s.deny(d, runID)
 	}
@@ -390,11 +390,13 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	}}
 }
 
-func (s *ExtProcServer) record(cg uint64, runID string, d HTTPData) {
-	if runID == "" || s.events == nil {
+// record files a decision under the run's own cgroup id, which is how
+// the recorder keys runs, whichever child cgroup the client was in.
+func (s *ExtProcServer) record(runCg uint64, runID string, d HTTPData) {
+	if runID == "" || runCg == 0 || s.events == nil {
 		return
 	}
-	ev := AuditEvent{Type: EventHTTP, Timestamp: time.Now(), CgroupID: cg, RunCgroupID: cg, Data: d}
+	ev := AuditEvent{Type: EventHTTP, Timestamp: time.Now(), CgroupID: runCg, RunCgroupID: runCg, Data: d}
 	select {
 	case s.events <- ev:
 	default:

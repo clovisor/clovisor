@@ -68,6 +68,9 @@ type RunAPIRequest struct {
 	// RunID and ClampProfile target clamp and revoke.
 	RunID        string `json:"run_id,omitempty"`
 	ClampProfile string `json:"clamp_profile,omitempty"`
+	// MCPServers are stdio servers to expose through the MCP gateway
+	// (op mcp_register, on the run's own connection).
+	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
 }
 
 // RunAPIResponse is the agent's reply to each request.
@@ -83,6 +86,8 @@ type RunAPIResponse struct {
 	Allow   []string `json:"allow,omitempty"`
 	Default string   `json:"default,omitempty"`
 	Clamp   string   `json:"clamp,omitempty"`
+	// mcp_register:
+	MCP []MCPRegistration `json:"mcp,omitempty"`
 }
 
 // RunRegistry holds metadata for runs created through the API until the
@@ -138,13 +143,16 @@ type RunAPIServer struct {
 	policy atomic.Pointer[policy.Set] // nil: no policy loaded; runs are unprofiled
 	// ProxyURL is the node's explicit proxy, handed to clients for runs.
 	ProxyURL string
+	// MCP is the local MCP gateway, if enabled.
+	MCP *MCPGateway
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
 	active  map[string]bool // runs owned by a live connection
 	bound   map[string]*boundRun
 	byCg    map[uint64]*boundRun
-	runByCg map[uint64]string // every live run, profiled or not
+	runByCg map[uint64]string // every live run, profiled or not, and its child cgroups
+	runCg   map[string]uint64 // run id -> the run's own cgroup id
 	closing bool
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -162,16 +170,41 @@ type boundRun struct {
 // keep the versions they were bound to (§5.6, versioned binding).
 func (s *RunAPIServer) SetPolicy(set *policy.Set) { s.policy.Store(set) }
 
-// RunFor returns the live run whose cgroup is cgroupID and its effective
-// policy (nil for an unprofiled run), for enforcement points.
-func (s *RunAPIServer) RunFor(cgroupID uint64) (runID string, eff *policy.Effective, isRun bool) {
+// effectiveOf returns a live run's current effective policy, or nil.
+func (s *RunAPIServer) effectiveOf(runID string) *policy.Effective {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if b, ok := s.bound[runID]; ok {
+		return b.eff
+	}
+	return nil
+}
+
+// addRunCgroup attributes a child cgroup of a run (an MCP server's) to
+// the run, so enforcement points identify its sockets as the run's.
+func (s *RunAPIServer) addRunCgroup(runID string, cgroupID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active[runID] {
+		return
+	}
+	s.runByCg[cgroupID] = runID
+	if b, ok := s.bound[runID]; ok {
+		s.byCg[cgroupID] = b
+	}
+}
+
+// RunFor returns the live run that cgroupID belongs to (the run's own
+// cgroup or one of its children), the run's own cgroup id, under which its
+// events are recorded, and its effective policy (nil for an unprofiled run).
+func (s *RunAPIServer) RunFor(cgroupID uint64) (runID string, runCg uint64, eff *policy.Effective, isRun bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	runID, isRun = s.runByCg[cgroupID]
 	if b, ok := s.byCg[cgroupID]; ok {
 		eff = b.eff
 	}
-	return runID, eff, isRun
+	return runID, s.runCg[runID], eff, isRun
 }
 
 // reapInterval is how often orphaned run cgroups are checked.
@@ -215,6 +248,7 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		bound:     map[string]*boundRun{},
 		byCg:      map[uint64]*boundRun{},
 		runByCg:   map[uint64]string{},
+		runCg:     map[string]uint64{},
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -386,6 +420,8 @@ type apiConn struct {
 	cred     *unix.Ucred
 	runID    string
 	runPath  string
+	cgID     uint64
+	cwd      string
 	attached bool
 }
 
@@ -478,6 +514,8 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		return ac.profiles()
 	case "clamp", "revoke":
 		return ac.clamp(req)
+	case "mcp_register":
+		return ac.mcpRegister(req)
 	default:
 		return fail("unknown op %q", req.Op)
 	}
@@ -529,6 +567,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	if err == nil {
 		ac.s.active[runID] = true
 		ac.s.runByCg[id] = runID
+		ac.s.runCg[runID] = id
 		if binding != nil {
 			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: binding.Effective}
 			ac.s.bound[runID] = b
@@ -539,7 +578,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	if err != nil {
 		return fail("%v", err)
 	}
-	ac.runID, ac.runPath = runID, path
+	ac.runID, ac.runPath, ac.cgID, ac.cwd = runID, path, id, req.Cwd
 	rp := runPolicyRecord(binding)
 	ac.s.reg.Put(RunMeta{
 		RunID:     runID,
@@ -627,6 +666,24 @@ func (ac *apiConn) profiles() RunAPIResponse {
 		return fail("%v", err)
 	}
 	return RunAPIResponse{OK: true, Ceiling: name, Allow: allow, Default: def, Clamp: clamp}
+}
+
+// mcpRegister exposes the run's stdio MCP servers through the gateway.
+// Only the connection that created the run may do it.
+func (ac *apiConn) mcpRegister(req RunAPIRequest) RunAPIResponse {
+	if ac.runID == "" {
+		return fail("no run: send create first")
+	}
+	if ac.s.MCP == nil {
+		return fail("this node agent has no MCP gateway (start it with -mcp-listen)")
+	}
+	caller, err := ac.caller()
+	if err != nil {
+		return fail("%v", err)
+	}
+	run := &mcpRun{runID: ac.runID, cgPath: ac.runPath, cgID: ac.cgID, uid: int(ac.cred.Uid),
+		gid: int(ac.cred.Gid), groups: caller.GIDs[1:], cwd: ac.cwd}
+	return RunAPIResponse{OK: true, RunID: ac.runID, MCP: ac.s.MCP.Register(run, req.MCPServers)}
 }
 
 // clamp layers a profile onto a live run, or revokes its egress. A layer
@@ -756,13 +813,20 @@ func (ac *apiConn) finish(exitCode *int) {
 		m.EndedAt = &end
 		m.ExitCode = exitCode
 	})
+	if ac.s.MCP != nil {
+		ac.s.MCP.EndRun(ac.runID)
+	}
 	if err := ac.s.cm.DestroyRunCgroup(ac.runID); err != nil {
 		log.Printf("run api: run %s: %v", ac.runID, err)
 	}
 	ac.s.mu.Lock()
 	delete(ac.s.active, ac.runID)
 	if b, ok := ac.s.bound[ac.runID]; ok {
-		delete(ac.s.byCg, b.cgroupID)
+		for cg, bb := range ac.s.byCg {
+			if bb == b {
+				delete(ac.s.byCg, cg)
+			}
+		}
 		delete(ac.s.bound, ac.runID)
 	}
 	for cg, r := range ac.s.runByCg {
@@ -770,6 +834,7 @@ func (ac *apiConn) finish(exitCode *int) {
 			delete(ac.s.runByCg, cg)
 		}
 	}
+	delete(ac.s.runCg, ac.runID)
 	ac.s.mu.Unlock()
 	ac.runID = ""
 }
@@ -832,6 +897,12 @@ func (rc *RunAPIClient) Profiles() (RunAPIResponse, error) {
 // Clamp layers a profile onto a live run.
 func (rc *RunAPIClient) Clamp(runID, profile string) (RunAPIResponse, error) {
 	return rc.call(RunAPIRequest{Op: "clamp", RunID: runID, ClampProfile: profile})
+}
+
+// RegisterMCP exposes stdio MCP servers for the run created on this
+// connection.
+func (rc *RunAPIClient) RegisterMCP(servers []MCPServerSpec) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "mcp_register", MCPServers: servers})
 }
 
 // Revoke denies all further egress for a live run.

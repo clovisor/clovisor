@@ -30,15 +30,18 @@ var (
 	envoyCfg = flag.String("envoy-config", "/run/clovisor/envoy.json", "Where to write the generated Envoy bootstrap")
 	envoyUID = flag.String("envoy-uids", "101", "Comma-separated uids Envoy runs as, admitted to ext_proc (root always is)")
 	nonRun   = flag.Bool("proxy-non-run", false, "Let processes outside any run use the proxy")
+	mcpAddr  = flag.String("mcp-listen", "", "Enable the local MCP gateway on this loopback address, e.g. 127.0.0.1:18100")
 )
 
-func proxyAddr() netip.AddrPort {
-	if *proxy == "" {
+func proxyAddr() netip.AddrPort { return addrFlag("-proxy-listen", *proxy) }
+
+func addrFlag(name, v string) netip.AddrPort {
+	if v == "" {
 		return netip.AddrPort{}
 	}
-	ap, err := netip.ParseAddrPort(*proxy)
+	ap, err := netip.ParseAddrPort(v)
 	if err != nil {
-		log.Fatalf("-proxy-listen: %v", err)
+		log.Fatalf("%s: %v", name, err)
 	}
 	return ap
 }
@@ -73,6 +76,7 @@ func main() {
 		EnvoyConfig:   *envoyCfg,
 		EnvoyUIDs:     uids(*envoyUID),
 		NonRunProxy:   *nonRun,
+		MCPListen:     addrFlag("-mcp-listen", *mcpAddr),
 	})
 	// A policy that does not load is fatal at start: running without it
 	// would silently leave runs unprofiled.

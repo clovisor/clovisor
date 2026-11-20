@@ -1792,6 +1792,71 @@ it writes (`make envoy`).
 - **Dependencies.** go-control-plane v1.32.4 and gRPC v1.70.0, the newest that
   keep the module at Go 1.23.
 
+#### 2.5 status, part 1: local MCP gateway (2026-11-20)
+
+Done: the local MCP gateway of [§8.3](#83-normalize-the-transport). Enable it
+with `node-agent -mcp-listen 127.0.0.1:18100`.
+
+- **Where it runs.** In the node agent, not in the run. A gateway the agent
+  controls could be bypassed from the inside, not just around.
+- **Registration.** `agentctl run --mcp-config file` reads the common
+  `{"mcpServers": {...}}` format and registers each stdio server on the run's
+  own connection. The gateway refuses servers the run's `mcp` policy refuses:
+  `match.stdio` is matched against the command line (an argument, the same
+  with `@version` as `npx` and `uvx` specs use, an executable's basename, or a
+  glob).
+  - `agentctl` writes a copy of the config with accepted servers pointing at
+    `http://127.0.0.1:18100/mcp/<name>`, refused and unresolvable ones left
+    out, and remote entries unchanged. Its path is passed to the run as
+    `CLOVISOR_MCP_CONFIG`.
+- **Server processes.** Started on `initialize`, one per run and server, as
+  the run's uid and groups. Each is spawned with `clone3` directly into a
+  child cgroup `agents/run-<id>/mcp-<name>`. That cgroup is registered with the
+  run, so the server's own egress is attributed to the run: it gets the proxy
+  variables, the proxy applies the run's policy, and its decisions land in the
+  run's timeline. The servers end with the run.
+- **Identity.** Each HTTP request is attributed by the client socket's cgroup,
+  as in `ext_proc`. Only the run that registered a server can use it; clients
+  outside any run are refused.
+- **Transport.** Streamable HTTP: POST of single messages or batches,
+  `Mcp-Session-Id`, 404 for an unknown session so clients re-initialize, 202
+  for notifications and responses. GET opens an SSE stream for
+  server-initiated messages, and DELETE ends the session.
+- **Enforcement on the JSON-RPC.**
+  - `tools/call` for a denied tool never reaches the server. The answer is a
+    tool result with `isError: true` and the policy's message, which is what a
+    model reads (§7.7).
+  - `resources/read` is checked against `allow_uri`.
+  - `tools/list` is filtered, so the model is never offered a tool it cannot
+    call.
+  - Server-initiated `sampling/createMessage` is refused with the policy's
+    message unless `sampling.action: allow`.
+  - Layers combine as for egress. A layer with no `mcp` block abstains, so an
+    egress-only clamp does not switch MCP off.
+- **Tool pinning** ([§8.4](#84-two-mcp-specific-threats)). With
+  `pin_tool_definitions`, each tool's definition is hashed (canonical JSON) on
+  first sight, per profile and server rule, in
+  `/var/lib/clovisor/mcp-pins.json`. When a later `tools/list` shows a changed
+  definition:
+  - in enforce mode, the tool is dropped from the list and calls to it are
+    refused until an operator re-approves it, by deleting its pin;
+  - in audit mode, it is recorded as would-deny.
+- **Audit.** Registrations, calls, resource reads, sampling requests and
+  drift are `mcp` timeline events, with a per-tool summary. The §8.6 chain is
+  visible in one timeline: tool call, the egress it caused, and the decision
+  on that egress.
+- **Bug found.** Proxy decisions for clients in a run's child cgroup were filed
+  under the child cgroup id, and so under a phantom run. Enforcement points now
+  file events under the run's own cgroup id.
+- **Not yet.**
+  - Per-server attenuation ([§7.8](#78-sub-agent-delegation-monotonic-attenuation)):
+    servers inherit the run's effective policy rather than a narrower profile
+    of their own.
+  - A command to review and re-approve pins.
+  - Learning tool lists (2.6).
+  - The bypass of §8.3 stands: an agent can spawn a stdio server itself, and
+    exec policy is the backstop (Phase 4).
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT

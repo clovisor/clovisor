@@ -33,7 +33,7 @@ func printUsage() {
 	fmt.Println("AgentCtl - Agent Cgroup Control Tool (Phase 1)")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--] <command> [args...]")
+	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--mcp-config file] [--] <command> [args...]")
 	fmt.Println("                                    Run a command as a governed run")
 	fmt.Println("  agentctl profiles                 Show which profiles you may request")
 	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
@@ -116,7 +116,120 @@ func proxyEnv(env []string, proxy string) []string {
 	return out
 }
 
-func runCommand(args []string, profile string, noProxy bool) (int, error) {
+// mcpConfig is the common MCP client configuration format
+// ({"mcpServers": {name: {...}}}), as read by most harnesses.
+type mcpConfig struct {
+	MCPServers map[string]map[string]interface{} `json:"mcpServers"`
+}
+
+// prepareMCP registers the stdio servers in configPath with the gateway
+// and writes a copy of the config pointing them at it. Remote (url)
+// entries pass through unchanged: they are ordinary egress. Servers the
+// policy refuses are left out, with the reason printed.
+func prepareMCP(api *clovisor.RunAPIClient, configPath, proxy string) (string, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+	var cfg mcpConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("%s: %w", configPath, err)
+	}
+	baseEnv := map[string]string{}
+	for _, k := range []string{"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TERM"} {
+		if v, ok := os.LookupEnv(k); ok {
+			baseEnv[k] = v
+		}
+	}
+	if proxy != "" {
+		for _, kv := range proxyEnv(nil, proxy) {
+			k, v, _ := strings.Cut(kv, "=")
+			baseEnv[k] = v
+		}
+	}
+
+	var specs []clovisor.MCPServerSpec
+	names := make([]string, 0, len(cfg.MCPServers))
+	for n := range cfg.MCPServers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		entry := cfg.MCPServers[name]
+		command, _ := entry["command"].(string)
+		if command == "" {
+			continue // remote server
+		}
+		path, err := exec.LookPath(command)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "agentctl: MCP server %s left out: %v\n", name, err)
+			delete(cfg.MCPServers, name)
+			continue
+		}
+		if path, err = filepath.Abs(path); err != nil {
+			return "", err
+		}
+		argv := []string{path}
+		if args, ok := entry["args"].([]interface{}); ok {
+			for _, a := range args {
+				s, ok := a.(string)
+				if !ok {
+					return "", fmt.Errorf("mcp server %s: args must be strings", name)
+				}
+				argv = append(argv, s)
+			}
+		}
+		env := map[string]string{}
+		for k, v := range baseEnv {
+			env[k] = v
+		}
+		if e, ok := entry["env"].(map[string]interface{}); ok {
+			for k, v := range e {
+				if s, ok := v.(string); ok {
+					env[k] = s
+				}
+			}
+		}
+		specs = append(specs, clovisor.MCPServerSpec{Name: name, Command: argv, Env: env})
+	}
+
+	if len(specs) > 0 {
+		resp, err := api.RegisterMCP(specs)
+		if err != nil {
+			return "", err
+		}
+		for _, reg := range resp.MCP {
+			if reg.Error != "" {
+				fmt.Fprintf(os.Stderr, "agentctl: MCP server %s refused: %s\n", reg.Name, reg.Error)
+				delete(cfg.MCPServers, reg.Name)
+				continue
+			}
+			note := ""
+			if len(reg.WouldDeny) > 0 {
+				note = " (would be refused by " + strings.Join(reg.WouldDeny, ", ") + ")"
+			}
+			fmt.Fprintf(os.Stderr, "agentctl: MCP server %s via %s%s\n", reg.Name, reg.URL, note)
+			cfg.MCPServers[reg.Name] = map[string]interface{}{"type": "http", "url": reg.URL}
+		}
+	}
+
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", "clovisor-mcp-*.json")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(out, '\n')); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func runCommand(args []string, profile string, noProxy bool, mcpConfigPath string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
 	}
@@ -162,9 +275,24 @@ func runCommand(args []string, profile string, noProxy bool) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{relR}
+	cmd.Env = os.Environ()
 	if run.Proxy != "" && !noProxy {
-		cmd.Env = proxyEnv(os.Environ(), run.Proxy)
+		cmd.Env = proxyEnv(cmd.Env, run.Proxy)
 		fmt.Fprintf(os.Stderr, "agentctl: egress via %s\n", run.Proxy)
+	}
+	if mcpConfigPath != "" {
+		proxy := run.Proxy
+		if noProxy {
+			proxy = ""
+		}
+		rewritten, err := prepareMCP(api, mcpConfigPath, proxy)
+		if err != nil {
+			relR.Close()
+			return 0, err
+		}
+		defer os.Remove(rewritten)
+		cmd.Env = append(cmd.Env, "CLOVISOR_MCP_CONFIG="+rewritten)
+		fmt.Fprintf(os.Stderr, "agentctl: MCP config for the harness: $CLOVISOR_MCP_CONFIG (%s)\n", rewritten)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &pidfd}
 
@@ -234,28 +362,42 @@ func describePolicy(rp *clovisor.RunPolicy) string {
 	return "profile " + strings.Join(parts, " + ")
 }
 
-// parseRunArgs splits "[--profile p] [--no-proxy] [--] command..." for
-// agentctl run.
-func parseRunArgs(args []string) (profile string, noProxy bool, cmd []string, err error) {
+// runArgs are agentctl run's options.
+type runArgs struct {
+	profile   string
+	noProxy   bool
+	mcpConfig string
+}
+
+// parseRunArgs splits "[--profile p] [--no-proxy] [--mcp-config f] [--]
+// command..." for agentctl run.
+func parseRunArgs(args []string) (o runArgs, cmd []string, err error) {
 	for len(args) > 0 {
 		a := args[0]
 		switch {
 		case a == "--no-proxy":
-			noProxy, args = true, args[1:]
+			o.noProxy, args = true, args[1:]
+		case a == "--mcp-config":
+			if len(args) < 2 {
+				return o, nil, fmt.Errorf("--mcp-config needs a file")
+			}
+			o.mcpConfig, args = args[1], args[2:]
+		case strings.HasPrefix(a, "--mcp-config="):
+			o.mcpConfig, args = strings.TrimPrefix(a, "--mcp-config="), args[1:]
 		case a == "--":
-			return profile, noProxy, args[1:], nil
+			return o, args[1:], nil
 		case a == "--profile" || a == "-profile":
 			if len(args) < 2 {
-				return "", false, nil, fmt.Errorf("--profile needs a name")
+				return o, nil, fmt.Errorf("--profile needs a name")
 			}
-			profile, args = args[1], args[2:]
+			o.profile, args = args[1], args[2:]
 		case strings.HasPrefix(a, "--profile="):
-			profile, args = strings.TrimPrefix(a, "--profile="), args[1:]
+			o.profile, args = strings.TrimPrefix(a, "--profile="), args[1:]
 		default:
-			return profile, noProxy, args, nil
+			return o, args, nil
 		}
 	}
-	return profile, noProxy, nil, nil
+	return o, nil, nil
 }
 
 func listProfiles() error {
@@ -483,6 +625,20 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if e.DstName != "" {
 				detail += " (" + e.DstName + ")"
 			}
+		case "mcp":
+			detail = fmt.Sprintf("%s %s %s -> %s", e.MCPServer, e.Method, e.MCPName, e.Decision)
+			if e.Decision == "deny" && !e.Enforced {
+				detail += " (not enforced)"
+			}
+			if e.Layer != "" {
+				detail += " by " + e.Layer
+			}
+			if len(e.WouldDeny) > 0 {
+				detail += " (would deny: " + strings.Join(e.WouldDeny, ", ") + ")"
+			}
+			if e.Reason != "" {
+				detail += " [" + e.Reason + "]"
+			}
 		case "http":
 			detail = fmt.Sprintf("%s %s%s -> %s", e.Method, net.JoinHostPort(e.DstName, strconv.Itoa(int(e.DstPort))), e.Path, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -526,6 +682,19 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	fmt.Printf("DNS names (%d)\n", len(tl.Summary.DNSNames))
 	for _, n := range tl.Summary.DNSNames {
 		fmt.Printf("  %s\n", n)
+	}
+	if len(tl.Summary.MCP) > 0 {
+		fmt.Printf("MCP (%d)\n", len(tl.Summary.MCP))
+		for _, u := range tl.Summary.MCP {
+			note := ""
+			if u.Denied > 0 {
+				note += fmt.Sprintf(" denied %d", u.Denied)
+			}
+			if u.WouldDeny > 0 {
+				note += fmt.Sprintf(" would-deny %d", u.WouldDeny)
+			}
+			fmt.Printf("  %-12s %-16s %-28s x%-4d%s\n", u.Server, u.Method, u.Name, u.Calls, note)
+		}
 	}
 	if len(tl.Summary.Proxied) > 0 {
 		fmt.Printf("Via proxy (%d destinations, %d connections to the proxy)\n", len(tl.Summary.Proxied), tl.Summary.ProxyConnects)
@@ -731,12 +900,12 @@ func main() {
 	switch command {
 	case "run":
 		// Pass remaining args to runCommand (skip "--" if present)
-		profile, noProxy, args, err := parseRunArgs(os.Args[2:])
+		o, args, err := parseRunArgs(os.Args[2:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		code, err := runCommand(args, profile, noProxy)
+		code, err := runCommand(args, o.profile, o.noProxy, o.mcpConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

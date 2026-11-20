@@ -60,6 +60,18 @@ type RunSummary struct {
 	// not listed as destinations.
 	Proxied       []ProxiedDest `json:"proxied,omitempty"`
 	ProxyConnects int           `json:"proxy_connects,omitempty"`
+	// MCP is what the run did through the local MCP gateway.
+	MCP []MCPUse `json:"mcp,omitempty"`
+}
+
+// MCPUse aggregates gateway operations on one tool or resource.
+type MCPUse struct {
+	Server    string `json:"server"`
+	Method    string `json:"method"` // tools/call, resources/read, ...
+	Name      string `json:"name,omitempty"`
+	Calls     int    `json:"calls"`
+	Denied    int    `json:"denied,omitempty"`
+	WouldDeny int    `json:"would_deny,omitempty"`
 }
 
 // ProxiedDest aggregates proxied requests to one destination.
@@ -111,7 +123,10 @@ type TimelineEvent struct {
 	Layer     string   `json:"layer,omitempty"`
 	WouldDeny []string `json:"would_deny,omitempty"`
 	Reason    string   `json:"reason,omitempty"`
-	Note      string   `json:"note,omitempty"`
+	// mcp events:
+	MCPServer string `json:"mcp_server,omitempty"`
+	MCPName   string `json:"mcp_name,omitempty"` // tool or resource
+	Note      string `json:"note,omitempty"`
 }
 
 type destKey struct {
@@ -131,7 +146,10 @@ type runState struct {
 	// returned it in this run.
 	ipName  map[string]string
 	proxied map[proxKey]*ProxiedDest
+	mcp     map[mcpKey]*MCPUse
 }
+
+type mcpKey struct{ server, method, name string }
 
 type proxKey struct {
 	host string
@@ -248,6 +266,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		names:    make(map[string]struct{}),
 		ipName:   make(map[string]string),
 		proxied:  make(map[proxKey]*ProxiedDest),
+		mcp:      make(map[mcpKey]*MCPUse),
 	}
 	if ev.Type == EventRunStart {
 		st.sawStart = true
@@ -261,6 +280,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		}
 		if err == nil && prev.CgroupID == id && prev.EndedAt == nil {
 			st.tl = prev
+			for i := range prev.Summary.MCP {
+				u := prev.Summary.MCP[i]
+				st.mcp[mcpKey{u.Server, u.Method, u.Name}] = &u
+			}
 			for i := range prev.Summary.Proxied {
 				p := prev.Summary.Proxied[i]
 				st.proxied[proxKey{p.Host, p.Port}] = &p
@@ -379,6 +402,39 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			DstName:  name,
 		}, r.MaxEvents)
 
+	case EventMCP:
+		d := ev.Data.(MCPData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		k := mcpKey{d.Server, d.Method, d.Name}
+		u := st.mcp[k]
+		if u == nil {
+			u = &MCPUse{Server: d.Server, Method: d.Method, Name: d.Name}
+			st.mcp[k] = u
+		}
+		u.Calls++
+		if d.Decision == "deny" && d.Enforced {
+			u.Denied++
+		} else if len(d.WouldDeny) > 0 {
+			u.WouldDeny++
+		}
+		st.add(TimelineEvent{
+			Time:      ev.Timestamp,
+			Type:      "mcp",
+			CgroupID:  ev.CgroupID,
+			Method:    d.Method,
+			MCPServer: d.Server,
+			MCPName:   d.Name,
+			Decision:  d.Decision,
+			Enforced:  d.Enforced,
+			Rule:      d.Rule,
+			Layer:     d.Layer,
+			WouldDeny: d.WouldDeny,
+			Reason:    d.Reason,
+		}, r.MaxEvents)
+
 	case EventHTTP:
 		d := ev.Data.(HTTPData)
 		st := r.state(ev, "")
@@ -491,6 +547,21 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl.Summary.Binaries = sortedKeys(st.binaries)
 
 	tl.Summary.DNSNames = sortedKeys(st.names)
+
+	tl.Summary.MCP = nil
+	for _, u := range st.mcp {
+		tl.Summary.MCP = append(tl.Summary.MCP, *u)
+	}
+	sort.Slice(tl.Summary.MCP, func(i, j int) bool {
+		a, b := tl.Summary.MCP[i], tl.Summary.MCP[j]
+		if a.Server != b.Server {
+			return a.Server < b.Server
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		return a.Name < b.Name
+	})
 
 	tl.Summary.Proxied = nil
 	for _, pd := range st.proxied {

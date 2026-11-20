@@ -93,7 +93,7 @@ func newTestExtProc(t *testing.T, profiled bool) (*ExtProcServer, chan AuditEven
 	t.Helper()
 	cm := &CgroupManager{agents: t.TempDir(), runMap: map[string]string{}}
 	api := &RunAPIServer{cm: cm, active: map[string]bool{}, bound: map[string]*boundRun{},
-		byCg: map[uint64]*boundRun{}, runByCg: map[uint64]string{}}
+		byCg: map[uint64]*boundRun{}, runByCg: map[uint64]string{}, runCg: map[string]uint64{}}
 	events := make(chan AuditEvent, 64)
 	xp := NewExtProcServer(api, cm.agents, events)
 	xp.resolve = func(_ context.Context, host string) ([]netip.Addr, error) {
@@ -106,6 +106,7 @@ func newTestExtProc(t *testing.T, profiled bool) (*ExtProcServer, chan AuditEven
 	t.Cleanup(c.close)
 	cg := ownCgroupID(t)
 	api.runByCg[cg] = "testrun"
+	api.runCg["testrun"] = cg
 	if profiled {
 		p, _ := policy.Parse([]byte(xpProfile))
 		comp, diags := policy.Compile(policy.Options{Linux: true}, p)
@@ -251,5 +252,21 @@ func TestSplitAuthority(t *testing.T) {
 		if _, _, err := splitAuthority(bad, 80); err == nil {
 			t.Errorf("splitAuthority(%q) accepted", bad)
 		}
+	}
+}
+
+// A client in a child cgroup of a run (an MCP server's) is the run's, and
+// its decisions are filed under the run's own cgroup id.
+func TestExtProcChildCgroupAttribution(t *testing.T) {
+	xp, events, c := newTestExtProc(t, false)
+	own := ownCgroupID(t)
+	// Pretend our cgroup is a child of run "testrun", whose own cgroup is 42.
+	xp.api.runCg["testrun"] = 42
+	if allowed, _, _ := decide(t, xp, c, "CONNECT", "example.com:443", ""); !allowed {
+		t.Fatal("child-cgroup client refused")
+	}
+	ev := <-events
+	if ev.RunCgroupID != 42 || ev.CgroupID != 42 || own == 42 {
+		t.Fatalf("filed under %d/%d, want the run's cgroup 42", ev.RunCgroupID, ev.CgroupID)
 	}
 }
