@@ -404,7 +404,29 @@ detail on this path.**
 **Who creates the cgroup.** A containerized harness running non-root cannot
 write host cgroupfs. Do not solve this with delegation. The node agent owns all
 cgroup manipulation from the host namespace and exposes a small local API
-("give me a cgroup for run X") returning an fd the harness passes to `CgroupFD`.
+("give me a cgroup for run X").
+
+*Revised 2026-11-20.* The API cannot simply return an fd for the harness to pass
+to `CgroupFD`:
+- `clone3(CLONE_INTO_CGROUP)` applies the same permission check as writing
+  `cgroup.procs`.
+- That check includes write access to the `cgroup.procs` of the common ancestor
+  of the source and target cgroups. For `agents/` the common ancestor is the
+  root cgroup.
+- Verified on the development kernel: a non-root caller gets `EPERM` even when
+  it owns the target cgroup and its `cgroup.procs`.
+
+So the node agent moves the process itself, and the harness parks the child
+until the move is done:
+1. The harness starts its child as a shim: its own code, blocked on a pipe.
+2. It sends the node agent a pidfd for that child over `SCM_RIGHTS`.
+3. The node agent checks, against `SO_PEERCRED`, that the target is a direct
+   child of the caller with the caller's uid, and that neither is already in a
+   run. It then writes the pid into the run's `cgroup.procs`.
+4. The shim is released and `exec`s the command in the same process.
+
+The guarantee is the same as `clone3`: no governed code ever runs outside the
+run. A caller can only ever confine its own children.
 Note `bpf_get_current_cgroup_id()` returns the host kernfs id regardless of
 cgroup namespacing, so the BPF side is unaffected; only userspace path
 construction cares, and that now lives in one place.
@@ -1457,7 +1479,7 @@ output is what makes Phase 2 profiles authorable.
 **Scope discipline.** Each phase must be useful on its own if the next one never
 ships. Phase 2 is the minimum product; everything after it hardens or extends it.
 
-### Phase 1 status (2026-11-19)
+### Phase 1 status (2026-11-20)
 
 Implemented:
 
@@ -1476,9 +1498,8 @@ Implemented:
   - At run end the node agent writes `/var/lib/clovisor/runs/run-<id>.json`:
     metadata, a summary (distinct binaries, and destinations with counts) and
     the ordered events.
-  - `agentctl` contributes the command line, uid and exit code through a spool
-    file in `/run/clovisor/runs`. This is an interim channel until the §5.4
-    API exists.
+  - `agentctl` contributes the command line, uid and exit code; since the run
+    API, over the socket.
   - Runs in progress at node-agent shutdown are written as partial timelines.
     A restarted agent resumes them, marks the gap, and flags the run
     `complete: false`.
@@ -1519,10 +1540,26 @@ Implemented:
   - `to.cidr` is not in the §7.3 example. Learn mode introduces it for the
     "other TCP" row of §7.5, and the Phase 2 compiler must accept it.
 
-Not yet done:
+- *Added 2026-11-20.* Run API ([§5.2](#52-enforcement-identity-cgroup-v2),
+  [§5.4](#54-the-injection-channel)). The node agent serves
+  `/run/clovisor/agent.sock` (`SOCK_SEQPACKET`, JSON) and is the only process
+  that creates, joins or removes run cgroups. `agentctl` needs no privileges.
+  - **Operations.** `create`, then `attach` (with a pidfd, as above), then
+    `end` (with the exit code).
+  - **Rules.** A run cannot create a run: the caller must not be inside
+    `agents/`. Nesting belongs to §7.8 attenuation.
+  - **A run lives as long as its connection.** If the client dies, the node
+    agent kills the run's processes and removes the cgroup.
+  - **Node-agent shutdown leaves runs running.** A reaper in the next node agent
+    removes run cgroups no client owns once they are empty, which finalizes
+    their timelines. Such runs lose their exit code, and their end time is when
+    the reaper ran, up to 5 s late. Watching `cgroup.events` would make that
+    exact.
+  - **Timeline files** are owned by, and readable only by, the user who started
+    the run.
 
-- the node-agent-owned cgroup API ([§5.4](#54-the-injection-channel)).
-  `agentctl` still creates cgroups directly, as root.
+Phase 1 is complete. Known gaps carried forward: a lost-event counter for ring
+buffer overflow, and DNS outside UDP/53 (fixed by Phase 3's forced local DNS).
 
 Implementation note: BPF programs attached to `syscalls/sys_enter_*` tracepoints
 through perf events fired only on the CPU the perf event was opened on, on the

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -26,9 +27,11 @@ const (
 )
 
 // CgroupManager manages cgroup v2 hierarchy for agent runs
+// Safe for concurrent use.
 type CgroupManager struct {
 	root   string
 	agents string
+	mu     sync.Mutex
 	runMap map[string]string
 }
 
@@ -99,7 +102,9 @@ func (cm *CgroupManager) CreateRunCgroup(runID string) (string, uint64, error) {
 		return "", 0, fmt.Errorf("failed to get cgroup id: %w", err)
 	}
 
+	cm.mu.Lock()
 	cm.runMap[runID] = cgroupPath
+	cm.mu.Unlock()
 
 	return cgroupPath, cgroupID, nil
 }
@@ -109,7 +114,9 @@ func (cm *CgroupManager) CreateRunCgroup(runID string) (string, uint64, error) {
 // then removes it. cgroupfs only allows rmdir on an empty cgroup; its
 // control files cannot be unlinked, so os.RemoveAll does not work here.
 func (cm *CgroupManager) DestroyRunCgroup(runID string) error {
+	cm.mu.Lock()
 	cgroupPath, ok := cm.runMap[runID]
+	cm.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("run cgroup not found for %s", runID)
 	}
@@ -139,7 +146,9 @@ func (cm *CgroupManager) DestroyRunCgroup(runID string) error {
 		return err
 	}
 
+	cm.mu.Lock()
 	delete(cm.runMap, runID)
+	cm.mu.Unlock()
 	return nil
 }
 
@@ -178,6 +187,8 @@ func removeCgroupTree(path string) error {
 
 // GetRunCgroupPath returns the path for a run cgroup
 func (cm *CgroupManager) GetRunCgroupPath(runID string) (string, bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	path, ok := cm.runMap[runID]
 	return path, ok
 }

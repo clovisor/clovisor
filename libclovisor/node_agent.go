@@ -26,6 +26,7 @@ type NodeAgent struct {
 	audit     *AgentAudit
 	bpfReader *EBPFReader
 	recorder  *RunRecorder
+	api       *RunAPIServer
 	stopChan  chan bool
 	handled   chan struct{} // closed when handleEvents has drained
 	running   bool
@@ -35,7 +36,7 @@ type NodeAgent struct {
 type NodeAgentOptions struct {
 	BPFObjPath string
 	OutDir     string // finished timelines; DefaultRunOutDir if empty
-	SpoolDir   string // agentctl metadata; DefaultRunSpoolDir if empty
+	SocketPath string // run API socket; DefaultRunAPISocket if empty
 }
 
 // NewNodeAgent creates a new node agent
@@ -67,8 +68,8 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 	if opts.OutDir == "" {
 		opts.OutDir = DefaultRunOutDir
 	}
-	if opts.SpoolDir == "" {
-		opts.SpoolDir = DefaultRunSpoolDir
+	if opts.SocketPath == "" {
+		opts.SocketPath = DefaultRunAPISocket
 	}
 
 	cmgr, err := NewCgroupManager()
@@ -85,7 +86,8 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		return nil, err
 	}
 
-	recorder, err := NewRunRecorder(cmgr.GetAgentsDir(), opts.OutDir, opts.SpoolDir)
+	registry := NewRunRegistry()
+	recorder, err := NewRunRecorder(cmgr.GetAgentsDir(), opts.OutDir, registry)
 	if err != nil {
 		return nil, err
 	}
@@ -95,10 +97,18 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		return nil, fmt.Errorf("failed to create agent audit: %w", err)
 	}
 
+	// Listen only once BPF is attached, so no run can start unobserved.
+	api, err := NewRunAPIServer(opts.SocketPath, cmgr, registry)
+	if err != nil {
+		audit.reader.Close()
+		return nil, err
+	}
+
 	na := &NodeAgent{
 		cmgr:     cmgr,
 		audit:    audit,
 		recorder: recorder,
+		api:      api,
 		stopChan: make(chan bool),
 		running:  false,
 	}
@@ -142,6 +152,12 @@ func (na *NodeAgent) Stop() error {
 		return fmt.Errorf("node agent not running")
 	}
 
+	// Stop serving first: runs ending now still get their rmdir events
+	// recorded below. Runs still going are left running.
+	if na.api != nil {
+		na.api.Close()
+	}
+
 	// Close BPF reader if it exists
 	if na.bpfReader != nil {
 		na.bpfReader.Close()
@@ -172,6 +188,9 @@ func (na *NodeAgent) Run() error {
 	// Set up event handler
 	na.handled = make(chan struct{})
 	go na.handleEvents()
+	if na.api != nil {
+		go na.api.Serve()
+	}
 
 	// Block forever - this is a daemon
 	select {}

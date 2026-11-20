@@ -54,9 +54,9 @@ install: build
 run: node-agent
 	sudo bin/node-agent -bpf $(BPF_OBJ)
 
-# Run a command using agentctl (requires root for cgroup access)
+# Run a command as a governed run (needs the node agent; no root needed)
 run-agent:
-	sudo bin/agentctl run -- $(CMD)
+	bin/agentctl run -- $(CMD)
 
 
 # Generate documentation

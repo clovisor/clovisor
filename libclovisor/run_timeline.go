@@ -116,8 +116,9 @@ type destState struct {
 // it from a single goroutine.
 type RunRecorder struct {
 	OutDir    string
-	SpoolDir  string
 	MaxEvents int
+	// Meta supplies what the run API knows about runs; may be nil.
+	Meta *RunRegistry
 
 	// agentsRel is the agents dir relative to the cgroup root, e.g. /agents.
 	agentsRel string
@@ -129,17 +130,19 @@ type RunRecorder struct {
 }
 
 // NewRunRecorder returns a recorder for runs under agentsDir.
-func NewRunRecorder(agentsDir, outDir, spoolDir string) (*RunRecorder, error) {
+func NewRunRecorder(agentsDir, outDir string, meta *RunRegistry) (*RunRecorder, error) {
 	rel, err := filepath.Rel(CgroupV2Root, agentsDir)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return nil, fmt.Errorf("%s is not under %s", agentsDir, CgroupV2Root)
 	}
-	if err := os.MkdirAll(outDir, 0750); err != nil {
+	// World-listable: each timeline file is owned by, and readable only
+	// by, the user who started the run (and root).
+	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create %s: %w", outDir, err)
 	}
 	return &RunRecorder{
 		OutDir:     outDir,
-		SpoolDir:   spoolDir,
+		Meta:       meta,
 		MaxEvents:  DefaultMaxRunEvents,
 		agentsRel:  "/" + rel,
 		lookupPath: func(id uint64) string { return findRunCgroupPath(agentsDir, id) },
@@ -354,25 +357,37 @@ func (r *RunRecorder) Flush() []error {
 	return errs
 }
 
-// finish merges agentctl's metadata into a finished run and writes it.
+// finish writes a finished run and releases its metadata.
 func (r *RunRecorder) finish(st *runState) (*RunTimeline, error) {
-	tl := st.tl
-	if r.SpoolDir != "" {
-		if m, err := ReadRunMeta(r.SpoolDir, tl.RunID); err == nil {
-			tl.Command = m.Command
-			tl.Cwd = m.Cwd
-			uid := m.UID
-			tl.UID = &uid
-			tl.ExitCode = m.ExitCode
-			RemoveRunMeta(r.SpoolDir, tl.RunID)
-		}
+	st.tl.Complete = st.sawStart && !st.gap
+	tl, err := r.write(st)
+	if r.Meta != nil {
+		r.Meta.Done(st.tl.RunID)
 	}
-	tl.Complete = st.sawStart && !st.gap
-	return r.write(st)
+	return tl, err
+}
+
+// mergeMeta copies what the run API knows into the timeline.
+func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
+	if r.Meta == nil {
+		return
+	}
+	m, ok := r.Meta.Get(tl.RunID)
+	if !ok {
+		return
+	}
+	tl.Command = m.Command
+	tl.Cwd = m.Cwd
+	uid := m.UID
+	tl.UID = &uid
+	if m.ExitCode != nil {
+		tl.ExitCode = m.ExitCode
+	}
 }
 
 func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl := st.tl
+	r.mergeMeta(tl)
 	tl.Summary.Binaries = sortedKeys(st.binaries)
 
 	tl.Summary.DNSNames = sortedKeys(st.names)
@@ -401,7 +416,11 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := writeFileAtomic(r.timelinePath(tl.RunID), append(data, '\n'), 0640); err != nil {
+	uid := -1
+	if tl.UID != nil {
+		uid = *tl.UID
+	}
+	if err := writeFileAtomicOwned(r.timelinePath(tl.RunID), append(data, '\n'), 0600, uid); err != nil {
 		return nil, fmt.Errorf("failed to write timeline for run %s: %w", tl.RunID, err)
 	}
 	return tl, nil

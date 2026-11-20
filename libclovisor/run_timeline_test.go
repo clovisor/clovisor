@@ -18,7 +18,7 @@ const testRunCg = 4242
 
 func newTestRecorder(t *testing.T) *RunRecorder {
 	t.Helper()
-	r, err := NewRunRecorder(CgroupV2Root+"/agents", t.TempDir(), t.TempDir())
+	r, err := NewRunRecorder(CgroupV2Root+"/agents", t.TempDir(), NewRunRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +67,7 @@ func feed(t *testing.T, r *RunRecorder, evs ...AuditEvent) *RunTimeline {
 func TestRunRecorderCompleteRun(t *testing.T) {
 	r := newTestRecorder(t)
 	exit := 3
-	if err := WriteRunMeta(r.SpoolDir, RunMeta{RunID: "abc", Command: []string{"sh", "-c", "curl x"}, UID: 0, ExitCode: &exit}); err != nil {
-		t.Fatal(err)
-	}
+	r.Meta.Put(RunMeta{RunID: "abc", Command: []string{"sh", "-c", "curl x"}, UID: os.Getuid(), ExitCode: &exit})
 
 	tl := feed(t, r,
 		runEv(EventRunStart, 0, "/agents/run-abc"),
@@ -108,8 +106,8 @@ func TestRunRecorderCompleteRun(t *testing.T) {
 	if !reflect.DeepEqual(got.Summary, tl.Summary) || len(got.Events) != 5 {
 		t.Fatalf("round trip mismatch")
 	}
-	if _, err := ReadRunMeta(r.SpoolDir, "abc"); !os.IsNotExist(err) {
-		t.Fatalf("spool metadata not removed: %v", err)
+	if _, ok := r.Meta.Get("abc"); ok {
+		t.Fatal("run metadata not released")
 	}
 	if len(r.runs) != 0 {
 		t.Fatalf("run state leaked")

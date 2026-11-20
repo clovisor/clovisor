@@ -41,101 +41,112 @@ func printUsage() {
 	fmt.Println("  agentctl run -- python3 script.py")
 	fmt.Println("  agentctl run -- curl https://example.com")
 	fmt.Println()
-	fmt.Println("For BPF functionality, run the node-agent daemon as root.")
-	fmt.Println()
-	fmt.Println("To compile BPF program:")
-	fmt.Println("  make bpf")
-	fmt.Println()
-	fmt.Println("To run the agent:")
-	fmt.Println("  sudo make run")
+	fmt.Println("agentctl run needs the node agent (sudo make run); agentctl itself")
+	fmt.Println("needs no privileges. Set CLOVISOR_SOCKET to use a non-default socket.")
 	os.Exit(0)
 }
 
-// runCommand runs args in a fresh run cgroup and returns the child's exit
-// code. agentctl itself never joins the cgroup: the child is spawned
-// directly into it with clone3(CLONE_INTO_CGROUP), so there is no window in
-// which it runs under agentctl's cgroup (design §5.2), and the run cgroup
-// contains only the governed process tree.
-func runCommand(args []string) (code int, err error) {
+// shimArg is the hidden subcommand agentctl re-executes itself with to
+// park the child until the node agent has moved it into the run.
+const shimArg = "__run-shim"
+
+// runShim is the child side of runCommand. It runs only agentctl's own
+// code until the parent releases it, then execs the real command in the
+// same process, which by then is in the run cgroup.
+func runShim(args []string) {
+	if len(args) < 2 {
+		os.Exit(127)
+	}
+	release := os.NewFile(3, "release")
+	var b [1]byte
+	if n, _ := release.Read(b[:]); n != 1 {
+		os.Exit(127) // parent gave up before releasing us
+	}
+	release.Close()
+	err := syscall.Exec(args[0], args[1:], os.Environ())
+	fmt.Fprintf(os.Stderr, "agentctl: exec %s: %v\n", args[0], err)
+	os.Exit(126)
+}
+
+// runCommand runs args in a fresh run and returns the child's exit code.
+//
+// The node agent owns the cgroup. agentctl starts the child as a parked
+// shim, has the node agent move it into the run, and only then lets it
+// exec the command. So no command code ever runs outside the run (design
+// §5.2), and agentctl needs no privileges. clone3(CLONE_INTO_CGROUP)
+// would do this in one step but needs root (see libclovisor/run_api.go).
+func runCommand(args []string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
 	}
-
-	cmgr, err := clovisor.NewCgroupManager()
+	path, err := exec.LookPath(args[0])
 	if err != nil {
-		return 0, fmt.Errorf("failed to create cgroup manager: %w", err)
+		return 0, err
 	}
-
-	runID, err := clovisor.NewRunID()
+	if path, err = filepath.Abs(path); err != nil {
+		return 0, err
+	}
+	self, err := os.Executable()
 	if err != nil {
 		return 0, err
 	}
 
-	cgroupPath, cgroupID, err := cmgr.CreateRunCgroup(runID)
+	api, err := clovisor.DialRunAPI(socketPath())
 	if err != nil {
-		return 0, fmt.Errorf("failed to create cgroup: %w", err)
+		return 0, err
 	}
-	defer func() {
-		if err := cmgr.DestroyRunCgroup(runID); err != nil {
-			fmt.Fprintf(os.Stderr, "agentctl: warning: failed to destroy cgroup: %v\n", err)
-		}
-	}()
+	// Closing without End makes the node agent end the run: this also
+	// covers agentctl dying.
+	defer api.Close()
 
-	// The node agent reads this when the run cgroup is removed, so the
-	// final write (deferred after the destroy, so it runs first) must land
-	// before DestroyRunCgroup.
 	cwd, _ := os.Getwd()
-	meta := clovisor.RunMeta{
-		RunID:     runID,
-		Command:   args,
-		Cwd:       cwd,
-		UID:       os.Getuid(),
-		StartedAt: time.Now().UTC(),
-	}
-	writeMeta := func() {
-		if err := clovisor.WriteRunMeta(clovisor.DefaultRunSpoolDir, meta); err != nil {
-			fmt.Fprintf(os.Stderr, "agentctl: warning: failed to record run metadata: %v\n", err)
-		}
-	}
-	writeMeta()
-	defer func() {
-		end := time.Now().UTC()
-		meta.EndedAt = &end
-		if err == nil {
-			c := code
-			meta.ExitCode = &c
-		}
-		writeMeta()
-	}()
-
-	fmt.Fprintf(os.Stderr, "agentctl: run %s cgroup %s (id %d)\n", runID, cgroupPath, cgroupID)
-
-	cgroupDir, err := os.Open(cgroupPath)
+	run, err := api.Create(args, cwd)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open cgroup: %w", err)
+		return 0, err
 	}
-	defer cgroupDir.Close()
+	fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d)\n", run.RunID, run.CgroupID)
 
-	cmd := exec.Command(args[0], args[1:]...)
+	relR, relW, err := os.Pipe()
+	if err != nil {
+		return 0, err
+	}
+	defer relW.Close()
+
+	pidfd := -1
+	cmd := exec.Command(self, append([]string{shimArg, path}, args...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		UseCgroupFD: true,
-		CgroupFD:    int(cgroupDir.Fd()),
-	}
+	cmd.ExtraFiles = []*os.File{relR}
+	cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &pidfd}
 
 	// Terminal signals (Ctrl-C, Ctrl-\) already reach the child through the
-	// foreground process group; agentctl ignores them so it survives to clean
-	// up. Signals aimed at agentctl alone are forwarded.
+	// foreground process group; agentctl ignores them so it survives to
+	// report the exit. Signals aimed at agentctl alone are forwarded.
 	signal.Ignore(syscall.SIGINT, syscall.SIGQUIT)
 	fwd := make(chan os.Signal, 1)
 	signal.Notify(fwd, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(fwd)
 
 	if err := cmd.Start(); err != nil {
+		relR.Close()
 		return 0, fmt.Errorf("failed to start %s: %w", args[0], err)
 	}
+	relR.Close()
+
+	attachErr := api.Attach(pidfd)
+	syscall.Close(pidfd)
+	if attachErr != nil {
+		relW.Close() // the shim exits without running the command
+		cmd.Wait()
+		return 0, attachErr
+	}
+	if _, err := relW.Write([]byte{1}); err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return 0, fmt.Errorf("failed to release %s: %w", args[0], err)
+	}
+	relW.Close()
 
 	go func() {
 		for sig := range fwd {
@@ -143,7 +154,20 @@ func runCommand(args []string) (code int, err error) {
 		}
 	}()
 
-	err = cmd.Wait()
+	code, err := exitCode(cmd.Wait())
+	if err != nil {
+		return 0, err
+	}
+	if err := api.End(&code); err != nil {
+		// Most likely the node agent restarted during the run. It removes
+		// the run cgroup once empty, but never learns the exit code.
+		fmt.Fprintf(os.Stderr, "agentctl: warning: could not report the end of run %s to the node agent "+
+			"(restarted?); its timeline will lack the exit code: %v\n", run.RunID, err)
+	}
+	return code, nil
+}
+
+func exitCode(err error) (int, error) {
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
@@ -156,6 +180,13 @@ func runCommand(args []string) (code int, err error) {
 	default:
 		return 0, err
 	}
+}
+
+func socketPath() string {
+	if p := os.Getenv("CLOVISOR_SOCKET"); p != "" {
+		return p
+	}
+	return clovisor.DefaultRunAPISocket
 }
 
 func listCgroups() error {
@@ -224,7 +255,9 @@ func listRuns(dir string) error {
 	for _, p := range paths {
 		tl, err := clovisor.ReadRunTimeline(p)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "agentctl: skipping %v\n", err)
+			if !os.IsPermission(err) { // other users' runs are private
+				fmt.Fprintf(os.Stderr, "agentctl: skipping %v\n", err)
+			}
 			continue
 		}
 		tls = append(tls, tl)
@@ -363,6 +396,9 @@ func learnProfile(argv []string) error {
 	for _, p := range paths {
 		tl, err := clovisor.ReadRunTimeline(p)
 		if err != nil {
+			if *all && os.IsPermission(err) {
+				continue // another user's run
+			}
 			return err
 		}
 		if tl.EndedAt == nil {
@@ -410,6 +446,9 @@ func main() {
 	}
 
 	command := os.Args[1]
+	if command == shimArg {
+		runShim(os.Args[2:])
+	}
 
 	switch command {
 	case "run":
