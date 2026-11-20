@@ -11,7 +11,6 @@
 package clovisor
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -26,8 +25,17 @@ type NodeAgent struct {
 	cmgr      *CgroupManager
 	audit     *AgentAudit
 	bpfReader *EBPFReader
+	recorder  *RunRecorder
 	stopChan  chan bool
+	handled   chan struct{} // closed when handleEvents has drained
 	running   bool
+}
+
+// NodeAgentOptions configures where run timelines go.
+type NodeAgentOptions struct {
+	BPFObjPath string
+	OutDir     string // finished timelines; DefaultRunOutDir if empty
+	SpoolDir   string // agentctl metadata; DefaultRunSpoolDir if empty
 }
 
 // NewNodeAgent creates a new node agent
@@ -53,8 +61,16 @@ func NewNodeAgent() (*NodeAgent, error) {
 }
 
 // NewNodeAgentWithBPF creates a node agent that loads and attaches the
-// audit BPF program, scoped to the agents cgroup subtree.
-func NewNodeAgentWithBPF(bpfObjPath string) (*NodeAgent, error) {
+// audit BPF program, scoped to the agents cgroup subtree, and writes one
+// timeline per run.
+func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
+	if opts.OutDir == "" {
+		opts.OutDir = DefaultRunOutDir
+	}
+	if opts.SpoolDir == "" {
+		opts.SpoolDir = DefaultRunSpoolDir
+	}
+
 	cmgr, err := NewCgroupManager()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cgroup manager: %w", err)
@@ -69,7 +85,12 @@ func NewNodeAgentWithBPF(bpfObjPath string) (*NodeAgent, error) {
 		return nil, err
 	}
 
-	audit, err := NewAgentAuditWithBPF(bpfObjPath, cmgr.GetAgentsDir(), agentsID, level)
+	recorder, err := NewRunRecorder(cmgr.GetAgentsDir(), opts.OutDir, opts.SpoolDir)
+	if err != nil {
+		return nil, err
+	}
+
+	audit, err := NewAgentAuditWithBPF(opts.BPFObjPath, cmgr.GetAgentsDir(), agentsID, level)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent audit: %w", err)
 	}
@@ -77,6 +98,7 @@ func NewNodeAgentWithBPF(bpfObjPath string) (*NodeAgent, error) {
 	na := &NodeAgent{
 		cmgr:     cmgr,
 		audit:    audit,
+		recorder: recorder,
 		stopChan: make(chan bool),
 		running:  false,
 	}
@@ -126,9 +148,13 @@ func (na *NodeAgent) Stop() error {
 		na.bpfReader = nil
 	}
 
-	// Stop the audit
+	// Stop the audit; this closes the event channel, so handleEvents
+	// drains what is left and flushes runs still in progress.
 	if err := na.audit.Stop(); err != nil {
 		return fmt.Errorf("failed to stop audit: %w", err)
+	}
+	if na.handled != nil {
+		<-na.handled
 	}
 
 	na.running = false
@@ -144,6 +170,7 @@ func (na *NodeAgent) Run() error {
 	}
 
 	// Set up event handler
+	na.handled = make(chan struct{})
 	go na.handleEvents()
 
 	// Block forever - this is a daemon
@@ -152,8 +179,14 @@ func (na *NodeAgent) Run() error {
 
 // handleEvents processes audit events
 func (na *NodeAgent) handleEvents() {
+	defer close(na.handled)
 	for event := range na.audit.Events() {
 		na.processEvent(event)
+	}
+	if na.recorder != nil {
+		for _, err := range na.recorder.Flush() {
+			fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
+		}
 	}
 }
 
@@ -162,40 +195,36 @@ func (na *NodeAgent) StopSignal() {
 	close(na.stopChan)
 }
 
-// processEvent processes a single audit event
+// processEvent logs a single audit event and records it in its run.
 func (na *NodeAgent) processEvent(event AuditEvent) {
+	ts := event.Timestamp.Format(time.RFC3339Nano)
 	switch event.Type {
 	case EventExec:
-		execData := event.Data.(ExecData)
-		fmt.Printf("%s [EXEC] run=%d cgroup=%d pid=%d binary=%s\n",
-			event.Timestamp.Format(time.RFC3339Nano), event.RunCgroupID,
-			event.CgroupID, event.PID, execData.BinaryPath)
+		d := event.Data.(ExecData)
+		fmt.Printf("%s [EXEC] run=%d cgroup=%d pid=%d ppid=%d binary=%s args=%q\n",
+			ts, event.RunCgroupID, event.CgroupID, event.PID, d.PPID, d.BinaryPath, d.Args)
 	case EventConnect:
-		connectData := event.Data.(ConnectData)
+		d := event.Data.(ConnectData)
 		fmt.Printf("%s [CONNECT] run=%d cgroup=%d pid=%d proto=%s dst=%s\n",
-			event.Timestamp.Format(time.RFC3339Nano), event.RunCgroupID,
-			event.CgroupID, event.PID, connectData.Protocol,
-			net.JoinHostPort(connectData.DstIP, strconv.Itoa(int(connectData.DstPort))))
+			ts, event.RunCgroupID, event.CgroupID, event.PID, d.Protocol,
+			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))))
+	case EventRunStart:
+		fmt.Printf("%s [RUN START] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
+	case EventRunEnd:
+		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}
-}
 
-// ExportEvents exports events to a JSON file
-func (na *NodeAgent) ExportEvents(outputPath string) error {
-	events := make([]map[string]interface{}, 0)
-
-	// Read events from the channel (this would need to be buffered or we'd need
-	// a way to collect events first)
-	// For now, just create a placeholder
-	event := map[string]interface{}{
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-		"type":      "placeholder",
+	if na.recorder == nil {
+		return
 	}
-	events = append(events, event)
-
-	data, err := json.MarshalIndent(events, "", "  ")
+	tl, err := na.recorder.Handle(event)
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
+		return
 	}
-
-	return os.WriteFile(outputPath, data, 0644)
+	if tl != nil {
+		fmt.Printf("%s [TIMELINE] run %s: %d execs, %d connects, complete=%t -> %s\n",
+			ts, tl.RunID, tl.Summary.Execs, tl.Summary.Connects, tl.Complete,
+			TimelinePath(na.recorder.OutDir, tl.RunID))
+	}
 }

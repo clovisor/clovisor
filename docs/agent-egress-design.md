@@ -1469,11 +1469,24 @@ Implemented:
   only: the hooks always allow.
 - Events go through a single ring buffer. Each carries both the run cgroup id and
   the leaf cgroup id, so child cgroups roll up to their run.
+- *Added 2026-11-20.* Per-run timelines.
+  - Exec events carry the ppid and argv (first 512 bytes).
+  - `tp_btf/cgroup_mkdir` and `cgroup_rmdir` mark run start and end. Because of
+    the single ring buffer, the rmdir event is always the run's last event.
+  - At run end the node agent writes `/var/lib/clovisor/runs/run-<id>.json`:
+    metadata, a summary (distinct binaries, and destinations with counts) and
+    the ordered events.
+  - `agentctl` contributes the command line, uid and exit code through a spool
+    file in `/run/clovisor/runs`. This is an interim channel until the §5.4
+    API exists.
+  - Runs in progress at node-agent shutdown are written as partial timelines.
+    A restarted agent resumes them, marks the gap, and flags the run
+    `complete: false`.
+  - `agentctl events` lists runs; `agentctl events <id>` shows one timeline.
 
 Not yet done:
 
 - DNS events;
-- correlation into a timeline, and export;
 - learn mode;
 - the node-agent-owned cgroup API ([§5.4](#54-the-injection-channel)).
   `agentctl` still creates cgroups directly, as root.

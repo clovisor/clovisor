@@ -19,6 +19,12 @@
  * attached via perf_event they only fire on the CPU the perf event was
  * opened on with current kernels.
  *
+ * run:     tp_btf/cgroup_mkdir + cgroup_rmdir, for cgroups one level below
+ *          agents/, mark the start and end of a run. A run cgroup can only
+ *          be removed once every task in it has exited, and all events go
+ *          through one ring buffer, so the rmdir event is always the last
+ *          event of its run.
+ *
  * Each event carries the leaf cgroup id and the run cgroup id (the
  * agents/run-<id> ancestor), so tool-call child cgroups roll up to the run.
  * All events go through a single ring buffer.
@@ -29,17 +35,41 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 
-#define MAX_PATH_LEN 256
+#define MAX_PATH_LEN   256
+#define MAX_ARGS_LEN   512  /* power of two: used as a mask */
+#define MAX_CGPATH_LEN 128
 
 #define AF_INET  2
 #define AF_INET6 10
 
 #define EVENT_EXEC    0
 #define EVENT_CONNECT 1
+#define EVENT_RUN_START 2
+#define EVENT_RUN_END   3
 
-/* CO-RE: only the field we need; relocated against kernel BTF at load. */
+/* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct linux_binprm {
     const char *filename;
+} __attribute__((preserve_access_index));
+
+struct mm_struct {
+    unsigned long arg_start;
+    unsigned long arg_end;
+} __attribute__((preserve_access_index));
+
+struct task_struct {
+    int tgid;
+    struct task_struct *real_parent;
+    struct mm_struct *mm;
+} __attribute__((preserve_access_index));
+
+struct kernfs_node {
+    __u64 id;
+} __attribute__((preserve_access_index));
+
+struct cgroup {
+    struct kernfs_node *kn;
+    int level;
 } __attribute__((preserve_access_index));
 
 /* Written once by the node agent: which cgroup is the agents root. */
@@ -59,7 +89,10 @@ struct event_hdr {
 
 struct exec_event {
     struct event_hdr hdr;
+    __u32 ppid;
+    __u32 args_len;       /* bytes of args used; NUL-separated argv */
     char filename[MAX_PATH_LEN];
+    char args[MAX_ARGS_LEN];
 };
 
 struct connect_event {
@@ -68,6 +101,12 @@ struct connect_event {
     __u16 dport;          /* host byte order */
     __u32 protocol;       /* IPPROTO_TCP / IPPROTO_UDP */
     __u8  daddr[16];      /* v4 in first 4 bytes, network order */
+};
+
+/* hdr.cgroup_id and hdr.run_cgroup_id are both the run cgroup's id. */
+struct cgroup_event {
+    struct event_hdr hdr;
+    char path[MAX_CGPATH_LEN]; /* relative to the cgroup root, e.g. /agents/run-x */
 };
 
 struct {
@@ -127,6 +166,23 @@ int on_exec(__u64 *ctx)
     if (bpf_probe_read_kernel_str(e->filename, sizeof(e->filename), fname) < 0)
         e->filename[0] = '\0';
 
+    struct task_struct *task = (struct task_struct *)ctx[0];
+    e->ppid = BPF_CORE_READ(task, real_parent, tgid);
+
+    /* argv lives in the new image's user memory, already written by exec. */
+    unsigned long start = BPF_CORE_READ(task, mm, arg_start);
+    unsigned long end = BPF_CORE_READ(task, mm, arg_end);
+    __u32 len = 0;
+    if (end > start) {
+        len = end - start;
+        if (len > MAX_ARGS_LEN)
+            len = MAX_ARGS_LEN;
+        if (bpf_probe_read_user(e->args, len & (MAX_ARGS_LEN - 1) ?: MAX_ARGS_LEN,
+                                (const void *)start) < 0)
+            len = 0;
+    }
+    e->args_len = len;
+
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
@@ -160,6 +216,47 @@ static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family
     }
 
     bpf_ringbuf_submit(e, 0);
+}
+
+static __always_inline void emit_cgroup(struct cgroup *cgrp, const char *path, __u32 type)
+{
+    __u32 zero = 0;
+    struct audit_config *cfg = bpf_map_lookup_elem(&config, &zero);
+    if (!cfg || cfg->agents_cgroup_id == 0)
+        return;
+    if (BPF_CORE_READ(cgrp, level) != cfg->agents_level + 1)
+        return; /* the node agent checks the path is under agents/ */
+
+    struct cgroup_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return;
+
+    __u64 id = BPF_CORE_READ(cgrp, kn, id);
+    e->hdr.type = type;
+    e->hdr.pid = bpf_get_current_pid_tgid() >> 32;
+    e->hdr.timestamp_ns = bpf_ktime_get_boot_ns();
+    e->hdr.cgroup_id = id;
+    e->hdr.run_cgroup_id = id;
+    if (bpf_probe_read_kernel_str(e->path, sizeof(e->path), path) < 0)
+        e->path[0] = '\0';
+
+    bpf_ringbuf_submit(e, 0);
+}
+
+/* cgroup_mkdir(struct cgroup *cgrp, const char *path) */
+SEC("tp_btf/cgroup_mkdir")
+int on_cgroup_mkdir(__u64 *ctx)
+{
+    emit_cgroup((struct cgroup *)ctx[0], (const char *)ctx[1], EVENT_RUN_START);
+    return 0;
+}
+
+/* cgroup_rmdir(struct cgroup *cgrp, const char *path) */
+SEC("tp_btf/cgroup_rmdir")
+int on_cgroup_rmdir(__u64 *ctx)
+{
+    emit_cgroup((struct cgroup *)ctx[0], (const char *)ctx[1], EVENT_RUN_END);
+    return 0;
 }
 
 SEC("cgroup/connect4")

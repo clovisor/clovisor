@@ -17,14 +17,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var bpfObj = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object")
+var (
+	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object")
+	outDir   = flag.String("out", clovisor.DefaultRunOutDir, "Directory for per-run timeline files")
+	spoolDir = flag.String("spool", clovisor.DefaultRunSpoolDir, "Directory where agentctl leaves run metadata")
+)
 
 func main() {
 	flag.Parse()
 	log.Info("Clovisor Node Agent starting...")
 
 	// Create and initialize the node agent with BPF audit attached
-	agent, err := clovisor.NewNodeAgentWithBPF(*bpfObj)
+	agent, err := clovisor.NewNodeAgentWithBPF(clovisor.NodeAgentOptions{
+		BPFObjPath: *bpfObj,
+		OutDir:     *outDir,
+		SpoolDir:   *spoolDir,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create node agent: %v", err)
 	}

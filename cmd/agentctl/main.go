@@ -8,13 +8,21 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
+	"time"
 
 	clovisor "github.com/clovisor/clovisor/libclovisor"
 )
@@ -24,7 +32,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  agentctl run <command> [args...]  Run a command in a new agent cgroup")
-	fmt.Println("  agentctl events                   Show captured audit events")
+	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
 	fmt.Println("  agentctl cgroups                  List active cgroups")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -46,7 +54,7 @@ func printUsage() {
 // directly into it with clone3(CLONE_INTO_CGROUP), so there is no window in
 // which it runs under agentctl's cgroup (design §5.2), and the run cgroup
 // contains only the governed process tree.
-func runCommand(args []string) (int, error) {
+func runCommand(args []string) (code int, err error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
 	}
@@ -69,6 +77,33 @@ func runCommand(args []string) (int, error) {
 		if err := cmgr.DestroyRunCgroup(runID); err != nil {
 			fmt.Fprintf(os.Stderr, "agentctl: warning: failed to destroy cgroup: %v\n", err)
 		}
+	}()
+
+	// The node agent reads this when the run cgroup is removed, so the
+	// final write (deferred after the destroy, so it runs first) must land
+	// before DestroyRunCgroup.
+	cwd, _ := os.Getwd()
+	meta := clovisor.RunMeta{
+		RunID:     runID,
+		Command:   args,
+		Cwd:       cwd,
+		UID:       os.Getuid(),
+		StartedAt: time.Now().UTC(),
+	}
+	writeMeta := func() {
+		if err := clovisor.WriteRunMeta(clovisor.DefaultRunSpoolDir, meta); err != nil {
+			fmt.Fprintf(os.Stderr, "agentctl: warning: failed to record run metadata: %v\n", err)
+		}
+	}
+	writeMeta()
+	defer func() {
+		end := time.Now().UTC()
+		meta.EndedAt = &end
+		if err == nil {
+			c := code
+			meta.ExitCode = &c
+		}
+		writeMeta()
 	}()
 
 	fmt.Fprintf(os.Stderr, "agentctl: run %s cgroup %s (id %d)\n", runID, cgroupPath, cgroupID)
@@ -148,11 +183,137 @@ func listCgroups() error {
 	return nil
 }
 
-func showEvents() error {
-	fmt.Println("Event collection from BPF perf ring buffers not yet implemented.")
-	fmt.Println("Run the node-agent daemon to capture events:")
-	fmt.Println("  sudo make run")
+// showEvents lists recorded runs, or prints one run's timeline.
+func showEvents(argv []string) error {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	asJSON := fs.Bool("json", false, "print the raw timeline JSON")
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+
+	if fs.NArg() == 0 {
+		return listRuns(*dir)
+	}
+	runID := strings.TrimPrefix(fs.Arg(0), clovisor.RunPrefix)
+	path := clovisor.TimelinePath(*dir, runID)
+	if *asJSON {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	tl, err := clovisor.ReadRunTimeline(path)
+	if err != nil {
+		return err
+	}
+	printTimeline(tl)
 	return nil
+}
+
+func listRuns(dir string) error {
+	paths, err := filepath.Glob(filepath.Join(dir, "run-*.json"))
+	if err != nil {
+		return err
+	}
+	var tls []*clovisor.RunTimeline
+	for _, p := range paths {
+		tl, err := clovisor.ReadRunTimeline(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "agentctl: skipping %v\n", err)
+			continue
+		}
+		tls = append(tls, tl)
+	}
+	if len(tls) == 0 {
+		fmt.Printf("No recorded runs in %s. Is the node agent running?\n", dir)
+		return nil
+	}
+	sort.Slice(tls, func(i, j int) bool { return tls[i].StartedAt.Before(tls[j].StartedAt) })
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "RUN ID\tSTARTED\tDURATION\tEXIT\tEXECS\tCONNECTS\tCOMPLETE\tCOMMAND")
+	for _, tl := range tls {
+		dur, exit := "running", "-"
+		if tl.EndedAt != nil {
+			dur = tl.EndedAt.Sub(tl.StartedAt).Round(time.Millisecond).String()
+		}
+		if tl.ExitCode != nil {
+			exit = strconv.Itoa(*tl.ExitCode)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%t\t%s\n",
+			tl.RunID, tl.StartedAt.Local().Format(time.DateTime), dur, exit,
+			tl.Summary.Execs, tl.Summary.Connects, tl.Complete, truncate(strings.Join(tl.Command, " "), 50))
+	}
+	return w.Flush()
+}
+
+func printTimeline(tl *clovisor.RunTimeline) {
+	fmt.Printf("Run       %s (cgroup %d, %s)\n", tl.RunID, tl.CgroupID, tl.CgroupPath)
+	if len(tl.Command) > 0 {
+		fmt.Printf("Command   %s\n", strings.Join(tl.Command, " "))
+	}
+	fmt.Printf("Started   %s\n", tl.StartedAt.Local().Format(time.RFC3339Nano))
+	if tl.EndedAt != nil {
+		fmt.Printf("Ended     %s (%s)\n", tl.EndedAt.Local().Format(time.RFC3339Nano),
+			tl.EndedAt.Sub(tl.StartedAt).Round(time.Millisecond))
+	}
+	if tl.ExitCode != nil {
+		fmt.Printf("Exit      %d\n", *tl.ExitCode)
+	}
+	if !tl.Complete {
+		fmt.Println("Note      incomplete: the node agent did not see the whole run")
+	}
+	if tl.DroppedEvents > 0 {
+		fmt.Printf("Note      %d events past the per-run cap are counted but not listed\n", tl.DroppedEvents)
+	}
+
+	fmt.Println()
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "+TIME\tPID\tPPID\tEVENT\tDETAIL")
+	for _, e := range tl.Events {
+		rel := "+" + e.Time.Sub(tl.StartedAt).Round(time.Microsecond).String()
+		pid, ppid := "", ""
+		if e.PID != 0 {
+			pid = strconv.Itoa(int(e.PID))
+		}
+		if e.PPID != 0 {
+			ppid = strconv.Itoa(int(e.PPID))
+		}
+		var detail string
+		switch e.Type {
+		case "exec":
+			detail = e.Binary
+			if len(e.Args) > 0 {
+				b, _ := json.Marshal(e.Args)
+				detail += " " + string(b)
+			}
+		case "connect":
+			detail = e.Proto + " " + net.JoinHostPort(e.DstIP, strconv.Itoa(int(e.DstPort)))
+		default:
+			detail = e.Note
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", rel, pid, ppid, e.Type, detail)
+	}
+	w.Flush()
+
+	fmt.Printf("\nBinaries (%d)\n", len(tl.Summary.Binaries))
+	for _, b := range tl.Summary.Binaries {
+		fmt.Printf("  %s\n", b)
+	}
+	fmt.Printf("Destinations (%d)\n", len(tl.Summary.Destinations))
+	for _, d := range tl.Summary.Destinations {
+		fmt.Printf("  %-4s %-40s x%d\n", d.Proto, net.JoinHostPort(d.IP, strconv.Itoa(int(d.Port))), d.Count)
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
 }
 
 func main() {
@@ -181,7 +342,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "events":
-		if err := showEvents(); err != nil {
+		if err := showEvents(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

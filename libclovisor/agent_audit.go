@@ -17,6 +17,8 @@ import (
 const (
 	EventExec = iota
 	EventConnect
+	EventRunStart // a run cgroup (agents/<name>) was created
+	EventRunEnd   // a run cgroup was removed; always the run's last event
 )
 
 // AuditEvent represents an audit event
@@ -37,6 +39,13 @@ type ExecData struct {
 	BinaryPath string
 	PID        uint32
 	PPID       uint32
+	Args       []string
+}
+
+// RunData describes a run cgroup appearing or disappearing.
+type RunData struct {
+	// Path relative to the cgroup v2 root, e.g. /agents/run-1a2b3c.
+	CgroupPath string
 }
 
 // ConnectData contains connection event data

@@ -27,10 +27,14 @@ import (
 )
 
 const (
-	MaxPathLen = 256
+	MaxPathLen   = 256
+	maxArgsLen   = 512
+	maxCgPathLen = 128
 
-	bpfEventExec    = 0
-	bpfEventConnect = 1
+	bpfEventExec     = 0
+	bpfEventConnect  = 1
+	bpfEventRunStart = 2
+	bpfEventRunEnd   = 3
 
 	afInet  = 2
 	afInet6 = 10
@@ -53,7 +57,15 @@ type bpfEventHdr struct {
 
 type bpfExecEvent struct {
 	Hdr      bpfEventHdr
+	PPID     uint32
+	ArgsLen  uint32
 	Filename [MaxPathLen]byte
+	Args     [maxArgsLen]byte
+}
+
+type bpfCgroupEvent struct {
+	Hdr  bpfEventHdr
+	Path [maxCgPathLen]byte
 }
 
 type bpfConnectEvent struct {
@@ -66,6 +78,8 @@ type bpfConnectEvent struct {
 
 type bpfObjects struct {
 	ExecProg     *ebpf.Program `ebpf:"on_exec"`
+	MkdirProg    *ebpf.Program `ebpf:"on_cgroup_mkdir"`
+	RmdirProg    *ebpf.Program `ebpf:"on_cgroup_rmdir"`
 	Connect4Prog *ebpf.Program `ebpf:"on_connect4"`
 	Connect6Prog *ebpf.Program `ebpf:"on_connect6"`
 	Config       *ebpf.Map     `ebpf:"config"`
@@ -73,7 +87,7 @@ type bpfObjects struct {
 }
 
 func (o *bpfObjects) Close() {
-	for _, c := range []interface{ Close() error }{o.ExecProg, o.Connect4Prog, o.Connect6Prog, o.Config, o.Events} {
+	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.Connect4Prog, o.Connect6Prog, o.Config, o.Events} {
 		if c != nil {
 			c.Close()
 		}
@@ -120,12 +134,21 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		return nil, fmt.Errorf("failed to write BPF config: %w", err)
 	}
 
-	l, err := link.AttachTracing(link.TracingOptions{Program: r.objs.ExecProg})
-	if err != nil {
-		r.Close()
-		return nil, fmt.Errorf("failed to attach sched_process_exec: %w", err)
+	for _, t := range []struct {
+		name string
+		prog *ebpf.Program
+	}{
+		{"sched_process_exec", r.objs.ExecProg},
+		{"cgroup_mkdir", r.objs.MkdirProg},
+		{"cgroup_rmdir", r.objs.RmdirProg},
+	} {
+		l, err := link.AttachTracing(link.TracingOptions{Program: t.prog})
+		if err != nil {
+			r.Close()
+			return nil, fmt.Errorf("failed to attach %s: %w", t.name, err)
+		}
+		r.links = append(r.links, l)
 	}
-	r.links = append(r.links, l)
 
 	for _, c := range []struct {
 		name string
@@ -213,12 +236,25 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
 			return AuditEvent{}, err
 		}
-		path := e.Filename[:]
-		if i := bytes.IndexByte(path, 0); i >= 0 {
-			path = path[:i]
-		}
+		ev.PPID = e.PPID
 		ev.Type = EventExec
-		ev.Data = ExecData{BinaryPath: string(path), PID: hdr.PID}
+		ev.Data = ExecData{
+			BinaryPath: cString(e.Filename[:]),
+			PID:        hdr.PID,
+			PPID:       e.PPID,
+			Args:       splitArgs(e.Args[:min(int(e.ArgsLen), maxArgsLen)]),
+		}
+
+	case bpfEventRunStart, bpfEventRunEnd:
+		var e bpfCgroupEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		ev.Type = EventRunStart
+		if hdr.Type == bpfEventRunEnd {
+			ev.Type = EventRunEnd
+		}
+		ev.Data = RunData{CgroupPath: cString(e.Path[:])}
 
 	case bpfEventConnect:
 		var e bpfConnectEvent
@@ -242,6 +278,29 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 	}
 
 	return ev, nil
+}
+
+// cString returns b up to its first NUL.
+func cString(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return string(b)
+}
+
+// splitArgs splits a NUL-separated argv block. A block cut off at the
+// capture limit keeps its partial last argument.
+func splitArgs(b []byte) []string {
+	b = bytes.TrimRight(b, "\x00")
+	if len(b) == 0 {
+		return nil
+	}
+	parts := bytes.Split(b, []byte{0})
+	args := make([]string, len(parts))
+	for i, p := range parts {
+		args[i] = string(p)
+	}
+	return args
 }
 
 func protoName(p uint32) string {

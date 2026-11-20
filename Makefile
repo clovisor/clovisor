@@ -74,3 +74,4 @@ GO_PKGS = ./cmd/... ./libclovisor
 check:
 	$(GO) vet $(GO_PKGS)
 	$(GO) build $(GO_PKGS)
+	$(GO) test $(GO_PKGS)
