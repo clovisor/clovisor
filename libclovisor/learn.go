@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -112,7 +113,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		for _, n := range tl.Summary.DNSNames {
 			looked[n] = true
 		}
-		for _, dst := range tl.Summary.Destinations {
+		for _, dst := range append(append([]Destination{}, tl.Summary.Destinations...), proxiedDestinations(tl, true)...) {
 			if dst.Port == 53 && dst.Proto == "UDP" {
 				d.dnsServers[net.JoinHostPort(dst.IP, "53")] += dst.Count
 				continue
@@ -329,7 +330,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	}
 	for _, r := range d.Profile.Spec.Egress.Rules {
 		h := d.hosts[r.Name]
-		p("      # %s to %s%s", plural(h.conns, "connection"), strings.Join(sortedSet(h.ips), ", "), runsNote(h.runs, total))
+		p("      # %s%s", hostSeen(h), runsNote(h.runs, total))
 		p("      - name: %s", q(r.Name))
 		p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
 		p("        action: %s", r.Action)
@@ -426,6 +427,50 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// proxiedDestinations turns a run's proxied requests into destinations
+// as learn and check see them. With letThrough, requests the proxy
+// blocked are left out: learning from them would widen the profile.
+func proxiedDestinations(tl *RunTimeline, letThrough bool) []Destination {
+	var out []Destination
+	for _, p := range tl.Summary.Proxied {
+		n := p.Requests
+		if letThrough {
+			n -= p.Denied
+		}
+		if n <= 0 {
+			continue
+		}
+		d := Destination{Proto: "TCP", IP: "via proxy", Port: p.Port, Count: n, Names: []string{p.Host}}
+		if _, err := netip.ParseAddr(p.Host); err == nil {
+			d.IP, d.Names = p.Host, nil
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// hostSeen describes how a learned host was reached.
+func hostSeen(h *learnedHost) string {
+	var ips []string
+	viaProxy := false
+	for ip := range h.ips {
+		if ip == "via proxy" {
+			viaProxy = true
+		} else {
+			ips = append(ips, ip)
+		}
+	}
+	sort.Strings(ips)
+	parts := []string{}
+	if len(ips) > 0 {
+		parts = append(parts, "to "+strings.Join(ips, ", "))
+	}
+	if viaProxy {
+		parts = append(parts, "through the proxy")
+	}
+	return plural(h.conns, "connection") + " " + strings.Join(parts, " and ")
 }
 
 // commentSafe escapes s for a YAML comment. Command lines, paths and DNS

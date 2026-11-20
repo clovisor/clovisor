@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent check format doc
+.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check format doc
 
 # Compiler and flags
 CC = clang
@@ -53,6 +53,17 @@ install: build
 # Run the agent (requires root for BPF)
 run: node-agent
 	sudo bin/node-agent -bpf $(BPF_OBJ)
+
+# Run the node agent with the explicit proxy (milestone 2.3), then Envoy
+# from the bootstrap it writes. Envoy runs as uid 101 in the image.
+PROXY_LISTEN ?= 127.0.0.1:18000
+ENVOY_IMAGE ?= envoyproxy/envoy:v1.34-latest
+
+run-proxy: node-agent
+	sudo bin/node-agent -bpf $(BPF_OBJ) -proxy-listen $(PROXY_LISTEN)
+
+envoy:
+	sudo docker run --rm --network host -v /run/clovisor:/run/clovisor $(ENVOY_IMAGE) -c /run/clovisor/envoy.json
 
 # Run a command as a governed run (needs the node agent; no root needed)
 run-agent:

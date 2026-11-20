@@ -10,9 +10,11 @@ package clovisor
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,6 +55,20 @@ type RunSummary struct {
 	Binaries     []string      `json:"binaries"`
 	DNSNames     []string      `json:"dns_names"` // distinct names looked up
 	Destinations []Destination `json:"destinations"`
+	// Proxied is what the run asked the node's proxy for, by destination.
+	// Connections to the proxy itself are counted in ProxyConnects and
+	// not listed as destinations.
+	Proxied       []ProxiedDest `json:"proxied,omitempty"`
+	ProxyConnects int           `json:"proxy_connects,omitempty"`
+}
+
+// ProxiedDest aggregates proxied requests to one destination.
+type ProxiedDest struct {
+	Host      string `json:"host"` // hostname or IP literal
+	Port      uint16 `json:"port"`
+	Requests  int    `json:"requests"`
+	Denied    int    `json:"denied,omitempty"`     // blocked
+	WouldDeny int    `json:"would_deny,omitempty"` // allowed, but an audit layer would deny
 }
 
 // Destination is one distinct (protocol, address, port) a run connected to.
@@ -70,7 +86,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, connect, dns, gap
+	Type     string      `json:"type"` // exec, connect, dns, http, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -86,7 +102,16 @@ type TimelineEvent struct {
 	Server   string      `json:"server,omitempty"`
 	Answers  []DNSAnswer `json:"answers,omitempty"`
 	Partial  bool        `json:"partial,omitempty"` // DNS reply cut off at capture limit
-	Note     string      `json:"note,omitempty"`
+	// http events (proxied requests):
+	Method    string   `json:"method,omitempty"`
+	Path      string   `json:"path,omitempty"`
+	Decision  string   `json:"decision,omitempty"`
+	Enforced  bool     `json:"enforced,omitempty"`
+	Rule      string   `json:"rule,omitempty"`
+	Layer     string   `json:"layer,omitempty"`
+	WouldDeny []string `json:"would_deny,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	Note      string   `json:"note,omitempty"`
 }
 
 type destKey struct {
@@ -104,7 +129,13 @@ type runState struct {
 	names    map[string]struct{}
 	// ipName maps an address to the name whose lookup most recently
 	// returned it in this run.
-	ipName map[string]string
+	ipName  map[string]string
+	proxied map[proxKey]*ProxiedDest
+}
+
+type proxKey struct {
+	host string
+	port uint16
 }
 
 type destState struct {
@@ -120,6 +151,8 @@ type RunRecorder struct {
 	MaxEvents int
 	// Meta supplies what the run API knows about runs; may be nil.
 	Meta *RunRegistry
+	// ProxyAddrs are the node proxy's listen addresses ("ip:port").
+	ProxyAddrs map[string]bool
 
 	// agentsRel is the agents dir relative to the cgroup root, e.g. /agents.
 	agentsRel string
@@ -214,12 +247,24 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		dests:    make(map[destKey]*destState),
 		names:    make(map[string]struct{}),
 		ipName:   make(map[string]string),
+		proxied:  make(map[proxKey]*ProxiedDest),
 	}
 	if ev.Type == EventRunStart {
 		st.sawStart = true
 	} else {
-		if prev, err := ReadRunTimeline(r.timelinePath(runID)); err == nil && prev.CgroupID == id && prev.EndedAt == nil {
+		prev, err := ReadRunTimeline(r.timelinePath(runID))
+		if err == nil && prev.CgroupID == id && prev.EndedAt != nil {
+			// The run already finished and its timeline is written. A late
+			// event must not start a phantom run whose partial timeline
+			// would later overwrite the complete one.
+			return nil
+		}
+		if err == nil && prev.CgroupID == id && prev.EndedAt == nil {
 			st.tl = prev
+			for i := range prev.Summary.Proxied {
+				p := prev.Summary.Proxied[i]
+				st.proxied[proxKey{p.Host, p.Port}] = &p
+			}
 			for _, b := range prev.Summary.Binaries {
 				st.binaries[b] = struct{}{}
 			}
@@ -274,6 +319,9 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			return nil, nil
 		}
 		st := r.state(ev, d.CgroupPath)
+		if st == nil {
+			return nil, nil
+		}
 		end := ev.Timestamp
 		st.tl.EndedAt = &end
 		delete(r.runs, ev.RunCgroupID)
@@ -282,6 +330,9 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 	case EventExec:
 		d := ev.Data.(ExecData)
 		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
 		st.tl.Summary.Execs++
 		st.binaries[d.BinaryPath] = struct{}{}
 		st.add(TimelineEvent{
@@ -297,6 +348,14 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 	case EventConnect:
 		d := ev.Data.(ConnectData)
 		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		if d.Protocol == "TCP" && r.ProxyAddrs[net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort)))] {
+			// To the node's proxy; what it was for arrives as http events.
+			st.tl.Summary.ProxyConnects++
+			return nil, nil
+		}
 		st.tl.Summary.Connects++
 		k := destKey{d.Protocol, d.DstIP, d.DstPort}
 		ds := st.dests[k]
@@ -320,9 +379,46 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			DstName:  name,
 		}, r.MaxEvents)
 
+	case EventHTTP:
+		d := ev.Data.(HTTPData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		k := proxKey{d.Host, d.Port}
+		pd := st.proxied[k]
+		if pd == nil {
+			pd = &ProxiedDest{Host: d.Host, Port: d.Port}
+			st.proxied[k] = pd
+		}
+		pd.Requests++
+		if d.Decision == "deny" && d.Enforced {
+			pd.Denied++
+		} else if len(d.WouldDeny) > 0 {
+			pd.WouldDeny++
+		}
+		st.add(TimelineEvent{
+			Time:      ev.Timestamp,
+			Type:      "http",
+			CgroupID:  ev.CgroupID,
+			Method:    d.Method,
+			DstName:   d.Host,
+			DstPort:   d.Port,
+			Path:      d.Path,
+			Decision:  d.Decision,
+			Enforced:  d.Enforced,
+			Rule:      d.Rule,
+			Layer:     d.Layer,
+			WouldDeny: d.WouldDeny,
+			Reason:    d.Reason,
+		}, r.MaxEvents)
+
 	case EventDNS:
 		d := ev.Data.(DNSData)
 		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
 		st.tl.Summary.DNSReplies++
 		if d.Query != "" {
 			st.names[d.Query] = struct{}{}
@@ -395,6 +491,18 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl.Summary.Binaries = sortedKeys(st.binaries)
 
 	tl.Summary.DNSNames = sortedKeys(st.names)
+
+	tl.Summary.Proxied = nil
+	for _, pd := range st.proxied {
+		tl.Summary.Proxied = append(tl.Summary.Proxied, *pd)
+	}
+	sort.Slice(tl.Summary.Proxied, func(i, j int) bool {
+		a, b := tl.Summary.Proxied[i], tl.Summary.Proxied[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		return a.Port < b.Port
+	})
 
 	tl.Summary.Destinations = make([]Destination, 0, len(st.dests))
 	for k, ds := range st.dests {

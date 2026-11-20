@@ -13,6 +13,7 @@ package clovisor
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,15 +25,17 @@ import (
 
 // NodeAgent is the main daemon for node-level agent egress tracking
 type NodeAgent struct {
-	cmgr      *CgroupManager
-	audit     *AgentAudit
-	bpfReader *EBPFReader
-	recorder  *RunRecorder
-	api       *RunAPIServer
-	policyDir string
-	stopChan  chan bool
-	handled   chan struct{} // closed when handleEvents has drained
-	running   bool
+	cmgr       *CgroupManager
+	audit      *AgentAudit
+	bpfReader  *EBPFReader
+	recorder   *RunRecorder
+	api        *RunAPIServer
+	extproc    *ExtProcServer
+	httpEvents chan AuditEvent
+	policyDir  string
+	stopChan   chan bool
+	handled    chan struct{} // closed when handleEvents has drained
+	running    bool
 }
 
 // NodeAgentOptions configures where run timelines go.
@@ -43,6 +46,17 @@ type NodeAgentOptions struct {
 	// PolicyDir holds profiles and ceilings. If it does not exist, runs
 	// are unprofiled, as in Phase 1.
 	PolicyDir string
+
+	// ProxyListen enables the explicit proxy (milestone 2.3): the node
+	// agent serves ext_proc and writes an Envoy bootstrap that listens
+	// here. Leave invalid to run without a proxy.
+	ProxyListen   netip.AddrPort
+	ExtProcSocket string   // DefaultExtProcSocket if empty
+	EnvoyAdmin    string   // Envoy admin socket; /run/clovisor/envoy/admin.sock if empty
+	EnvoyConfig   string   // where to write the bootstrap; /run/clovisor/envoy.json if empty
+	EnvoyUIDs     []uint32 // uids Envoy runs as, admitted to ext_proc (root always is)
+	// NonRunProxy lets processes outside any run use the proxy.
+	NonRunProxy bool
 }
 
 // NewNodeAgent creates a new node agent
@@ -122,14 +136,60 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		api.SetPolicy(set)
 	}
 
+	var xp *ExtProcServer
+	httpEvents := make(chan AuditEvent, 1000)
+	if opts.ProxyListen.IsValid() {
+		if opts.ExtProcSocket == "" {
+			opts.ExtProcSocket = DefaultExtProcSocket
+		}
+		if opts.EnvoyAdmin == "" {
+			// In a directory only Envoy can use, since Envoy creates the
+			// socket and must not be able to touch anything else here.
+			dir := "/run/clovisor/envoy"
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, err
+			}
+			if len(opts.EnvoyUIDs) > 0 {
+				if err := os.Chown(dir, int(opts.EnvoyUIDs[0]), -1); err != nil {
+					return nil, err
+				}
+			}
+			opts.EnvoyAdmin = dir + "/admin.sock"
+		}
+		if opts.EnvoyConfig == "" {
+			opts.EnvoyConfig = "/run/clovisor/envoy.json"
+		}
+		boot, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket, AdminSocket: opts.EnvoyAdmin})
+		if err == nil {
+			err = writeFileAtomic(opts.EnvoyConfig, boot, 0o644)
+		}
+		if err != nil {
+			api.Close()
+			audit.reader.Close()
+			return nil, fmt.Errorf("envoy bootstrap: %w", err)
+		}
+		xp = NewExtProcServer(api, cmgr.GetAgentsDir(), httpEvents)
+		xp.NonRunAllowed = opts.NonRunProxy
+		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
+			api.Close()
+			audit.reader.Close()
+			return nil, err
+		}
+		api.ProxyURL = "http://" + opts.ProxyListen.String()
+		recorder.ProxyAddrs = map[string]bool{opts.ProxyListen.String(): true}
+		fmt.Printf("proxy: ext_proc on %s; Envoy bootstrap %s (proxy %s)\n", opts.ExtProcSocket, opts.EnvoyConfig, opts.ProxyListen)
+	}
+
 	na := &NodeAgent{
-		cmgr:      cmgr,
-		audit:     audit,
-		recorder:  recorder,
-		api:       api,
-		policyDir: opts.PolicyDir,
-		stopChan:  make(chan bool),
-		running:   false,
+		cmgr:       cmgr,
+		audit:      audit,
+		recorder:   recorder,
+		api:        api,
+		extproc:    xp,
+		httpEvents: httpEvents,
+		policyDir:  opts.PolicyDir,
+		stopChan:   make(chan bool),
+		running:    false,
 	}
 
 	return na, nil
@@ -205,6 +265,9 @@ func (na *NodeAgent) Stop() error {
 
 	// Stop serving first: runs ending now still get their rmdir events
 	// recorded below. Runs still going are left running.
+	if na.extproc != nil {
+		na.extproc.Close()
+	}
 	if na.api != nil {
 		na.api.Close()
 	}
@@ -242,6 +305,13 @@ func (na *NodeAgent) Run() error {
 	if na.api != nil {
 		go na.api.Serve()
 	}
+	if na.extproc != nil {
+		go func() {
+			if err := na.extproc.Serve(); err != nil {
+				fmt.Fprintf(os.Stderr, "ext_proc: %v\n", err)
+			}
+		}()
+	}
 
 	// Block forever - this is a daemon
 	select {}
@@ -250,9 +320,29 @@ func (na *NodeAgent) Run() error {
 // handleEvents processes audit events
 func (na *NodeAgent) handleEvents() {
 	defer close(na.handled)
-	for event := range na.audit.Events() {
-		na.processEvent(event)
+	// One goroutine feeds the recorder: kernel events and proxy decisions.
+	events := na.audit.Events()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				for {
+					select {
+					case ev := <-na.httpEvents:
+						na.processEvent(ev)
+						continue
+					default:
+					}
+					break
+				}
+				goto flush
+			}
+			na.processEvent(event)
+		case ev := <-na.httpEvents:
+			na.processEvent(ev)
+		}
 	}
+flush:
 	if na.recorder != nil {
 		for _, err := range na.recorder.Flush() {
 			fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
@@ -282,6 +372,23 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		d := event.Data.(DNSData)
 		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v\n",
 			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs())
+	case EventHTTP:
+		d := event.Data.(HTTPData)
+		what := d.Method + " " + net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))) + d.Path
+		extra := ""
+		if d.Rule != "" {
+			extra += " rule=" + d.Rule
+		}
+		if d.Layer != "" {
+			extra += " layer=" + d.Layer
+		}
+		if len(d.WouldDeny) > 0 {
+			extra += " would-deny=" + strings.Join(d.WouldDeny, ",")
+		}
+		if d.Reason != "" {
+			extra += " reason=" + strconv.Quote(d.Reason)
+		}
+		fmt.Printf("%s [HTTP] run=%d %s decision=%s%s\n", ts, event.RunCgroupID, what, d.Decision, extra)
 	case EventRunStart:
 		fmt.Printf("%s [RUN START] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	case EventRunEnd:

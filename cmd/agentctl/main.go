@@ -33,7 +33,7 @@ func printUsage() {
 	fmt.Println("AgentCtl - Agent Cgroup Control Tool (Phase 1)")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  agentctl run [--profile p] [--] <command> [args...]")
+	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--] <command> [args...]")
 	fmt.Println("                                    Run a command as a governed run")
 	fmt.Println("  agentctl profiles                 Show which profiles you may request")
 	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
@@ -84,7 +84,39 @@ func runShim(args []string) {
 // exec the command. So no command code ever runs outside the run (design
 // §5.2), and agentctl needs no privileges. clone3(CLONE_INTO_CGROUP)
 // would do this in one step but needs root (see libclovisor/run_api.go).
-func runCommand(args []string, profile string) (int, error) {
+// proxyEnv points a run at the node's proxy. Both spellings are set:
+// curl ignores upper-case HTTP_PROXY (the httpoxy mitigation), and some
+// tools read only one or the other. Values already in the environment are
+// replaced, so an inherited NO_PROXY cannot route around the proxy.
+func proxyEnv(env []string, proxy string) []string {
+	set := map[string]string{
+		"HTTP_PROXY": proxy, "http_proxy": proxy,
+		"HTTPS_PROXY": proxy, "https_proxy": proxy,
+		"NO_PROXY": "localhost,127.0.0.1,::1", "no_proxy": "localhost,127.0.0.1,::1",
+	}
+	out := make([]string, 0, len(env)+len(set))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := set[k]; ok {
+			continue
+		}
+		if strings.EqualFold(k, "ALL_PROXY") {
+			continue // would send other protocols somewhere else
+		}
+		out = append(out, kv)
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+set[k])
+	}
+	return out
+}
+
+func runCommand(args []string, profile string, noProxy bool) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
 	}
@@ -130,6 +162,10 @@ func runCommand(args []string, profile string) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{relR}
+	if run.Proxy != "" && !noProxy {
+		cmd.Env = proxyEnv(os.Environ(), run.Proxy)
+		fmt.Fprintf(os.Stderr, "agentctl: egress via %s\n", run.Proxy)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &pidfd}
 
 	// Terminal signals (Ctrl-C, Ctrl-\) already reach the child through the
@@ -198,25 +234,28 @@ func describePolicy(rp *clovisor.RunPolicy) string {
 	return "profile " + strings.Join(parts, " + ")
 }
 
-// parseRunArgs splits "[--profile p] [--] command..." for agentctl run.
-func parseRunArgs(args []string) (profile string, cmd []string, err error) {
+// parseRunArgs splits "[--profile p] [--no-proxy] [--] command..." for
+// agentctl run.
+func parseRunArgs(args []string) (profile string, noProxy bool, cmd []string, err error) {
 	for len(args) > 0 {
 		a := args[0]
 		switch {
+		case a == "--no-proxy":
+			noProxy, args = true, args[1:]
 		case a == "--":
-			return profile, args[1:], nil
+			return profile, noProxy, args[1:], nil
 		case a == "--profile" || a == "-profile":
 			if len(args) < 2 {
-				return "", nil, fmt.Errorf("--profile needs a name")
+				return "", false, nil, fmt.Errorf("--profile needs a name")
 			}
 			profile, args = args[1], args[2:]
 		case strings.HasPrefix(a, "--profile="):
 			profile, args = strings.TrimPrefix(a, "--profile="), args[1:]
 		default:
-			return profile, args, nil
+			return profile, noProxy, args, nil
 		}
 	}
-	return profile, nil, nil
+	return profile, noProxy, nil, nil
 }
 
 func listProfiles() error {
@@ -444,6 +483,23 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if e.DstName != "" {
 				detail += " (" + e.DstName + ")"
 			}
+		case "http":
+			detail = fmt.Sprintf("%s %s%s -> %s", e.Method, net.JoinHostPort(e.DstName, strconv.Itoa(int(e.DstPort))), e.Path, e.Decision)
+			if e.Decision == "deny" && !e.Enforced {
+				detail += " (not enforced)"
+			}
+			if e.Rule != "" {
+				detail += " rule " + e.Rule
+			}
+			if e.Layer != "" {
+				detail += " by " + e.Layer
+			}
+			if len(e.WouldDeny) > 0 {
+				detail += " (would deny: " + strings.Join(e.WouldDeny, ", ") + ")"
+			}
+			if e.Reason != "" {
+				detail += " [" + e.Reason + "]"
+			}
 		case "dns":
 			detail = fmt.Sprintf("%s %s %s from %s", e.Query, e.QType, e.RCode, e.Server)
 			var vals []string
@@ -470,6 +526,19 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	fmt.Printf("DNS names (%d)\n", len(tl.Summary.DNSNames))
 	for _, n := range tl.Summary.DNSNames {
 		fmt.Printf("  %s\n", n)
+	}
+	if len(tl.Summary.Proxied) > 0 {
+		fmt.Printf("Via proxy (%d destinations, %d connections to the proxy)\n", len(tl.Summary.Proxied), tl.Summary.ProxyConnects)
+		for _, p := range tl.Summary.Proxied {
+			note := ""
+			if p.Denied > 0 {
+				note += fmt.Sprintf(" denied %d", p.Denied)
+			}
+			if p.WouldDeny > 0 {
+				note += fmt.Sprintf(" would-deny %d", p.WouldDeny)
+			}
+			fmt.Printf("  %-46s x%-4d%s\n", net.JoinHostPort(p.Host, strconv.Itoa(int(p.Port))), p.Requests, note)
+		}
 	}
 	fmt.Printf("Destinations (%d)\n", len(tl.Summary.Destinations))
 	for _, d := range tl.Summary.Destinations {
@@ -662,12 +731,12 @@ func main() {
 	switch command {
 	case "run":
 		// Pass remaining args to runCommand (skip "--" if present)
-		profile, args, err := parseRunArgs(os.Args[2:])
+		profile, noProxy, args, err := parseRunArgs(os.Args[2:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		code, err := runCommand(args, profile)
+		code, err := runCommand(args, profile, noProxy)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

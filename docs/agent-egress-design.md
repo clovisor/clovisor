@@ -1728,6 +1728,70 @@ Done: profile binding ([§5.6](#56-profile-binding-names-with-a-trusted-ceiling)
 - **For 2.3.** `RunAPIServer.EffectiveFor(cgroupID)` gives `ext_proc` a run's
   current effective policy from the cgroup id it resolves via sock_diag.
 
+#### 2.3 status (2026-11-20)
+
+Done: the host-level data plane in explicit-proxy mode. Enable it with
+`node-agent -proxy-listen 127.0.0.1:18000`, then run Envoy from the bootstrap
+it writes (`make envoy`).
+
+- **Envoy.**
+  - The node agent generates a static bootstrap: one listener for CONNECT and
+    absolute-form HTTP, `ext_proc` on request headers with
+    `failure_mode_allow: false`, and the dynamic forward proxy.
+  - It carries no per-run state, so it changes only with node configuration
+    (§6.5 rule 2). It validates with Envoy 1.34.
+  - With `ext_proc` unavailable, requests fail closed. After a node-agent
+    restart, Envoy reconnects to the new `ext_proc` unchanged.
+- **`ext_proc`** is served in-process by the node agent, so a run's layers are
+  a map lookup. For each request:
+  - It identifies the run by the client socket's cgroup (sock_diag).
+  - It applies the run's effective policy: CONNECT authority at connect
+    phase, `Host`, method and path for plain HTTP.
+  - It answers denials with the narrated 403: a JSON body plus
+    `x-clovisor-denial` and `x-clovisor-run`. Verified with curl and Python:
+    on plain HTTP the JSON body arrives; on CONNECT only the header does.
+  - Audit-mode layers allow and record would-deny, which is live shadowing.
+  - Unprofiled runs are allowed and recorded.
+  - A CONNECT whose deciding rule needs method or path is refused until
+    termination exists (2.4), rather than tunnelled with the rule unenforced.
+  - Clamps and revokes take effect on the next request.
+- **Security decisions found while building it.**
+  - **`ext_proc` only talks to Envoy.** Whoever can call `ext_proc` can name
+    any client 4-tuple, which reads another run's decisions and writes into
+    its timeline. So `ext_proc` listens on a unix socket and admits only peers
+    whose `SO_PEERCRED` uid is root or Envoy's (`-envoy-uids`, default 101).
+  - **Envoy admin is a unix socket** in a directory only Envoy's uid can use.
+    A TCP admin port would be reachable through the proxy itself.
+  - **Node-local guard.** Whatever the policy, the proxy refuses loopback,
+    link-local (including 169.254.169.254), unspecified and multicast
+    destinations, `localhost` names, and names that resolve to any of those.
+    This stops a run using the proxy, which sits on the host, to reach node
+    services. Residual: a name that rebinds between the check and Envoy's own
+    resolution. Closing it needs the proxy's own connects gated in the kernel,
+    which Phase 3's hooks can do.
+  - **Clients outside any run are refused** (`-proxy-non-run` to allow), with a
+    message saying to use `agentctl run`.
+  - Client-supplied `x-clovisor-*` headers are stripped.
+- **`agentctl run`.**
+  - When the node agent advertises a proxy, it sets both spellings of
+    `http_proxy` and `https_proxy` and `NO_PROXY=localhost,127.0.0.1,::1`.
+  - It replaces inherited values and drops `ALL_PROXY`, so an inherited
+    setting cannot route around the proxy. `--no-proxy` opts out.
+- **Audit.**
+  - Every decision is an `http` timeline event: method, destination, path
+    without query, decision, rule, deciding layer, would-deny layers, reason.
+  - The summary gains `proxied`: requests, denied and would-deny per
+    destination. Connections to the proxy are counted separately, not
+    reported as loopback destinations. This closes the 2.1 limitation.
+  - `agentctl check` replays proxied requests. Learn mode drafts rules only
+    from requests the proxy let through, so blocked attempts never widen a
+    draft.
+  - The recorder no longer recreates a run whose timeline is finished. A late
+    event used to start a phantom run whose partial timeline would overwrite
+    the complete one at shutdown.
+- **Dependencies.** go-control-plane v1.32.4 and gRPC v1.70.0, the newest that
+  keep the module at Go 1.23.
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT

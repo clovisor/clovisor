@@ -10,6 +10,7 @@ package clovisor
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -203,5 +204,49 @@ func TestSplitArgs(t *testing.T) {
 		if got := splitArgs([]byte(in)); !reflect.DeepEqual(got, want) {
 			t.Errorf("splitArgs(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestRunRecorderProxiedRequests(t *testing.T) {
+	r := newTestRecorder(t)
+	r.ProxyAddrs = map[string]bool{"127.0.0.1:18000": true}
+	httpEv := func(ms int, host string, port uint16, decision string, enforced bool, would ...string) AuditEvent {
+		return AuditEvent{Type: EventHTTP, Timestamp: at(ms), CgroupID: testRunCg, RunCgroupID: testRunCg,
+			Data: HTTPData{Method: "CONNECT", Host: host, Port: port, Decision: decision, Enforced: enforced, WouldDeny: would}}
+	}
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		connEv(1, 10, "127.0.0.1", 18000), // to the proxy: not a destination
+		httpEv(2, "github.com", 443, "allow", false),
+		httpEv(3, "github.com", 443, "allow", false, "shadow"),
+		httpEv(4, "evil.example", 443, "deny", true),
+		connEv(5, 10, "127.0.0.1", 18000),
+		runEv(EventRunEnd, 6, "/agents/run-abc"),
+	)
+	if tl.Summary.ProxyConnects != 2 || tl.Summary.Connects != 0 || len(tl.Summary.Destinations) != 0 {
+		t.Fatalf("proxy connects not separated: %+v", tl.Summary)
+	}
+	want := []ProxiedDest{{Host: "evil.example", Port: 443, Requests: 1, Denied: 1}, {Host: "github.com", Port: 443, Requests: 2, WouldDeny: 1}}
+	if !reflect.DeepEqual(tl.Summary.Proxied, want) {
+		t.Fatalf("proxied %+v", tl.Summary.Proxied)
+	}
+
+	// Learn only from what the proxy let through.
+	var b strings.Builder
+	LearnProfile("p", []*RunTimeline{tl}).WriteYAML(&b, t0)
+	if !strings.Contains(b.String(), `fqdn: ["github.com"], ports: [443]`) || strings.Contains(b.String(), `fqdn: ["evil.example"]`) {
+		t.Fatalf("learned from denied requests:\n%s", b.String())
+	}
+
+	// A late event for the finished run must not resurrect it.
+	if got, err := r.Handle(httpEv(9, "github.com", 443, "allow", false)); got != nil || err != nil || len(r.runs) != 0 {
+		t.Fatalf("late event created a run: %v %v %d", got, err, len(r.runs))
+	}
+	if errs := r.Flush(); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	after, _ := ReadRunTimeline(TimelinePath(r.OutDir, "abc"))
+	if after.EndedAt == nil || !after.Complete {
+		t.Fatal("finished timeline overwritten")
 	}
 }

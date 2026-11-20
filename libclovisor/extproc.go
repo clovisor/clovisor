@@ -1,0 +1,447 @@
+// Copyright (c) Authors of Clovisor
+//
+// All rights reserved. This program and the accompanying materials
+// are made available under the terms of the Apache License, Version 2.0
+// which accompanies this distribution, and is available at
+// http://www.apache.org/licenses/LICENSE-2.0
+
+package clovisor
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
+)
+
+// DefaultExtProcSocket is where the node agent serves ext_proc to Envoy.
+const DefaultExtProcSocket = "/run/clovisor/extproc.sock"
+
+// HTTPData is one proxied request and the decision on it.
+type HTTPData struct {
+	Method    string // CONNECT for tunnels
+	Host      string // hostname or IP literal
+	Port      uint16
+	Path      string // without query; empty for CONNECT
+	Decision  string // allow, deny, tag-and-log
+	Enforced  bool   // a deny that blocked (not audit-only)
+	Rule      string
+	Layer     string   // profile that decided a block
+	WouldDeny []string // audit-mode layers that would have denied
+	Reason    string   // why, when not a policy rule (guard, identity, termination)
+	Message   string
+}
+
+// ExtProcServer decides proxied requests for runs (milestone 2.3). It
+// resolves the client's run from the client socket's cgroup, applies the
+// run's effective policy, and answers denials with narration.
+type ExtProcServer struct {
+	extprocv3.UnimplementedExternalProcessorServer
+
+	api       *RunAPIServer
+	agentsDir string
+	// NonRunAllowed lets clients outside any run use the proxy. Off by
+	// default: the proxy exists for runs.
+	NonRunAllowed bool
+
+	events  chan<- AuditEvent
+	dropped atomic.Uint64
+
+	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+	cacheMu sync.Mutex
+	cache   map[string]resolved
+
+	grpc *grpc.Server
+	ln   net.Listener
+	path string
+}
+
+type resolved struct {
+	addrs []netip.Addr
+	at    time.Time
+}
+
+// NewExtProcServer returns a server that reports decisions on events.
+func NewExtProcServer(api *RunAPIServer, agentsDir string, events chan<- AuditEvent) *ExtProcServer {
+	return &ExtProcServer{
+		api:       api,
+		agentsDir: agentsDir,
+		events:    events,
+		resolve: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		},
+		cache: map[string]resolved{},
+	}
+}
+
+// peerCheckListener admits only connections whose SO_PEERCRED uid is
+// allowed. Anything that can talk to ext_proc can ask about any client
+// 4-tuple and write events into any run's timeline, so only Envoy may.
+type peerCheckListener struct {
+	net.Listener
+	allowed map[uint32]bool
+}
+
+func (l *peerCheckListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		uc, ok := c.(*net.UnixConn)
+		if !ok {
+			c.Close()
+			continue
+		}
+		cred, err := peerCred(uc)
+		if err == nil && l.allowed[cred.Uid] {
+			return c, nil
+		}
+		if err == nil {
+			log.Printf("ext_proc: refused connection from uid %d pid %d", cred.Uid, cred.Pid)
+		}
+		c.Close()
+	}
+}
+
+// Listen serves on a unix socket, admitting only the given peer uids
+// (root is always admitted).
+func (s *ExtProcServer) Listen(path string, peerUIDs []uint32) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("ext_proc: listen %s: %w", path, err)
+	}
+	// Connect permission for everyone; the peer check decides.
+	if err := os.Chmod(path, 0o666); err != nil {
+		ln.Close()
+		return err
+	}
+	allowed := map[uint32]bool{0: true}
+	for _, u := range peerUIDs {
+		allowed[u] = true
+	}
+	s.ln = &peerCheckListener{Listener: ln, allowed: allowed}
+	s.path = path
+	s.grpc = grpc.NewServer()
+	extprocv3.RegisterExternalProcessorServer(s.grpc, s)
+	return nil
+}
+
+// Serve blocks until Close.
+func (s *ExtProcServer) Serve() error {
+	err := s.grpc.Serve(s.ln)
+	if errors.Is(err, grpc.ErrServerStopped) {
+		return nil
+	}
+	return err
+}
+
+// Close stops serving.
+func (s *ExtProcServer) Close() {
+	if s.grpc != nil {
+		s.grpc.Stop()
+		os.Remove(s.path)
+	}
+}
+
+// Process handles one HTTP stream from Envoy.
+func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var resp *extprocv3.ProcessingResponse
+		switch r := req.GetRequest().(type) {
+		case *extprocv3.ProcessingRequest_RequestHeaders:
+			resp = s.onHeaders(stream.Context(), req, r.RequestHeaders)
+		case *extprocv3.ProcessingRequest_RequestBody:
+			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestBody{RequestBody: &extprocv3.BodyResponse{}}}
+		case *extprocv3.ProcessingRequest_ResponseHeaders:
+			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extprocv3.HeadersResponse{}}}
+		case *extprocv3.ProcessingRequest_ResponseBody:
+			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: &extprocv3.BodyResponse{}}}
+		default:
+			continue
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
+}
+
+func attribute(req *extprocv3.ProcessingRequest, name string) string {
+	for _, st := range req.GetAttributes() {
+		if v, ok := st.GetFields()[name]; ok {
+			switch k := v.GetKind().(type) {
+			case *structpb.Value_StringValue:
+				return k.StringValue
+			case *structpb.Value_NumberValue:
+				return strconv.FormatInt(int64(k.NumberValue), 10)
+			}
+		}
+	}
+	return ""
+}
+
+func headerValue(h *corev3.HeaderMap, name string) string {
+	for _, kv := range h.GetHeaders() {
+		if kv.GetKey() == name {
+			if kv.GetValue() != "" {
+				return kv.GetValue()
+			}
+			return string(kv.GetRawValue())
+		}
+	}
+	return ""
+}
+
+// attrAddrPort reads "address" (which may already include the port) and
+// "port" attributes as an AddrPort.
+func attrAddrPort(req *extprocv3.ProcessingRequest, addrAttr, portAttr string) (netip.AddrPort, error) {
+	a := attribute(req, addrAttr)
+	if ap, err := netip.ParseAddrPort(a); err == nil {
+		return ap, nil
+	}
+	return netip.ParseAddrPort(net.JoinHostPort(a, attribute(req, portAttr)))
+}
+
+// splitAuthority parses "host:port", "[v6]:port" or a bare host.
+func splitAuthority(authority string, defPort uint16) (string, uint16, error) {
+	host, ps, err := net.SplitHostPort(authority)
+	if err != nil {
+		if strings.Contains(err.Error(), "missing port") {
+			return strings.Trim(authority, "[]"), defPort, nil
+		}
+		return "", 0, err
+	}
+	p, err := strconv.ParseUint(ps, 10, 16)
+	if err != nil || p == 0 {
+		return "", 0, fmt.Errorf("bad port in %q", authority)
+	}
+	return host, uint16(p), nil
+}
+
+// guardClass reports addresses the proxy must never reach for a run,
+// whatever the policy says: they are the node itself. Private ranges are
+// left to policy, since internal services are legitimate destinations.
+func guardClass(a netip.Addr) bool {
+	a = a.Unmap()
+	return a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
+		a.IsUnspecified() || a.IsMulticast() || a.IsInterfaceLocalMulticast()
+}
+
+const resolveCacheTTL = 30 * time.Second
+
+// guard returns a reason to refuse a destination that is, or resolves to,
+// a node-local address. A name that rebinds after this check can still
+// reach one: closing that needs the proxy's own connects gated in the
+// kernel (Phase 3).
+func (s *ExtProcServer) guard(ctx context.Context, host string, ip netip.Addr) string {
+	if ip.IsValid() {
+		if guardClass(ip) {
+			return "destination is a node-local address"
+		}
+		return ""
+	}
+	h := policy.NormalizeHost(host)
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return "destination is a node-local name"
+	}
+	s.cacheMu.Lock()
+	r, ok := s.cache[h]
+	s.cacheMu.Unlock()
+	if !ok || time.Since(r.at) > resolveCacheTTL {
+		cctx, cancel := context.WithTimeout(ctx, time.Second)
+		addrs, err := s.resolve(cctx, h)
+		cancel()
+		if err != nil {
+			return "" // the dynamic forward proxy will fail the request
+		}
+		r = resolved{addrs: addrs, at: time.Now()}
+		s.cacheMu.Lock()
+		if len(s.cache) > 4096 {
+			s.cache = map[string]resolved{}
+		}
+		s.cache[h] = r
+		s.cacheMu.Unlock()
+	}
+	for _, a := range r.addrs {
+		if guardClass(a) {
+			return "destination resolves to a node-local address"
+		}
+	}
+	return ""
+}
+
+func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) *extprocv3.ProcessingResponse {
+	hm := h.GetHeaders()
+	method := headerValue(hm, ":method")
+	authority := headerValue(hm, ":authority")
+	path := headerValue(hm, ":path")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+
+	d := HTTPData{Method: method}
+	phase := policy.PhaseRequest
+	defPort := uint16(80)
+	if method == "CONNECT" {
+		phase, path = policy.PhaseConnect, ""
+		defPort = 443
+	}
+	d.Path = path
+	host, port, err := splitAuthority(authority, defPort)
+	if err != nil || host == "" {
+		d.Host, d.Decision, d.Reason = authority, policy.ActionDeny, "bad authority"
+		d.Message = "The proxy could not parse the destination " + strconv.Quote(authority) + "."
+		return s.deny(d, "")
+	}
+	d.Host, d.Port = host, port
+	ip, _ := netip.ParseAddr(host)
+
+	// Identity: the cgroup of the client's socket (Phase 2 finding 1).
+	runID, eff, isRun, cg := "", (*policy.Effective)(nil), false, uint64(0)
+	src, err1 := attrAddrPort(req, "source.address", "source.port")
+	dst, err2 := attrAddrPort(req, "destination.address", "destination.port")
+	if err1 == nil && err2 == nil {
+		cg, err = SockCgroup(src, dst)
+	} else {
+		err = fmt.Errorf("no client address")
+	}
+	if err == nil {
+		runID, eff, isRun = s.api.RunFor(cg)
+		if !isRun {
+			if p := findRunCgroupPath(s.agentsDir, cg); p != "" {
+				// A run from before this node agent started: unprofiled.
+				runID, isRun = strings.TrimPrefix(p[strings.LastIndex(p, "/")+1:], RunPrefix), true
+			}
+		}
+	}
+	switch {
+	case err != nil:
+		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "unidentified client"
+		d.Message = "The proxy could not identify which run this connection belongs to."
+		return s.deny(d, "")
+	case !isRun && !s.NonRunAllowed:
+		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "not a run"
+		d.Message = "This proxy serves governed agent runs only; start the command with agentctl run."
+		return s.deny(d, "")
+	}
+
+	if reason := s.guard(ctx, host, ip); reason != "" {
+		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "guard: "+reason
+		d.Message = "Egress to " + net.JoinHostPort(host, strconv.Itoa(int(port))) + " is refused: " + reason + "."
+		s.record(cg, runID, d)
+		return s.deny(d, runID)
+	}
+
+	d.Decision = policy.ActionAllow
+	if eff != nil {
+		r := policy.Request{Port: port, Method: method, Path: path, Phase: phase}
+		if ip.IsValid() {
+			r.IP = ip
+		} else {
+			r.Host = host
+		}
+		ed := eff.Decide(r)
+		d.Decision, d.Rule, d.Layer, d.WouldDeny, d.Enforced, d.Message = ed.Action, ed.Rule, ed.Layer, ed.WouldDeny, ed.Enforced, ed.Message
+		if ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() {
+			// The deciding rule needs method or path, which a tunnel never
+			// shows. Without termination (2.4), passing it would leave the
+			// rule unenforced, so refuse.
+			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
+			d.Message = fmt.Sprintf("Rule %s needs the request's method or path, which this proxy cannot see "+
+				"inside a TLS tunnel yet.", ed.Rule)
+		}
+	} else {
+		d.Reason = "unprofiled run"
+	}
+	s.record(cg, runID, d)
+	if d.Decision == policy.ActionDeny && d.Enforced {
+		return s.deny(d, runID)
+	}
+	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
+		RequestHeaders: &extprocv3.HeadersResponse{},
+	}}
+}
+
+func (s *ExtProcServer) record(cg uint64, runID string, d HTTPData) {
+	if runID == "" || s.events == nil {
+		return
+	}
+	ev := AuditEvent{Type: EventHTTP, Timestamp: time.Now(), CgroupID: cg, RunCgroupID: cg, Data: d}
+	select {
+	case s.events <- ev:
+	default:
+		if n := s.dropped.Add(1); n%100 == 1 {
+			log.Printf("ext_proc: event queue full; %d decisions not recorded", n)
+		}
+	}
+}
+
+// headerSafe makes a message usable as a header value.
+func headerSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// deny answers with the narrated 403 (design §7.7). On CONNECT most
+// clients drop the body, so the message is also in x-clovisor-denial.
+func (s *ExtProcServer) deny(d HTTPData, runID string) *extprocv3.ProcessingResponse {
+	target := net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port)))
+	if d.Method != "CONNECT" {
+		target = d.Host + d.Path
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"error":   "egress denied",
+		"run":     runID,
+		"profile": d.Layer,
+		"rule":    d.Rule,
+		"blocked": d.Method + " " + target,
+		"message": d.Message,
+	})
+	headers := []*corev3.HeaderValueOption{
+		{Header: &corev3.HeaderValue{Key: "content-type", RawValue: []byte("application/json")}},
+		{Header: &corev3.HeaderValue{Key: "x-clovisor-denial", RawValue: []byte(headerSafe(d.Message))}},
+	}
+	if runID != "" {
+		headers = append(headers, &corev3.HeaderValueOption{Header: &corev3.HeaderValue{Key: "x-clovisor-run", RawValue: []byte(runID)}})
+	}
+	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ImmediateResponse{
+		ImmediateResponse: &extprocv3.ImmediateResponse{
+			Status:  &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+			Body:    body,
+			Headers: &extprocv3.HeaderMutation{SetHeaders: headers},
+			Details: "clovisor_policy_deny",
+		},
+	}}
+}

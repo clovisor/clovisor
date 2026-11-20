@@ -74,8 +74,11 @@ func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
 
 	for _, tl := range runs {
 		rep.Runs = append(rep.Runs, tl.RunID)
-		for _, d := range tl.Summary.Destinations {
+		for _, d := range append(append([]Destination{}, tl.Summary.Destinations...), proxiedDestinations(tl, false)...) {
 			addr := net.JoinHostPort(d.IP, strconv.Itoa(int(d.Port)))
+			if d.IP == "via proxy" {
+				addr = "via proxy"
+			}
 			ip, _ := netip.ParseAddr(d.IP)
 			switch {
 			case d.Proto == "UDP" && d.Port == 53:

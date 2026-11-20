@@ -77,6 +77,7 @@ type RunAPIResponse struct {
 	RunID    string     `json:"run_id,omitempty"`
 	CgroupID uint64     `json:"cgroup_id,omitempty"`
 	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
+	Proxy    string     `json:"proxy,omitempty"`  // create: the node's proxy URL, if any
 	// profiles:
 	Ceiling string   `json:"ceiling,omitempty"`
 	Allow   []string `json:"allow,omitempty"`
@@ -135,12 +136,15 @@ type RunAPIServer struct {
 	path      string
 
 	policy atomic.Pointer[policy.Set] // nil: no policy loaded; runs are unprofiled
+	// ProxyURL is the node's explicit proxy, handed to clients for runs.
+	ProxyURL string
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
 	active  map[string]bool // runs owned by a live connection
 	bound   map[string]*boundRun
 	byCg    map[uint64]*boundRun
+	runByCg map[uint64]string // every live run, profiled or not
 	closing bool
 	done    chan struct{}
 	wg      sync.WaitGroup
@@ -158,16 +162,16 @@ type boundRun struct {
 // keep the versions they were bound to (§5.6, versioned binding).
 func (s *RunAPIServer) SetPolicy(set *policy.Set) { s.policy.Store(set) }
 
-// EffectiveFor returns the effective policy of the run whose cgroup is
-// cgroupID, for enforcement points (2.3).
-func (s *RunAPIServer) EffectiveFor(cgroupID uint64) (runID string, eff *policy.Effective, ok bool) {
+// RunFor returns the live run whose cgroup is cgroupID and its effective
+// policy (nil for an unprofiled run), for enforcement points.
+func (s *RunAPIServer) RunFor(cgroupID uint64) (runID string, eff *policy.Effective, isRun bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, ok := s.byCg[cgroupID]
-	if !ok {
-		return "", nil, false
+	runID, isRun = s.runByCg[cgroupID]
+	if b, ok := s.byCg[cgroupID]; ok {
+		eff = b.eff
 	}
-	return b.runID, b.eff, true
+	return runID, eff, isRun
 }
 
 // reapInterval is how often orphaned run cgroups are checked.
@@ -210,6 +214,7 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		active:    map[string]bool{},
 		bound:     map[string]*boundRun{},
 		byCg:      map[uint64]*boundRun{},
+		runByCg:   map[uint64]string{},
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -523,6 +528,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	path, id, err := ac.s.cm.CreateRunCgroup(runID)
 	if err == nil {
 		ac.s.active[runID] = true
+		ac.s.runByCg[id] = runID
 		if binding != nil {
 			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: binding.Effective}
 			ac.s.bound[runID] = b
@@ -548,7 +554,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		granted = rp.Layers[0].Profile + "@" + rp.Layers[0].Version + " (" + rp.Reason + ")"
 	}
 	log.Printf("run api: run %s created for uid %d pid %d: %s", runID, ac.cred.Uid, ac.cred.Pid, granted)
-	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp}
+	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL}
 }
 
 // caller is the requester's platform identity: uid from SO_PEERCRED,
@@ -758,6 +764,11 @@ func (ac *apiConn) finish(exitCode *int) {
 	if b, ok := ac.s.bound[ac.runID]; ok {
 		delete(ac.s.byCg, b.cgroupID)
 		delete(ac.s.bound, ac.runID)
+	}
+	for cg, r := range ac.s.runByCg {
+		if r == ac.runID {
+			delete(ac.s.runByCg, cg)
+		}
 	}
 	ac.s.mu.Unlock()
 	ac.runID = ""

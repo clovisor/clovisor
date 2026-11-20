@@ -20,6 +20,7 @@ const (
 	EventRunStart // a run cgroup (agents/<name>) was created
 	EventRunEnd   // a run cgroup was removed; always the run's last event
 	EventDNS      // a resolver reply delivered to a socket in a run
+	EventHTTP     // a request through the node's proxy, and its decision
 )
 
 // AuditEvent represents an audit event
