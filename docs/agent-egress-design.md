@@ -47,6 +47,13 @@ place:
 | Exfiltration through *allowed* destinations stated as an explicit limit. | [§11](#11-non-goals-and-honest-limits) |
 | Code-reuse table corrected to what actually carries over. | [§9](#9-what-maps-from-the-existing-codebase) |
 
+### 2026-11-20 — Phase 1 implementation
+
+| Change | Where |
+|---|---|
+| `clone3(CLONE_INTO_CGROUP)` needs root, so the run API moves a parked child by pidfd instead of handing out a cgroup fd. | [§5.2](#52-enforcement-identity-cgroup-v2), [Phase 1 status](#phase-1-status-2026-11-20) |
+| Phase 1 complete; Phase 2 broken into milestones, with explicit-proxy identity from socket diagnostics on Linux. | [Phase 2 plan](#phase-2-plan-2026-11-20) |
+
 ---
 
 ## 1. Provenance: what Clovisor was
@@ -1561,6 +1568,88 @@ Implemented:
 Phase 1 is complete. Known gaps carried forward: a lost-event counter for ring
 buffer overflow, and DNS outside UDP/53 (fixed by Phase 3's forced local DNS).
 
+### Phase 2 plan (2026-11-20)
+
+Goal, from the table above: the proxy and MCP layer in explicit-proxy mode
+([§4.3](#43-two-deployment-modes)), needing no root and no kernel features, so
+it also runs on macOS. Each milestone must be useful if the later ones never
+ship.
+
+#### Findings that shape the plan
+
+1. **On Linux, explicit-proxy identity can be the cgroup.** Socket diagnostics
+   (`NETLINK_SOCK_DIAG` with `INET_DIAG_CGROUP_ID`, Linux 5.7+) report a
+   socket's cgroup id. `ext_proc` can map a client connection's source port to
+   the client socket, then to the cgroup, then to the run. That identity is
+   unforgeable; only routing stays advisory until Phase 3. Elsewhere, the
+   fallback is a per-run proxy credential, a claim
+   ([§5.5](#55-the-forgeability-rule)). The receipt states which one applies.
+   This answers open question 5 for Linux ([§12](#12-open-questions)).
+2. **Explicit-proxy HTTPS arrives as `CONNECT host:443`.** Host rules need no
+   termination and no SNI parsing: the CONNECT authority names the
+   destination. Path, method and body rules need Envoy to end the CONNECT and
+   terminate TLS inside it, by chaining to an internal listener. That is the
+   riskiest Envoy configuration in this phase, so it gets a spike.
+3. **Denial narration ([§7.7](#77-denial-as-a-teaching-signal)) does not survive
+   a CONNECT.** Clients report a 403 on CONNECT as a failed tunnel and drop the
+   body. Narration reaches the model on plain HTTP, on terminated connections,
+   and on the MCP error path. For CONNECT it is carried in a response header
+   for harnesses to surface, and the receipt says so.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **2.0** | Spikes | Envoy CONNECT host decisions; CONNECT termination via an internal listener; dynamic forward proxy with both. A minimal Go `ext_proc` (headers, immediate 403, body buffering). Cgroup lookup by source port via sock_diag. | Settles the Envoy question before product code depends on it. |
+| **2.1** | Policy package and receipt | `AgentProfile` types moved out of learn mode, covering the §7.3 fields Phase 2 enforces and the §8.5 `mcp` block. Strict parsing. Compile errors: `deny` without `message`, body rule on `no_terminate`, `paths:` on non-HTTP, anything no tier can enforce. Tier placement, per-destination posture with the node-wide note. `agentctl explain` prints the receipt. `agentctl check --runs` replays Phase 1 timelines against a profile, which is the shadow step of [§7.10](#710-authoring-lifecycle--the-adoption-problem) without a proxy. | Lint, receipt and offline shadowing of learned profiles. |
+| **2.2** | Profile binding | `agentctl run --profile`. The run API resolves the name against a ceiling chosen by `SO_PEERCRED` (uid/gid on a host), never the request ([§5.6](#56-profile-binding-names-with-a-trusted-ceiling)). Runs bind to `name@sha256`, recorded in the timeline. Out-of-band clamp, remove-only. | Audit records which policy governed each run. |
+| **2.3** | Data plane, host level | Compiler emits a static Envoy bootstrap: one listener, `ext_proc`, dynamic forward proxy, CONNECT and plain HTTP. Go `ext_proc` server runs the 2.1 engine on the CONNECT authority or `Host`, resolves identity (sock_diag, or credential), returns narrated 403s. `mode: audit` logs would-deny and allows: live shadowing. `agentctl run` sets the proxy variables. Decisions return to the node agent as `http` timeline events. | Host-level egress policy for any harness that honours a proxy. |
+| **2.4** | Termination | Terminating chain for exactly the destinations whose rules need it. A node CA whose key only the proxy can read; `agentctl` injects trust (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`). Method and path rules. Body discard for runs with no body rule on that destination ([§6.6](#66-tls-posture)). Content rules stay in Phase 5. | Path and method policy. |
+| **2.5** | MCP | Remote: JSON-RPC parsing in `ext_proc` (`tools/call`, `resources/read`, `tools/list`), tool allow and deny globs, `Mcp-Session-Id` in the timeline. Tool-definition pinning with drift alert or block, including SSE response streams ([§8.4](#84-two-mcp-specific-threats)). Local gateway `clovisor-mcp`: stdio servers, each in a child cgroup on Linux, exposed over streamable HTTP on loopback, enforced by the same engine library. Sampling denied with a message until `ask` exists (Phase 5). | Tool-level MCP policy, the headline capability. |
+| **2.6** | Learn and audit | Learn mode drafts methods, paths and MCP tool lists from `http` events, still allowing only what was observed. `agentctl events` shows L7 decisions. | Profiles stay authorable as rules get finer. |
+| **2.7** | Portability and tests | Build tags so `agentctl`, the compiler, `ext_proc` and the MCP gateway build without BPF, including macOS. Docker integration tests against a pinned Envoy (curl, Python requests, git over HTTPS, an MCP client). Operator guide. | Phase 2 ships. |
+
+Order: 2.0, 2.1, 2.2, 2.3, then 2.5's local gateway, 2.4, the rest of 2.5,
+2.6, 2.7. Doing 2.1 first gives `explain` and offline shadowing before any
+proxy exists.
+
+#### 2.0 spike results (2026-11-20)
+
+Envoy 1.34.14, a Go `ext_proc` server on go-control-plane, and the Phase 1
+node agent, on kernel 7.0 (aarch64). Code and configs in `spikes/phase2/`.
+
+| Question | Result |
+|---|---|
+| Cgroup from the client's source port | Works. `NETLINK_SOCK_DIAG` exact lookup returns `INET_DIAG_CGROUP_ID` for the client socket. Unprivileged, about 3 µs. Every request resolved to the correct run, including two connections from one process. A request from outside any run resolved to a non-run cgroup. |
+| Host decisions on CONNECT | Works. `ext_proc` sees `:method CONNECT` and `:authority host:port`, plus `source.address` and `destination.address` as request attributes. Lookup plus decision took 70–200 µs, most of it the spike's directory walk from cgroup id to run; production keeps that map in the node agent. |
+| Plain HTTP | Works, as absolute-form requests through the same listener. |
+| Denial narration | As predicted. On CONNECT, curl and Python report only "tunnel failed: 403" and drop the body; the `x-clovisor-denial` header is visible to anything that reads the CONNECT response. On plain HTTP and on terminated connections, the JSON body reaches the client intact. |
+| CONNECT termination | Works. A route matching `connect_matcher` plus exact `:authority` sends that CONNECT, ended (`connect_config: {}`), to an internal listener that terminates TLS (ALPN h2 and http/1.1) and runs `ext_proc` with buffered bodies. The termination set lives in route config, so it changes with policy, never per run ([§6.5](#65-three-rules-that-must-not-be-gotten-wrong)). Other hosts stay plain tunnels with the origin's certificate. |
+| Identity across the internal hop | Works. `set_filter_state` records the outer connection's addresses with `shared_with_upstream: TRANSITIVE`. On the inner hop `header_mutation`, placed before `ext_proc`, writes them into `x-clovisor-client` with `OVERWRITE_IF_EXISTS_OR_ADD`. A client-supplied value was overwritten. Route-level `request_headers_to_add` would not work: the router applies it after `ext_proc` has run. |
+| Dynamic forward proxy | Works on both paths: plain DFP for tunnels and HTTP, DFP with upstream TLS (`auto_sni`, `auto_san_validation`) behind termination. |
+| `ext_proc` unavailable | Fails closed: CONNECT gets a 500 with `failure_mode_allow: false`. |
+
+Two findings for later milestones:
+
+- **curl ignores upper-case `HTTP_PROXY`** (the httpoxy mitigation), and
+  plain HTTP then goes direct. `agentctl run` must set both spellings of
+  `http_proxy` and `https_proxy` (2.3).
+- **Python 3.13+ verifies certificates strictly by default** and rejects a CA
+  without critical `basicConstraints` and `keyUsage`, or a leaf without
+  `authorityKeyIdentifier`. The node CA must be generated to RFC 5280 profile
+  (2.4).
+
+#### Decisions
+
+- **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT
+  termination works with stock filters, so no Go proxy is needed.
+- **One engine.** A Go library called by both `ext_proc` and the MCP gateway:
+  two enforcement points, one definition of each rule.
+- **macOS identity.** The per-run credential, labelled a claim in the receipt,
+  rather than declaring macOS audit-only.
+- **Repository** ([§12](#12-open-questions) item 7). *Decided 2026-11-20:* Phase 2
+  stays in the `clovisor` repository.
+
 Implementation note: BPF programs attached to `syscalls/sys_enter_*` tracepoints
 through perf events fired only on the CPU the perf event was opened on, on the
 development kernel. Use `tp_btf` or cgroup hooks instead.
@@ -1630,6 +1719,5 @@ development kernel. Use `tp_btf` or cgroup hooks instead.
 6. **Allowed-channel exfiltration** — how far to go beyond method/path rules and
    `ask` for write-capable destinations. See
    [§11](#11-non-goals-and-honest-limits).
-7. **Repository** — keep growing in `clovisor`, or start a fresh repository in its
-   lineage. The legacy bcc tree no longer shares code with the new path. See
+7. ~~**Repository**~~ — *decided 2026-11-20:* keep growing in `clovisor`. See
    [§9](#9-what-maps-from-the-existing-codebase).
