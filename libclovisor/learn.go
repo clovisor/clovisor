@@ -1,0 +1,464 @@
+// Copyright (c) Authors of Clovisor
+//
+// All rights reserved. This program and the accompanying materials
+// are made available under the terms of the Apache License, Version 2.0
+// which accompanies this distribution, and is available at
+// http://www.apache.org/licenses/LICENSE-2.0
+
+package clovisor
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// AgentProfile is the subset of the policy language (design §7.3) that
+// learn mode can draft from audit data. Field names follow the YAML.
+type AgentProfile struct {
+	Kind     string `yaml:"kind"`
+	Metadata struct {
+		Name string `yaml:"name"`
+	} `yaml:"metadata"`
+	Spec ProfileSpec `yaml:"spec"`
+}
+
+// ProfileSpec is the body of an AgentProfile.
+type ProfileSpec struct {
+	Mode   string       `yaml:"mode"`
+	Egress EgressPolicy `yaml:"egress"`
+	Exec   ExecPolicy   `yaml:"exec"`
+}
+
+// EgressPolicy is the egress block of a profile.
+type EgressPolicy struct {
+	Default string       `yaml:"default"`
+	Rules   []EgressRule `yaml:"rules"`
+}
+
+// EgressRule is one egress rule.
+type EgressRule struct {
+	Name   string     `yaml:"name"`
+	To     EgressDest `yaml:"to"`
+	Action string     `yaml:"action"`
+}
+
+// EgressDest selects destinations.
+type EgressDest struct {
+	FQDN  []string `yaml:"fqdn,omitempty"`
+	CIDR  []string `yaml:"cidr,omitempty"`
+	Ports []uint16 `yaml:"ports,omitempty"`
+}
+
+// ExecPolicy is the exec block of a profile.
+type ExecPolicy struct {
+	Default               string      `yaml:"default"`
+	RequireReadonlyOrigin bool        `yaml:"require_readonly_origin"`
+	Allow                 []ExecAllow `yaml:"allow"`
+}
+
+// ExecAllow allows one binary.
+type ExecAllow struct {
+	Path string `yaml:"path"`
+	Note string `yaml:"note,omitempty"`
+}
+
+// interpreters are binaries whose exec permission amounts to arbitrary
+// code (design §7.6). Matched on basename, versions stripped.
+var interpreters = map[string]bool{
+	"sh": true, "bash": true, "dash": true, "zsh": true, "ksh": true, "fish": true, "busybox": true,
+	"python": true, "python3": true, "node": true, "nodejs": true, "deno": true, "bun": true,
+	"perl": true, "ruby": true, "php": true, "lua": true, "tclsh": true, "osascript": true,
+	"env": true, "xargs": true, "awk": true, "gawk": true,
+}
+
+var versionSuffix = regexp.MustCompile(`[0-9.]+$`)
+
+func isInterpreter(path string) bool {
+	base := filepath.Base(path)
+	if interpreters[base] {
+		return true
+	}
+	return interpreters[versionSuffix.ReplaceAllString(base, "")]
+}
+
+// learnedHost is one hostname the runs connected to.
+type learnedHost struct {
+	name  string
+	ports map[uint16]bool
+	conns int
+	ips   map[string]bool
+	runs  map[string]bool
+	udp   map[uint16]int // UDP connects to this name, by port (QUIC etc.)
+}
+
+// learnedIP is a destination reached without any looked-up name.
+type learnedIP struct {
+	proto string
+	ip    string
+	port  uint16
+	conns int
+	runs  map[string]bool
+}
+
+// Draft is a profile drafted from one or more run timelines, plus what
+// the reviewer needs to judge it.
+type Draft struct {
+	Profile AgentProfile
+
+	Runs       []*RunTimeline
+	hosts      map[string]*learnedHost // keyed by rule name
+	ruleHost   map[string]string       // rule name -> host
+	unnamedTCP []*learnedIP            // TCP to an IP with no name: commented-out cidr rules
+	local      []*learnedIP            // loopback destinations
+	dnsServers map[string]int          // resolver ip:port -> connects
+	otherUDP   []*learnedIP            // UDP, not DNS, no name
+	lookedUp   []string                // names looked up but never connected to
+	binaryRuns map[string]map[string]bool
+}
+
+// LearnProfile drafts an AgentProfile that would allow exactly the
+// behaviour seen in runs: TCP to the hostnames they looked up and then
+// connected to, and exec of the binaries they ran. Anything that cannot
+// be expressed precisely is left out of the profile and reported as a
+// comment instead, so the draft never allows more than was seen.
+func LearnProfile(name string, runs []*RunTimeline) *Draft {
+	d := &Draft{
+		Runs:       runs,
+		hosts:      map[string]*learnedHost{},
+		ruleHost:   map[string]string{},
+		dnsServers: map[string]int{},
+		binaryRuns: map[string]map[string]bool{},
+	}
+	d.Profile.Kind = "AgentProfile"
+	d.Profile.Metadata.Name = name
+	d.Profile.Spec.Mode = "audit"
+	d.Profile.Spec.Egress.Default = "deny"
+	d.Profile.Spec.Exec.Default = "deny"
+	d.Profile.Spec.Exec.RequireReadonlyOrigin = true
+
+	byHost := map[string]*learnedHost{}
+	ipDests := map[destKey]*learnedIP{}
+	connected := map[string]bool{}
+	looked := map[string]bool{}
+
+	for _, tl := range runs {
+		for _, b := range tl.Summary.Binaries {
+			if d.binaryRuns[b] == nil {
+				d.binaryRuns[b] = map[string]bool{}
+			}
+			d.binaryRuns[b][tl.RunID] = true
+		}
+		for _, n := range tl.Summary.DNSNames {
+			looked[n] = true
+		}
+		for _, dst := range tl.Summary.Destinations {
+			if dst.Port == 53 && dst.Proto == "UDP" {
+				d.dnsServers[net.JoinHostPort(dst.IP, "53")] += dst.Count
+				continue
+			}
+			if len(dst.Names) == 0 {
+				k := destKey{dst.Proto, dst.IP, dst.Port}
+				li := ipDests[k]
+				if li == nil {
+					li = &learnedIP{proto: dst.Proto, ip: dst.IP, port: dst.Port, runs: map[string]bool{}}
+					ipDests[k] = li
+				}
+				li.conns += dst.Count
+				li.runs[tl.RunID] = true
+				continue
+			}
+			for _, n := range dst.Names {
+				connected[n] = true
+				h := byHost[n]
+				if h == nil {
+					h = &learnedHost{name: n, ports: map[uint16]bool{}, ips: map[string]bool{},
+						runs: map[string]bool{}, udp: map[uint16]int{}}
+					byHost[n] = h
+				}
+				h.runs[tl.RunID] = true
+				h.ips[dst.IP] = true
+				if dst.Proto == "UDP" {
+					h.udp[dst.Port] += dst.Count
+					continue
+				}
+				h.ports[dst.Port] = true
+				h.conns += dst.Count
+			}
+		}
+	}
+
+	// Egress: one rule per hostname reached over TCP, sorted by name.
+	hostNames := make([]string, 0, len(byHost))
+	for n := range byHost {
+		hostNames = append(hostNames, n)
+	}
+	sort.Strings(hostNames)
+	used := map[string]bool{}
+	for _, n := range hostNames {
+		h := byHost[n]
+		rn := uniqueRuleName(ruleName(n), used)
+		d.hosts[rn] = h
+		d.ruleHost[rn] = n
+		if len(h.ports) == 0 {
+			continue // UDP only: reported, not allowed
+		}
+		d.Profile.Spec.Egress.Rules = append(d.Profile.Spec.Egress.Rules, EgressRule{
+			Name:   rn,
+			To:     EgressDest{FQDN: []string{n}, Ports: sortedPorts(h.ports)},
+			Action: "allow",
+		})
+	}
+
+	for _, li := range ipDests {
+		ip := net.ParseIP(li.ip)
+		switch {
+		case ip != nil && ip.IsLoopback():
+			d.local = append(d.local, li)
+		case li.proto == "TCP":
+			d.unnamedTCP = append(d.unnamedTCP, li)
+		default:
+			d.otherUDP = append(d.otherUDP, li)
+		}
+	}
+	for _, s := range [][]*learnedIP{d.local, d.unnamedTCP, d.otherUDP} {
+		sort.Slice(s, func(i, j int) bool {
+			if s[i].ip != s[j].ip {
+				return s[i].ip < s[j].ip
+			}
+			if s[i].port != s[j].port {
+				return s[i].port < s[j].port
+			}
+			return s[i].proto < s[j].proto
+		})
+	}
+
+	for n := range looked {
+		if !connected[n] {
+			d.lookedUp = append(d.lookedUp, n)
+		}
+	}
+	sort.Strings(d.lookedUp)
+
+	// Exec: every binary seen, absolute paths only.
+	bins := make([]string, 0, len(d.binaryRuns))
+	for b := range d.binaryRuns {
+		bins = append(bins, b)
+	}
+	sort.Strings(bins)
+	for _, b := range bins {
+		a := ExecAllow{Path: b}
+		if isInterpreter(b) {
+			a.Note = "interpreter: allows arbitrary code; confinement comes from egress policy"
+		}
+		d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
+	}
+	return d
+}
+
+var nonRuleChars = regexp.MustCompile(`[^a-z0-9]+`)
+
+func ruleName(host string) string {
+	n := strings.Trim(nonRuleChars.ReplaceAllString(strings.ToLower(host), "-"), "-")
+	if n == "" {
+		n = "host"
+	}
+	return n
+}
+
+func uniqueRuleName(n string, used map[string]bool) string {
+	cand := n
+	for i := 2; used[cand]; i++ {
+		cand = fmt.Sprintf("%s-%d", n, i)
+	}
+	used[cand] = true
+	return cand
+}
+
+func sortedPorts(m map[uint16]bool) []uint16 {
+	out := make([]uint16, 0, len(m))
+	for p := range m {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func sortedSet(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// q quotes s as a YAML double-quoted scalar. JSON string syntax is a
+// subset of YAML's double-quoted style.
+func q(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func portList(ps []uint16) string {
+	s := make([]string, len(ps))
+	for i, p := range ps {
+		s[i] = strconv.Itoa(int(p))
+	}
+	return "[" + strings.Join(s, ", ") + "]"
+}
+
+func plural(n int, one string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %ss", n, one)
+}
+
+func runsNote(runs map[string]bool, total int) string {
+	if total <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(", %d/%d runs", len(runs), total)
+}
+
+// WriteYAML renders the draft as YAML, with review notes as comments.
+func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
+	var b strings.Builder
+	p := func(format string, a ...interface{}) { fmt.Fprintf(&b, format+"\n", a...) }
+	total := len(d.Runs)
+
+	p("# Draft profile generated by learn mode on %s.", now.UTC().Format(time.RFC3339))
+	p("# It allows exactly what was observed; review before enforcing (design §7.10).")
+	p("#")
+	p("# Source runs:")
+	var incomplete []string
+	for _, tl := range d.Runs {
+		flag := ""
+		if !tl.Complete {
+			flag = "  [incomplete: events may be missing]"
+			incomplete = append(incomplete, tl.RunID)
+		}
+		cmd := strings.Join(tl.Command, " ")
+		if len(cmd) > 60 {
+			cmd = cmd[:57] + "..."
+		}
+		p("#   %s  %s  %s%s", tl.RunID, tl.StartedAt.UTC().Format(time.RFC3339), cmd, flag)
+	}
+	if len(incomplete) > 0 {
+		p("# Incomplete runs may under-report destinations and binaries.")
+	}
+	p("kind: AgentProfile")
+	p("metadata:")
+	p("  name: %s", q(d.Profile.Metadata.Name))
+	p("spec:")
+	p("  mode: %s  # switch to enforce once shadowing shows no violations", d.Profile.Spec.Mode)
+	p("")
+	p("  egress:")
+	p("    default: %s", d.Profile.Spec.Egress.Default)
+	if len(d.Profile.Spec.Egress.Rules) == 0 {
+		p("    rules: []")
+	} else {
+		p("    rules:")
+	}
+	for _, r := range d.Profile.Spec.Egress.Rules {
+		h := d.hosts[r.Name]
+		p("      # %s to %s%s", plural(h.conns, "connection"), strings.Join(sortedSet(h.ips), ", "), runsNote(h.runs, total))
+		p("      - name: %s", q(r.Name))
+		p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
+		p("        action: %s", r.Action)
+	}
+
+	if len(d.unnamedTCP) > 0 {
+		p("")
+		p("      # TCP to addresses with no looked-up name. An IP rule is coarse (shared CDN")
+		p("      # addresses, design §7.5), so these are left disabled. Prefer finding the")
+		p("      # hostname; enable only for protocols with no name on the wire.")
+		for _, li := range d.unnamedTCP {
+			p("      # - name: %s  # %s%s", q(ruleName("ip-"+li.ip+"-"+strconv.Itoa(int(li.port)))),
+				plural(li.conns, "connection"), runsNote(li.runs, total))
+			p("      #   to: { cidr: [%s], ports: [%d] }", q(hostCIDR(li.ip)), li.port)
+			p("      #   action: allow")
+		}
+	}
+
+	var udpNamed []string
+	for rn, h := range d.hosts {
+		for port, n := range h.udp {
+			udpNamed = append(udpNamed, fmt.Sprintf("%s:%d (%s, rule %s)", h.name, port, plural(n, "connection"), rn))
+		}
+	}
+	sort.Strings(udpNamed)
+	if len(udpNamed) > 0 || len(d.otherUDP) > 0 {
+		p("")
+		p("      # UDP seen and not allowed. QUIC is denied by default and clients fall back")
+		p("      # to TCP (design §6.8).")
+		for _, s := range udpNamed {
+			p("      #   %s", s)
+		}
+		for _, li := range d.otherUDP {
+			p("      #   %s (%s)", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), plural(li.conns, "connection"))
+		}
+	}
+	if len(d.local) > 0 {
+		p("")
+		p("      # Loopback destinations, not covered by egress rules:")
+		for _, li := range d.local {
+			p("      #   %s %s (%s)", li.proto, net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), plural(li.conns, "connection"))
+		}
+	}
+	if len(d.dnsServers) > 0 {
+		servers := make([]string, 0, len(d.dnsServers))
+		for s := range d.dnsServers {
+			servers = append(servers, s)
+		}
+		sort.Strings(servers)
+		p("")
+		p("      # DNS went to %s. With forced local DNS (design §6.8) the", strings.Join(servers, ", "))
+		p("      # node resolver answers instead; no rule is needed.")
+	}
+	if len(d.lookedUp) > 0 {
+		p("")
+		p("      # Looked up but never connected to (not allowed):")
+		for _, n := range d.lookedUp {
+			p("      #   %s", n)
+		}
+	}
+
+	p("")
+	p("  exec:")
+	p("    default: %s", d.Profile.Spec.Exec.Default)
+	p("    require_readonly_origin: %t  # design §7.6", d.Profile.Spec.Exec.RequireReadonlyOrigin)
+	if len(d.Profile.Spec.Exec.Allow) == 0 {
+		p("    allow: []")
+	} else {
+		p("    allow:")
+	}
+	for _, a := range d.Profile.Spec.Exec.Allow {
+		line := fmt.Sprintf("      - path: %s", q(a.Path))
+		if rn := runsNote(d.binaryRuns[a.Path], total); rn != "" {
+			line += "  # " + strings.TrimPrefix(rn, ", ")
+		}
+		p("%s", line)
+		if a.Note != "" {
+			p("        note: %s", q(a.Note))
+		}
+	}
+
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+func hostCIDR(ip string) string {
+	if strings.Contains(ip, ":") {
+		return ip + "/128"
+	}
+	return ip + "/32"
+}

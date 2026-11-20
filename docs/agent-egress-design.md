@@ -1499,9 +1499,28 @@ Implemented:
       `nss-resolve` talking to systemd-resolved over varlink, or `nscd`;
     - IPv6 replies with extension headers.
 
+- *Added 2026-11-20.* Learn mode: `agentctl learn (--all | <run-id>...)` drafts
+  an `AgentProfile` (§7.3) from finished runs. The draft allows exactly what was
+  observed and nothing more:
+  - **Egress.** Default deny, plus one `allow` rule per hostname that a run
+    looked up and then reached over TCP, with the ports it used.
+  - **Exec.** Default deny with `require_readonly_origin`, and an allow entry per
+    absolute binary path. Interpreters carry a note that allowing them allows
+    arbitrary code (§7.6).
+  - **`mode: audit`.** The draft is the input to the shadow step of §7.10, not
+    an enforcing profile.
+  - **Comments instead of rules** for what cannot be expressed precisely:
+    - TCP to IPs with no looked-up name, as disabled `cidr` rules (§7.5);
+    - UDP and QUIC;
+    - loopback;
+    - the resolver;
+    - names looked up but never connected to;
+    - incomplete source runs.
+  - `to.cidr` is not in the §7.3 example. Learn mode introduces it for the
+    "other TCP" row of §7.5, and the Phase 2 compiler must accept it.
+
 Not yet done:
 
-- learn mode;
 - the node-agent-owned cgroup API ([§5.4](#54-the-injection-channel)).
   `agentctl` still creates cgroups directly, as root.
 

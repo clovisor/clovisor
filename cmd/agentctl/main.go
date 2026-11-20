@@ -33,6 +33,8 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  agentctl run <command> [args...]  Run a command in a new agent cgroup")
 	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
+	fmt.Println("  agentctl learn [-o file] [--name n] (--all | run-id...)")
+	fmt.Println("                                    Draft a profile from recorded runs")
 	fmt.Println("  agentctl cgroups                  List active cgroups")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -329,6 +331,72 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	}
 }
 
+// learnProfile drafts an AgentProfile from recorded runs.
+func learnProfile(argv []string) error {
+	fs := flag.NewFlagSet("learn", flag.ContinueOnError)
+	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	name := fs.String("name", "learned-profile", "metadata.name of the drafted profile")
+	out := fs.String("o", "", "write the profile here instead of stdout")
+	all := fs.Bool("all", false, "learn from every finished run in -dir")
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+
+	var paths []string
+	switch {
+	case *all && fs.NArg() > 0:
+		return fmt.Errorf("give either --all or run ids, not both")
+	case *all:
+		var err error
+		if paths, err = filepath.Glob(filepath.Join(*dir, "run-*.json")); err != nil {
+			return err
+		}
+	case fs.NArg() == 0:
+		return fmt.Errorf("give run ids to learn from, or --all")
+	default:
+		for _, id := range fs.Args() {
+			paths = append(paths, clovisor.TimelinePath(*dir, strings.TrimPrefix(id, clovisor.RunPrefix)))
+		}
+	}
+
+	var runs []*clovisor.RunTimeline
+	for _, p := range paths {
+		tl, err := clovisor.ReadRunTimeline(p)
+		if err != nil {
+			return err
+		}
+		if tl.EndedAt == nil {
+			if *all {
+				continue // still running, or the agent stopped mid-run
+			}
+			return fmt.Errorf("run %s has not finished", tl.RunID)
+		}
+		runs = append(runs, tl)
+	}
+	if len(runs) == 0 {
+		return fmt.Errorf("no finished runs in %s", *dir)
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].StartedAt.Before(runs[j].StartedAt) })
+
+	draft := clovisor.LearnProfile(*name, runs)
+	if *out == "" {
+		return draft.WriteYAML(os.Stdout, time.Now())
+	}
+	f, err := os.Create(*out)
+	if err != nil {
+		return err
+	}
+	if err := draft.WriteYAML(f, time.Now()); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "agentctl: wrote draft profile from %d run(s) to %s\n", len(runs), *out)
+	return nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -363,6 +431,11 @@ func main() {
 		}
 	case "events":
 		if err := showEvents(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "learn":
+		if err := learnProfile(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
