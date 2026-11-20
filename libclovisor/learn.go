@@ -18,57 +18,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
-
-// AgentProfile is the subset of the policy language (design §7.3) that
-// learn mode can draft from audit data. Field names follow the YAML.
-type AgentProfile struct {
-	Kind     string `yaml:"kind"`
-	Metadata struct {
-		Name string `yaml:"name"`
-	} `yaml:"metadata"`
-	Spec ProfileSpec `yaml:"spec"`
-}
-
-// ProfileSpec is the body of an AgentProfile.
-type ProfileSpec struct {
-	Mode   string       `yaml:"mode"`
-	Egress EgressPolicy `yaml:"egress"`
-	Exec   ExecPolicy   `yaml:"exec"`
-}
-
-// EgressPolicy is the egress block of a profile.
-type EgressPolicy struct {
-	Default string       `yaml:"default"`
-	Rules   []EgressRule `yaml:"rules"`
-}
-
-// EgressRule is one egress rule.
-type EgressRule struct {
-	Name   string     `yaml:"name"`
-	To     EgressDest `yaml:"to"`
-	Action string     `yaml:"action"`
-}
-
-// EgressDest selects destinations.
-type EgressDest struct {
-	FQDN  []string `yaml:"fqdn,omitempty"`
-	CIDR  []string `yaml:"cidr,omitempty"`
-	Ports []uint16 `yaml:"ports,omitempty"`
-}
-
-// ExecPolicy is the exec block of a profile.
-type ExecPolicy struct {
-	Default               string      `yaml:"default"`
-	RequireReadonlyOrigin bool        `yaml:"require_readonly_origin"`
-	Allow                 []ExecAllow `yaml:"allow"`
-}
-
-// ExecAllow allows one binary.
-type ExecAllow struct {
-	Path string `yaml:"path"`
-	Note string `yaml:"note,omitempty"`
-}
 
 // interpreters are binaries whose exec permission amounts to arbitrary
 // code (design §7.6). Matched on basename, versions stripped.
@@ -111,7 +63,7 @@ type learnedIP struct {
 // Draft is a profile drafted from one or more run timelines, plus what
 // the reviewer needs to judge it.
 type Draft struct {
-	Profile AgentProfile
+	Profile policy.AgentProfile
 
 	Runs       []*RunTimeline
 	hosts      map[string]*learnedHost // keyed by rule name
@@ -121,6 +73,7 @@ type Draft struct {
 	dnsServers map[string]int          // resolver ip:port -> connects
 	otherUDP   []*learnedIP            // UDP, not DNS, no name
 	lookedUp   []string                // names looked up but never connected to
+	badNames   map[string]int          // connected-to names that are not valid fqdn entries
 	binaryRuns map[string]map[string]bool
 }
 
@@ -136,13 +89,13 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		ruleHost:   map[string]string{},
 		dnsServers: map[string]int{},
 		binaryRuns: map[string]map[string]bool{},
+		badNames:   map[string]int{},
 	}
 	d.Profile.Kind = "AgentProfile"
 	d.Profile.Metadata.Name = name
 	d.Profile.Spec.Mode = "audit"
 	d.Profile.Spec.Egress.Default = "deny"
-	d.Profile.Spec.Exec.Default = "deny"
-	d.Profile.Spec.Exec.RequireReadonlyOrigin = true
+	d.Profile.Spec.Exec = &policy.Exec{Default: "deny", RequireReadonlyOrigin: true}
 
 	byHost := map[string]*learnedHost{}
 	ipDests := map[destKey]*learnedIP{}
@@ -177,6 +130,12 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 			}
 			for _, n := range dst.Names {
 				connected[n] = true
+				if !policy.ValidHostname(n) {
+					// Not expressible as a rule (e.g. "_srv" labels, or
+					// bytes no hostname has); reported for review.
+					d.badNames[n] += dst.Count
+					continue
+				}
 				h := byHost[n]
 				if h == nil {
 					h = &learnedHost{name: n, ports: map[uint16]bool{}, ips: map[string]bool{},
@@ -210,9 +169,9 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		if len(h.ports) == 0 {
 			continue // UDP only: reported, not allowed
 		}
-		d.Profile.Spec.Egress.Rules = append(d.Profile.Spec.Egress.Rules, EgressRule{
+		d.Profile.Spec.Egress.Rules = append(d.Profile.Spec.Egress.Rules, policy.EgressRule{
 			Name:   rn,
-			To:     EgressDest{FQDN: []string{n}, Ports: sortedPorts(h.ports)},
+			To:     policy.Destination{FQDN: []string{n}, Ports: sortedPorts(h.ports)},
 			Action: "allow",
 		})
 	}
@@ -254,7 +213,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 	}
 	sort.Strings(bins)
 	for _, b := range bins {
-		a := ExecAllow{Path: b}
+		a := policy.ExecAllow{Path: b}
 		if isInterpreter(b) {
 			a.Note = "interpreter: allows arbitrary code; confinement comes from egress policy"
 		}
@@ -346,11 +305,11 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			flag = "  [incomplete: events may be missing]"
 			incomplete = append(incomplete, tl.RunID)
 		}
-		cmd := strings.Join(tl.Command, " ")
+		cmd := commentSafe(strings.Join(tl.Command, " "))
 		if len(cmd) > 60 {
 			cmd = cmd[:57] + "..."
 		}
-		p("#   %s  %s  %s%s", tl.RunID, tl.StartedAt.UTC().Format(time.RFC3339), cmd, flag)
+		p("#   %s  %s  %s%s", commentSafe(tl.RunID), tl.StartedAt.UTC().Format(time.RFC3339), cmd, flag)
 	}
 	if len(incomplete) > 0 {
 		p("# Incomplete runs may under-report destinations and binaries.")
@@ -401,7 +360,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		p("      # UDP seen and not allowed. QUIC is denied by default and clients fall back")
 		p("      # to TCP (design §6.8).")
 		for _, s := range udpNamed {
-			p("      #   %s", s)
+			p("      #   %s", commentSafe(s))
 		}
 		for _, li := range d.otherUDP {
 			p("      #   %s (%s)", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), plural(li.conns, "connection"))
@@ -428,7 +387,20 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		p("")
 		p("      # Looked up but never connected to (not allowed):")
 		for _, n := range d.lookedUp {
-			p("      #   %s", n)
+			p("      #   %s", commentSafe(n))
+		}
+	}
+
+	if len(d.badNames) > 0 {
+		bad := make([]string, 0, len(d.badNames))
+		for n := range d.badNames {
+			bad = append(bad, n)
+		}
+		sort.Strings(bad)
+		p("")
+		p("      # Connected to by names that are not valid fqdn entries (not allowed):")
+		for _, n := range bad {
+			p("      #   %s (%s)", commentSafe(n), plural(d.badNames[n], "connection"))
 		}
 	}
 
@@ -454,6 +426,14 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// commentSafe escapes s for a YAML comment. Command lines, paths and DNS
+// names come from the audited run, which controls them: a raw newline
+// would end the comment and let the run write YAML into its own draft.
+func commentSafe(s string) string {
+	quoted := strconv.QuoteToGraphic(s)
+	return quoted[1 : len(quoted)-1]
 }
 
 func hostCIDR(ip string) string {

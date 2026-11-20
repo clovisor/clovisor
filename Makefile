@@ -70,7 +70,7 @@ format:
 # Check code. Scoped to the Phase 1 packages. Excluded: the root package
 # (legacy, bcc-tagged), libclovisor/libproto (Go plugin sources, built one
 # file at a time) and k8s-ctlr (stale client-go API, does not build).
-GO_PKGS = ./cmd/... ./libclovisor
+GO_PKGS = ./cmd/... ./libclovisor ./libclovisor/policy
 check:
 	$(GO) vet $(GO_PKGS)
 	$(GO) build $(GO_PKGS)

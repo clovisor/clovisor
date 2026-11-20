@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v2"
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
 func learnRuns() []*RunTimeline {
@@ -50,10 +50,11 @@ func TestLearnProfile(t *testing.T) {
 	}
 	text := out.String()
 
-	var got AgentProfile
-	if err := yaml.UnmarshalStrict([]byte(text), &got); err != nil {
+	gotp, err := policy.Parse([]byte(text))
+	if err != nil {
 		t.Fatalf("draft is not valid profile YAML: %v\n%s", err, text)
 	}
+	got := *gotp
 	if !reflect.DeepEqual(got, d.Profile) {
 		t.Fatalf("rendered YAML does not round-trip:\n got %+v\nwant %+v\n%s", got, d.Profile, text)
 	}
@@ -63,16 +64,22 @@ func TestLearnProfile(t *testing.T) {
 		t.Fatalf("bad header: %+v", got)
 	}
 
-	wantRules := []EgressRule{
-		{Name: "api-github-com", To: EgressDest{FQDN: []string{"api.github.com"}, Ports: []uint16{80, 443}}, Action: "allow"},
-		{Name: "files-pythonhosted-org", To: EgressDest{FQDN: []string{"files.pythonhosted.org"}, Ports: []uint16{443}}, Action: "allow"},
-		{Name: "pypi-org", To: EgressDest{FQDN: []string{"pypi.org"}, Ports: []uint16{443}}, Action: "allow"},
+	// A draft must compile as it stands, so it can go straight to
+	// shadowing (agentctl check) and audit-mode enforcement.
+	if _, diags := policy.Compile(policy.Options{Linux: true}, gotp); len(diags) > 0 {
+		t.Fatalf("draft does not compile: %v", diags)
+	}
+
+	wantRules := []policy.EgressRule{
+		{Name: "api-github-com", To: policy.Destination{FQDN: []string{"api.github.com"}, Ports: []uint16{80, 443}}, Action: "allow"},
+		{Name: "files-pythonhosted-org", To: policy.Destination{FQDN: []string{"files.pythonhosted.org"}, Ports: []uint16{443}}, Action: "allow"},
+		{Name: "pypi-org", To: policy.Destination{FQDN: []string{"pypi.org"}, Ports: []uint16{443}}, Action: "allow"},
 	}
 	if !reflect.DeepEqual(got.Spec.Egress.Rules, wantRules) {
 		t.Fatalf("rules %+v\nwant %+v", got.Spec.Egress.Rules, wantRules)
 	}
 
-	wantExec := []ExecAllow{
+	wantExec := []policy.ExecAllow{
 		{Path: "/usr/bin/git"},
 		{Path: "/usr/bin/python3", Note: "interpreter: allows arbitrary code; confinement comes from egress policy"},
 		{Path: "/usr/bin/sh", Note: "interpreter: allows arbitrary code; confinement comes from egress policy"},
@@ -108,12 +115,60 @@ func TestLearnProfileEmpty(t *testing.T) {
 	if err := d.WriteYAML(&out, t0); err != nil {
 		t.Fatal(err)
 	}
-	var got AgentProfile
-	if err := yaml.UnmarshalStrict([]byte(out.String()), &got); err != nil {
+	got, err := policy.Parse([]byte(out.String()))
+	if err != nil {
 		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if _, diags := policy.Compile(policy.Options{Linux: true}, got); len(diags) > 0 {
+		t.Fatalf("empty draft does not compile: %v", diags)
 	}
 	if len(got.Spec.Egress.Rules) != 0 || len(got.Spec.Exec.Allow) != 0 {
 		t.Fatalf("empty runs produced rules: %+v", got)
+	}
+}
+
+// A run controls its command line, its binaries' paths and, through DNS,
+// the names it connects to. None of it may change the drafted profile.
+func TestLearnProfileIsNotInjectable(t *testing.T) {
+	end := at(10)
+	evil := "x\nspec:\n  egress:\n    default: allow\n# "
+	runs := []*RunTimeline{{
+		RunID: "r1\nkind: Evil", Command: []string{"sh", "-c", evil}, StartedAt: at(0), EndedAt: &end, Complete: true,
+		Summary: RunSummary{
+			Binaries: []string{"/tmp/a\n  - path: /bin/evil"},
+			DNSNames: []string{"looked.up\n    default: allow"},
+			Destinations: []Destination{
+				{Proto: "TCP", IP: "192.0.2.1", Port: 443, Count: 1, Names: []string{"_srv.example.com"}},
+				{Proto: "TCP", IP: "192.0.2.2", Port: 443, Count: 1, Names: []string{"bad\nname.example"}},
+				{Proto: "UDP", IP: "192.0.2.3", Port: 443, Count: 1, Names: []string{"quic.example\n    default: allow"}},
+				{Proto: "TCP", IP: "192.0.2.4", Port: 443, Count: 1, Names: []string{"good.example.com"}},
+			},
+		},
+	}}
+	var out strings.Builder
+	if err := LearnProfile("p", runs).WriteYAML(&out, t0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := policy.Parse([]byte(out.String()))
+	if err != nil {
+		t.Fatalf("draft is not valid YAML: %v\n%s", err, out.String())
+	}
+	if got.Spec.Egress.Default != "deny" || got.Kind != "AgentProfile" {
+		t.Fatalf("draft was altered by run data:\n%s", out.String())
+	}
+	if len(got.Spec.Egress.Rules) != 1 || got.Spec.Egress.Rules[0].To.FQDN[0] != "good.example.com" {
+		t.Fatalf("rules: %+v", got.Spec.Egress.Rules)
+	}
+	if len(got.Spec.Exec.Allow) != 1 || got.Spec.Exec.Allow[0].Path != "/tmp/a\n  - path: /bin/evil" {
+		t.Fatalf("exec: %+v", got.Spec.Exec.Allow)
+	}
+	if !strings.Contains(out.String(), `#   _srv.example.com (1 connection)`) {
+		t.Errorf("invalid hostname not reported:\n%s", out.String())
+	}
+	// The exec path is not absolute-and-clean? It is absolute; the draft
+	// must still compile so review can start from it.
+	if _, diags := policy.Compile(policy.Options{Linux: true}, got); len(diags) > 0 {
+		t.Fatalf("draft does not compile: %v", diags)
 	}
 }
 

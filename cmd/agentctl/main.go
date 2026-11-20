@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	clovisor "github.com/clovisor/clovisor/libclovisor"
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
 func printUsage() {
@@ -35,6 +37,9 @@ func printUsage() {
 	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
 	fmt.Println("  agentctl learn [-o file] [--name n] (--all | run-id...)")
 	fmt.Println("                                    Draft a profile from recorded runs")
+	fmt.Println("  agentctl explain profile.yaml...  Compile profiles and print the enforcement receipt")
+	fmt.Println("  agentctl check --profile p.yaml (--all | run-id...)")
+	fmt.Println("                                    Replay recorded runs against a profile; exit 1 on violations")
 	fmt.Println("  agentctl cgroups                  List active cgroups")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -364,6 +369,135 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	}
 }
 
+// loadRuns reads the finished runs named by ids, or every finished run
+// readable by the caller when all is set, oldest first.
+func loadRuns(dir string, all bool, ids []string) ([]*clovisor.RunTimeline, error) {
+	var paths []string
+	switch {
+	case all && len(ids) > 0:
+		return nil, fmt.Errorf("give either --all or run ids, not both")
+	case all:
+		var err error
+		if paths, err = filepath.Glob(filepath.Join(dir, "run-*.json")); err != nil {
+			return nil, err
+		}
+	case len(ids) == 0:
+		return nil, fmt.Errorf("give run ids, or --all")
+	default:
+		for _, id := range ids {
+			paths = append(paths, clovisor.TimelinePath(dir, strings.TrimPrefix(id, clovisor.RunPrefix)))
+		}
+	}
+
+	var runs []*clovisor.RunTimeline
+	for _, p := range paths {
+		tl, err := clovisor.ReadRunTimeline(p)
+		if err != nil {
+			if all && os.IsPermission(err) {
+				continue // another user's run
+			}
+			return nil, err
+		}
+		if tl.EndedAt == nil {
+			if all {
+				continue // still running, or the agent stopped mid-run
+			}
+			return nil, fmt.Errorf("run %s has not finished", tl.RunID)
+		}
+		runs = append(runs, tl)
+	}
+	if len(runs) == 0 {
+		return nil, fmt.Errorf("no finished runs in %s", dir)
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].StartedAt.Before(runs[j].StartedAt) })
+	return runs, nil
+}
+
+// compileFiles parses and compiles profile files for this deployment,
+// printing every diagnostic.
+func compileFiles(paths []string, linux bool) (*policy.Compiled, error) {
+	var ps []*policy.AgentProfile
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		p, err := policy.Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		ps = append(ps, p)
+	}
+	c, diags := policy.Compile(policy.Options{Mode: policy.ExplicitProxy, Linux: linux}, ps...)
+	if len(diags) > 0 {
+		for _, d := range diags {
+			fmt.Fprintf(os.Stderr, "error: %v\n", d)
+		}
+		return nil, fmt.Errorf("%d compile error(s)", len(diags))
+	}
+	return c, nil
+}
+
+func platformFlag(fs *flag.FlagSet) *string {
+	def := "other"
+	if runtime.GOOS == "linux" {
+		def = "linux"
+	}
+	return fs.String("platform", def, "deployment platform: linux (cgroup identity) or other (per-run credential)")
+}
+
+// explainProfiles prints the enforcement receipt (design §7.4).
+func explainProfiles(argv []string) error {
+	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
+	platform := platformFlag(fs)
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("give one or more profile files; pass every profile active on a node to see node-wide TLS posture")
+	}
+	c, err := compileFiles(fs.Args(), *platform == "linux")
+	if err != nil {
+		return err
+	}
+	return c.WriteReceipt(os.Stdout)
+}
+
+// errViolations makes agentctl check exit 1 without an error message.
+var errViolations = errors.New("violations")
+
+// checkProfile replays recorded runs against a profile (design §7.10,
+// shadow step, offline).
+func checkProfile(argv []string) error {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	profile := fs.String("profile", "", "profile file to check against (required)")
+	all := fs.Bool("all", false, "check every finished run in -dir")
+	platform := platformFlag(fs)
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+	if *profile == "" {
+		return fmt.Errorf("--profile is required")
+	}
+	c, err := compileFiles([]string{*profile}, *platform == "linux")
+	if err != nil {
+		return err
+	}
+	runs, err := loadRuns(*dir, *all, fs.Args())
+	if err != nil {
+		return err
+	}
+	rep := clovisor.CheckRuns(c.Profiles[0], runs)
+	if err := rep.WriteText(os.Stdout); err != nil {
+		return err
+	}
+	if len(rep.Violations) > 0 {
+		return errViolations
+	}
+	return nil
+}
+
 // learnProfile drafts an AgentProfile from recorded runs.
 func learnProfile(argv []string) error {
 	fs := flag.NewFlagSet("learn", flag.ContinueOnError)
@@ -375,44 +509,10 @@ func learnProfile(argv []string) error {
 		return err
 	}
 
-	var paths []string
-	switch {
-	case *all && fs.NArg() > 0:
-		return fmt.Errorf("give either --all or run ids, not both")
-	case *all:
-		var err error
-		if paths, err = filepath.Glob(filepath.Join(*dir, "run-*.json")); err != nil {
-			return err
-		}
-	case fs.NArg() == 0:
-		return fmt.Errorf("give run ids to learn from, or --all")
-	default:
-		for _, id := range fs.Args() {
-			paths = append(paths, clovisor.TimelinePath(*dir, strings.TrimPrefix(id, clovisor.RunPrefix)))
-		}
+	runs, err := loadRuns(*dir, *all, fs.Args())
+	if err != nil {
+		return err
 	}
-
-	var runs []*clovisor.RunTimeline
-	for _, p := range paths {
-		tl, err := clovisor.ReadRunTimeline(p)
-		if err != nil {
-			if *all && os.IsPermission(err) {
-				continue // another user's run
-			}
-			return err
-		}
-		if tl.EndedAt == nil {
-			if *all {
-				continue // still running, or the agent stopped mid-run
-			}
-			return fmt.Errorf("run %s has not finished", tl.RunID)
-		}
-		runs = append(runs, tl)
-	}
-	if len(runs) == 0 {
-		return fmt.Errorf("no finished runs in %s", *dir)
-	}
-	sort.Slice(runs, func(i, j int) bool { return runs[i].StartedAt.Before(runs[j].StartedAt) })
 
 	draft := clovisor.LearnProfile(*name, runs)
 	if *out == "" {
@@ -471,6 +571,18 @@ func main() {
 	case "events":
 		if err := showEvents(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "explain":
+		if err := explainProfiles(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "check":
+		if err := checkProfile(os.Args[2:]); err != nil {
+			if err != errViolations {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			}
 			os.Exit(1)
 		}
 	case "learn":

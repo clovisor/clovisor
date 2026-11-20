@@ -1639,6 +1639,55 @@ Two findings for later milestones:
   `authorityKeyIdentifier`. The node CA must be generated to RFC 5280 profile
   (2.4).
 
+#### 2.1 status (2026-11-20)
+
+Done: `libclovisor/policy`, `agentctl explain`, `agentctl check`.
+
+- **Schema.** The §7.3 and §8.5 fields, parsed strictly with yaml.v3: an
+  unknown or misspelt field is an error. A profile's version is the sha256 of
+  its parsed content, so comments and formatting do not change it.
+- **Matching.**
+  - Rules are evaluated in order and the first match wins; the receipt lists
+    them in that order.
+  - `*.suffix` covers exactly one label, like a wildcard certificate, so a
+    terminated wildcard is always servable. `*` matches any host.
+  - Paths are globs where `*` spans `/`. `cidr` matches only connections
+    addressed to an IP literal, never a name that resolves into the range
+    (§7.5).
+- **Compile errors.** All of them are reported, not just the first:
+  - `deny` without `message`;
+  - `http:` on a `cidr` destination;
+  - an `http:` rule, or an MCP server, on a destination with `no_terminate`,
+    including across a wildcard;
+  - basename exec paths.
+- **Not enforceable yet.** Features no deployment can enforce are compile
+  errors naming the phase that delivers them: `mode`/`action ask`, `redirect`,
+  `rate-limit`, `redact`, `model`, `budget`, `content`, `limits`, exec
+  `hash`, and sampling `ask`.
+- **Exec.** Exec rules need `exec.audit_only: true` in `mode: enforce`, so
+  their non-enforcement until Phase 4 is declared rather than silent (§7.1).
+  This field is new to the §7.3 schema.
+- **Receipt.** States the deployment, the identity source (enforcement-grade
+  cgroup on Linux, claim elsewhere), that routing is advisory in
+  explicit-proxy mode, and the CONNECT narration limit. Per rule it gives the
+  tier, the enforcer and the exposure. Per destination it gives the posture,
+  including runs under other profiles that get terminated anyway.
+- **`agentctl check`.** Replays Phase 1 timelines against a profile. It lists
+  what would be denied, with the narration the agent would get, and exits 1 on
+  any violation, so it can gate CI. Two more sections:
+  - outcomes that depend on paths, which audit data lacks;
+  - traffic an explicit proxy never sees (loopback, DNS, UDP).
+
+  A learned profile checked against its own runs has no violations.
+- **Learn-mode fix.** A run's command line, binary paths and DNS names are
+  untrusted. Written raw into comments, a newline could inject YAML into the
+  draft. They are now escaped. Names that are not valid fqdn entries are
+  reported instead of becoming rules, so a draft always compiles.
+
+Limitation carried to 2.3: runs that already use a proxy show only the
+loopback connection to it in Phase 1 timelines. The proxy's `http` events
+supply the real destinations.
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT
