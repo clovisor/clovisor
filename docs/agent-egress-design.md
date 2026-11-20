@@ -42,6 +42,7 @@ place:
 | A portable explicit-proxy mode with no eBPF, for platforms where agents actually run (including macOS). | [§4.3](#43-two-deployment-modes) |
 | Tier 0 becomes **redirect-or-deny**: every TCP connect from a run goes to the proxy or fails. The DNS-learned IP allowlist backstop is dropped except for protocols with no hostname on the wire. | [§6.5](#65-three-rules-that-must-not-be-gotten-wrong), [§7.5](#75-one-rule-one-enforcement-point-no-bypass) |
 | Egress channels `connect4` cannot see: unconnected UDP, DNS (and DNS tunnelling), QUIC, raw sockets. | [§6.8](#68-channels-connect4-does-not-see) |
+| QUIC: denied by default, with opt-in SNI forwarding, plus a UDP packet backstop. Encrypted Client Hello defeated at the local resolver. | [§6.6](#66-tls-posture), [§6.8](#68-channels-connect4-does-not-see) |
 | Build order: the proxy and MCP layer moves to Phase 2, ahead of kernel enforcement. | [§10](#10-build-order) |
 | Exfiltration through *allowed* destinations stated as an explicit limit. | [§11](#11-non-goals-and-honest-limits) |
 | Code-reuse table corrected to what actually carries over. | [§9](#9-what-maps-from-the-existing-codebase) |
@@ -804,6 +805,32 @@ one terminating filter chain matching the SNI set derived from policy, one
 passthrough TCP chain for everything else. That set changes when policy changes,
 never per run, so xDS stays effectively static.
 
+#### Encrypted Client Hello
+
+*New 2026-11-19.* SNI-only posture assumes the SNI names the real destination.
+Encrypted Client Hello (ECH) breaks that assumption for TLS over TCP and QUIC
+alike:
+
+- the visible ("outer") SNI becomes the hosting provider's public name;
+- the real one is encrypted to a key the client gets from the destination's DNS
+  `HTTPS`/`SVCB` record.
+
+Left alone, growing ECH adoption silently degrades every SNI-only rule to "some
+site behind this provider." That is the shared-CDN problem from
+[§7.5](#75-one-rule-one-enforcement-point-no-bypass) again.
+
+The forced local resolver ([§6.8](#68-channels-connect4-does-not-see)) closes it.
+It strips the `ech` parameter from `HTTPS` and `SVCB` answers, so clients never
+attempt ECH and connections carry a cleartext SNI.
+
+Residuals:
+
+- **ECH configs from outside DNS.** A client with a hardcoded or previously
+  cached ECH config can still use it. The ECH extension is visible in the outer
+  ClientHello, so a TLS listener filter can detect it and deny the connection.
+- **Explicit-proxy mode.** [§4.3](#43-two-deployment-modes) gets this protection
+  only if the harness uses the local resolver.
+
 ### 6.7 ext_proc specifics
 
 - **Denial narration.** `ext_proc` can return an immediate response with a custom
@@ -829,7 +856,7 @@ syscall. Several egress paths never call `connect()`:
 |---|---|---|
 | Unconnected UDP (`sendto`, `sendmsg`) | no connect | `cgroup/sendmsg4` and `sendmsg6`: deny, except DNS to the local resolver |
 | DNS | usually unconnected UDP; also the classic tunnelling channel | Force all DNS to a node-local resolver (below) |
-| QUIC / HTTP/3 | UDP 443 | deny; clients fall back to TCP, which is redirected |
+| QUIC / HTTP/3 | UDP 443. Connected sockets (most QUIC clients) hit `connect4`/`connect6`; unconnected ones hit `sendmsg4`/`sendmsg6`. Both see the address only. | deny by default with `EPERM`; opt-in SNI forwarding. See [QUIC](#quic) below. |
 | Raw and packet sockets | bypass the inet hooks | drop `CAP_NET_RAW` for run cgroups; deny `SOCK_RAW` and `AF_PACKET` in the LSM `socket_create` hook (Phase 4) |
 | Unix sockets to host daemons | not inet | a run reaching the Docker socket or an SSH agent can egress through it; the LSM phase gates `AF_UNIX` connects by path |
 
@@ -841,7 +868,52 @@ leave the host. Wildcard rules reopen it for the zones they name, which is one
 more reason to keep wildcards narrow.
 
 The resolver also produces the per-run DNS events the audit timeline needs,
-which is simpler than parsing DNS in BPF.
+which is simpler than parsing DNS in BPF. It is also where Encrypted Client Hello
+is defeated ([§6.6](#66-tls-posture)).
+
+**UDP backstop.** A `cgroup_skb/egress` program, attached to `agents/` like the
+socket-address hooks, sees every packet leaving a run's sockets and can drop it.
+It drops any UDP whose destination is not the local resolver or the QUIC
+forwarder (below). That catches whatever the address hooks miss, for one map
+lookup per packet.
+
+#### QUIC
+
+The address hooks can deny QUIC, but they cannot police it by name. That needs
+the SNI, which sits in the TLS ClientHello inside QUIC Initial packets. Initial
+packets are encrypted, but with keys anyone can derive from the client's
+destination connection ID and a salt published in RFC 9001. So the SNI is
+recoverable on-path, without terminating anything.
+
+Recovering it in BPF is impractical:
+
+- **Crypto.** It needs AES-ECB for header protection and AES-GCM for the
+  payload. As of this writing, the BPF crypto kfuncs (Linux 6.10+) offer
+  symmetric skciphers to TC and XDP programs. That covers header protection, but
+  not the AEAD payload.
+- **Reassembly.** With post-quantum key shares, the ClientHello often spans more
+  than one Initial packet. Parsing it would mean reassembling CRYPTO frames
+  across packets in the kernel.
+
+So QUIC gets two postures, chosen per destination by the compiler, like TLS
+posture ([§6.6](#66-tls-posture)):
+
+| Posture | Mechanism | Used for |
+|---|---|---|
+| **Deny** (default) | `EPERM` on UDP 443 at `connect` and `sendmsg`. The failure is immediate, so HTTP/3 clients (browsers, curl) fall back to TCP without waiting for a timeout. | Every destination not opted into QUIC. Also every destination with body rules: those need termination, which exists on the TCP path. |
+| **SNI-forwarded** (opt-in) | `connect4`/`sendmsg4` rewrite UDP 443 to a node-local QUIC forwarder. `recvmsg4`/`recvmsg6` rewrite reply sources, so the application sees its original peer. The forwarder decrypts Initial packets in userspace, extracts the SNI, applies the same host policy as TCP, then relays datagrams unmodified. | A workload that needs QUIC, for a destination with host-level rules only. |
+
+SNI-forwarded QUIC has the same posture as SNI-only TLS over TCP: hostname
+granularity, no termination, no plaintext.
+
+Denying by default breaks little that should keep working. What it does break is
+mostly QUIC-only tunnels (MASQUE, VPN-like transports) and DNS-over-QUIC. Both
+route around the proxy or the resolver and should be blocked anyway.
+
+Visibility without enforcement is also possible: uprobes on QUIC libraries give
+plaintext for audit. But every application bundles its own QUIC stack, so
+coverage means chasing each library and version. That is the same trade-off as
+TLS uprobes (Phase 6).
 
 ---
 
@@ -1362,9 +1434,9 @@ kernel objects. Treat this as a new codebase in Clovisor's lineage, not a port.
 |---|---|---|
 | **1** | Audit only. cgroup-per-run via `agentctl`; exec, connect and DNS events; correlated timeline; learn mode drafting a candidate profile. | Zero |
 | **2** | Proxy and MCP layer in explicit-proxy mode ([§4.3](#43-two-deployment-modes)): Envoy + `ext_proc`, host/path policy, denial narration, the policy compiler and receipt, MCP transport normalization, tool-level policy, `tools/list` pinning. Runs anywhere, macOS included. | Low; opt-in per harness |
-| **3** | Transparent mode on Linux: `connect4` redirect-or-deny, `SO_ORIGINAL_DST` via `cgroup/getsockopt`, identity handoff, `sendmsg4/6` and forced local DNS ([§6.8](#68-channels-connect4-does-not-see)). Fail closed. | Medium |
+| **3** | Transparent mode on Linux: `connect4` redirect-or-deny, `SO_ORIGINAL_DST` via `cgroup/getsockopt`, identity handoff, `sendmsg4/6`, forced local DNS with ECH stripping, the UDP backstop and QUIC deny ([§6.8](#68-channels-connect4-does-not-see)). Fail closed. | Medium |
 | **4** | Exec gating via BPF LSM; raw-socket and `AF_UNIX` gating. Child cgroups per tool call. Sub-agent attenuation. | Medium |
-| **5** | Budgets (stateful), content policy, ask-mode with a human approval UI, MCP sampling control. | Higher |
+| **5** | Budgets (stateful), content policy, ask-mode with a human approval UI, MCP sampling control, opt-in SNI-forwarded QUIC. | Higher |
 | **6** | TLS uprobes for visibility without termination. | Low |
 
 **Why this order.** The original order put the proxy at Phase 3 and MCP at
