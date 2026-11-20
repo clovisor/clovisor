@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,6 +84,7 @@ spec:
     default: deny
     rules:
       - { name: gh, to: { fqdn: ["github.com"] }, action: allow }
+      - { name: no-admin, to: { fqdn: ["api.github.com"] }, http: { paths: ["/admin*"] }, action: deny, message: "No admin endpoints." }
       - { name: api, to: { fqdn: ["api.github.com"] }, http: { methods: [GET] }, action: allow }
       - { name: any-ip, to: { cidr: ["0.0.0.0/0"] }, action: allow }
       - { name: plain, to: { fqdn: ["mirror.internal"], ports: [80] }, http: { paths: ["/pub/*"] }, action: allow }
@@ -268,5 +270,117 @@ func TestExtProcChildCgroupAttribution(t *testing.T) {
 	ev := <-events
 	if ev.RunCgroupID != 42 || ev.CgroupID != 42 || own == 42 {
 		t.Fatalf("filed under %d/%d, want the run's cgroup 42", ev.RunCgroupID, ev.CgroupID)
+	}
+}
+
+func TestAuthorityRegex(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, authority string
+		want               bool
+	}{
+		{"api.github.com", "api.github.com:443", true},
+		{"api.github.com", "api.github.com:8443", true},
+		{"api.github.com", "api.github.com", false},
+		{"api.github.com", "apixgithub.com:443", false},
+		{"api.github.com", "evil.api.github.com:443", false},
+		{"*.example.org", "raw.example.org:443", true},
+		{"*.example.org", "a.b.example.org:443", false}, // one label, like the certificate
+		{"*.example.org", "example.org:443", false},
+		{"*.example.org", "rawxexample.org:443", false},
+		{"*.example.org", "[::1].example.org:443", false},
+	} {
+		if got := regexp.MustCompile(authorityRegex(tc.pattern)).MatchString(tc.authority); got != tc.want {
+			t.Errorf("%s vs %s: %v (regex %s)", tc.pattern, tc.authority, got, authorityRegex(tc.pattern))
+		}
+	}
+}
+
+// reqWith builds a request with chosen attributes and extra headers.
+func reqWith(attrs map[string]interface{}, method, authority, path string, extra map[string]string) (*extprocv3.ProcessingRequest, *extprocv3.HttpHeaders) {
+	hs := []*corev3.HeaderValue{
+		{Key: ":method", RawValue: []byte(method)},
+		{Key: ":authority", RawValue: []byte(authority)},
+		{Key: ":path", RawValue: []byte(path)},
+	}
+	for k, v := range extra {
+		hs = append(hs, &corev3.HeaderValue{Key: k, RawValue: []byte(v)})
+	}
+	st, _ := structpb.NewStruct(attrs)
+	return &extprocv3.ProcessingRequest{Attributes: map[string]*structpb.Struct{"envoy.filters.http.ext_proc": st}},
+		&extprocv3.HttpHeaders{Headers: &corev3.HeaderMap{Headers: hs}}
+}
+
+func TestExtProcTermination(t *testing.T) {
+	xp, _, c := newTestExtProc(t, true)
+	allowed := func(req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (bool, string) {
+		ir := xp.onHeaders(context.Background(), req, h).GetImmediateResponse()
+		if ir == nil {
+			return true, ""
+		}
+		var body map[string]interface{}
+		json.Unmarshal(ir.GetBody(), &body)
+		return false, body["message"].(string)
+	}
+	outer := map[string]interface{}{"source.address": c.src.String(), "destination.address": c.dst.String()}
+	innerAttrs := map[string]interface{}{"source.address": "envoy://internal_client_address/", "destination.address": "envoy://mitm-0/"}
+	tunnel := map[string]string{hdrClient: c.src.String() + "," + c.dst.String(), hdrConnect: "api.github.com:443"}
+
+	// The CONNECT is let through to termination only on a terminate route.
+	outer["xds.route_name"] = TerminateRoutePrefix + "0"
+	if ok, msg := allowed(reqWith(outer, "CONNECT", "api.github.com:443", "", nil)); !ok {
+		t.Fatalf("terminated CONNECT refused: %s", msg)
+	}
+	outer["xds.route_name"] = ""
+	if ok, msg := allowed(reqWith(outer, "CONNECT", "api.github.com:443", "", nil)); ok || !strings.Contains(msg, "restart Envoy") {
+		t.Fatalf("untermined CONNECT: %v %s", ok, msg)
+	}
+
+	// Inside the tunnel: method and path decide ("api" allows GET only).
+	if ok, msg := allowed(reqWith(innerAttrs, "GET", "api.github.com", "/repos/x", tunnel)); !ok {
+		t.Fatalf("inner GET refused: %s", msg)
+	}
+	if ok, msg := allowed(reqWith(innerAttrs, "GET", "api.github.com", "/admin/users", tunnel)); ok || msg != "No admin endpoints." {
+		t.Fatalf("inner path deny: %v %s", ok, msg)
+	}
+	// Smuggling: a Host other than the tunnel's destination.
+	if ok, msg := allowed(reqWith(innerAttrs, "GET", "evil.example", "/", tunnel)); ok || !strings.Contains(msg, "does not match the tunnel's destination") {
+		t.Fatalf("smuggled Host: %v %s", ok, msg)
+	}
+	// Same host, other port.
+	if ok, _ := allowed(reqWith(innerAttrs, "GET", "api.github.com:8443", "/repos/x", tunnel)); ok {
+		t.Fatal("smuggled port allowed")
+	}
+
+	// On the outer hop the identity header is not trusted: a client naming
+	// someone else's connection is identified by its own socket.
+	spoof := map[string]string{hdrClient: "127.0.0.1:1,127.0.0.1:2"}
+	if ok, msg := allowed(reqWith(outer, "CONNECT", "github.com:443", "", spoof)); !ok {
+		t.Fatalf("outer request with a spoofed header refused: %s", msg)
+	}
+	// On the inner hop, a header naming no live socket is refused.
+	bad := map[string]string{hdrClient: "127.0.0.1:1,127.0.0.1:2", hdrConnect: "api.github.com:443"}
+	if ok, msg := allowed(reqWith(innerAttrs, "GET", "api.github.com", "/repos/x", bad)); ok || !strings.Contains(msg, "could not identify") {
+		t.Fatalf("inner request without a live client: %v %s", ok, msg)
+	}
+}
+
+func TestEnvoyBootstrapTermination(t *testing.T) {
+	b, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: netip.MustParseAddrPort("127.0.0.1:18000"),
+		ExtProcSocket: "/x.sock", AdminSocket: "/a.sock", UpstreamCA: "/etc/ssl/certs/ca-certificates.crt",
+		Terminate: []TerminatedHost{{Pattern: "api.github.com", CertPath: "/t/0.crt", KeyPath: "/t/0.key"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{`"name": "clovisor-terminate-0"`, `"server_listener_name": "mitm-0"`, `"envoy.bootstrap.internal_listener"`,
+		`"filename": "/t/0.crt"`, `"auto_san_validation": true`, `"xds.route_name"`, `"remove": "x-clovisor-client"`,
+		`%FILTER_STATE(clovisor.connect:PLAIN)%`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("bootstrap lacks %s", want)
+		}
+	}
+	if _, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: netip.MustParseAddrPort("127.0.0.1:1"), ExtProcSocket: "/x", AdminSocket: "/a",
+		Terminate: []TerminatedHost{{Pattern: "a.com"}}}); err == nil {
+		t.Error("termination without an upstream CA accepted")
 	}
 }

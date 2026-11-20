@@ -126,7 +126,7 @@ type mcpConfig struct {
 // and writes a copy of the config pointing them at it. Remote (url)
 // entries pass through unchanged: they are ordinary egress. Servers the
 // policy refuses are left out, with the reason printed.
-func prepareMCP(api *clovisor.RunAPIClient, configPath, proxy string) (string, error) {
+func prepareMCP(api *clovisor.RunAPIClient, configPath, proxy, bundle, caCert string) (string, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return "", err
@@ -142,7 +142,11 @@ func prepareMCP(api *clovisor.RunAPIClient, configPath, proxy string) (string, e
 		}
 	}
 	if proxy != "" {
-		for _, kv := range proxyEnv(nil, proxy) {
+		extra := proxyEnv(nil, proxy)
+		if bundle != "" {
+			extra = trustEnv(extra, bundle, caCert)
+		}
+		for _, kv := range extra {
 			k, v, _ := strings.Cut(kv, "=")
 			baseEnv[k] = v
 		}
@@ -229,6 +233,34 @@ func prepareMCP(api *clovisor.RunAPIClient, configPath, proxy string) (string, e
 	return f.Name(), nil
 }
 
+// trustEnv makes TLS clients in a run trust the node CA, which terminates
+// TLS for destinations whose rules need it. These variables replace each
+// client's default store, so they name the full bundle (system roots plus
+// the node CA); NODE_EXTRA_CA_CERTS adds to Node's store, so it names only
+// the node CA.
+func trustEnv(env []string, bundle, caCert string) []string {
+	set := map[string]string{
+		"SSL_CERT_FILE": bundle, "REQUESTS_CA_BUNDLE": bundle, "CURL_CA_BUNDLE": bundle,
+		"GIT_SSL_CAINFO": bundle, "NODE_EXTRA_CA_CERTS": caCert,
+	}
+	out := make([]string, 0, len(env)+len(set))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if _, ok := set[k]; !ok {
+			out = append(out, kv)
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+set[k])
+	}
+	return out
+}
+
 func runCommand(args []string, profile string, noProxy bool, mcpConfigPath string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
@@ -279,13 +311,20 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 	if run.Proxy != "" && !noProxy {
 		cmd.Env = proxyEnv(cmd.Env, run.Proxy)
 		fmt.Fprintf(os.Stderr, "agentctl: egress via %s\n", run.Proxy)
+		if run.TrustBundle != "" {
+			cmd.Env = trustEnv(cmd.Env, run.TrustBundle, run.NodeCACert)
+		}
 	}
 	if mcpConfigPath != "" {
 		proxy := run.Proxy
 		if noProxy {
 			proxy = ""
 		}
-		rewritten, err := prepareMCP(api, mcpConfigPath, proxy)
+		bundle, caCert := "", ""
+		if proxy != "" {
+			bundle, caCert = run.TrustBundle, run.NodeCACert
+		}
+		rewritten, err := prepareMCP(api, mcpConfigPath, proxy, bundle, caCert)
 		if err != nil {
 			relR.Close()
 			return 0, err
@@ -769,9 +808,12 @@ func compileFiles(paths []string, linux bool) (*policy.Compiled, error) {
 		if err != nil {
 			return nil, err
 		}
-		p, err := policy.Parse(data)
+		p, _, err := policy.ParseDocument(data)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if p == nil {
+			continue // a ProfileCeiling: not part of the receipt
 		}
 		ps = append(ps, p)
 	}

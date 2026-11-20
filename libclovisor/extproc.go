@@ -314,6 +314,9 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 		phase, path = policy.PhaseConnect, ""
 		defPort = 443
 	}
+	if headerValue(hm, hdrConnect) != "" && strings.HasPrefix(attribute(req, "source.address"), "envoy://") {
+		defPort = 443 // inside a TLS tunnel, a Host without a port means 443
+	}
 	d.Path = path
 	host, port, err := splitAuthority(authority, defPort)
 	if err != nil || host == "" {
@@ -324,10 +327,33 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	d.Host, d.Port = host, port
 	ip, _ := netip.ParseAddr(host)
 
-	// Identity: the cgroup of the client's socket (Phase 2 finding 1).
+	// Identity: the cgroup of the client's socket (Phase 2 finding 1). On
+	// the inner hop of a terminated connection Envoy's own source is an
+	// internal address; the real client crossed the hop in x-clovisor-client,
+	// which Envoy wrote, overwriting any client value. Attributes cannot be
+	// set by clients, so the header is trusted only there.
+	inner := strings.HasPrefix(attribute(req, "source.address"), "envoy://")
 	runID, eff, isRun, cg, runCg := "", (*policy.Effective)(nil), false, uint64(0), uint64(0)
-	src, err1 := attrAddrPort(req, "source.address", "source.port")
-	dst, err2 := attrAddrPort(req, "destination.address", "destination.port")
+	var src, dst netip.AddrPort
+	var err1, err2 error
+	if inner {
+		client, proxy, _ := strings.Cut(headerValue(hm, hdrClient), ",")
+		src, err1 = netip.ParseAddrPort(client)
+		dst, err2 = netip.ParseAddrPort(proxy)
+		// Smuggling check: inside a tunnel to an allowed host, a Host
+		// header naming another host would be routed there by the dynamic
+		// forward proxy.
+		ch, cp, cerr := splitAuthority(headerValue(hm, hdrConnect), 443)
+		if cerr != nil || !strings.EqualFold(policy.NormalizeHost(ch), policy.NormalizeHost(host)) || cp != port {
+			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "host mismatch"
+			d.Message = fmt.Sprintf("The request's Host %s does not match the tunnel's destination %s.",
+				net.JoinHostPort(host, strconv.Itoa(int(port))), headerValue(hm, hdrConnect))
+			return s.deny(d, "")
+		}
+	} else {
+		src, err1 = attrAddrPort(req, "source.address", "source.port")
+		dst, err2 = attrAddrPort(req, "destination.address", "destination.port")
+	}
 	if err1 == nil && err2 == nil {
 		cg, err = SockCgroup(src, dst)
 	} else {
@@ -370,13 +396,19 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 		}
 		ed := eff.Decide(r)
 		d.Decision, d.Rule, d.Layer, d.WouldDeny, d.Enforced, d.Message = ed.Action, ed.Rule, ed.Layer, ed.WouldDeny, ed.Enforced, ed.Message
-		if ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() {
-			// The deciding rule needs method or path, which a tunnel never
-			// shows. Without termination (2.4), passing it would leave the
-			// rule unenforced, so refuse.
+		terminated := strings.HasPrefix(attribute(req, "xds.route_name"), TerminateRoutePrefix)
+		switch {
+		case ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() && terminated:
+			// Envoy terminates this tunnel; each request inside it is
+			// decided on method and path.
+			d.Reason = "terminated: decided per request"
+		case ed.Deferred && phase == policy.PhaseConnect && ed.Allowed():
+			// The deciding rule needs method or path, but Envoy will not
+			// terminate this tunnel (its configuration predates the rule).
+			// Passing it would leave the rule unenforced, so refuse.
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
 			d.Message = fmt.Sprintf("Rule %s needs the request's method or path, which this proxy cannot see "+
-				"inside a TLS tunnel yet.", ed.Rule)
+				"inside this TLS tunnel. An operator must restart Envoy with the current configuration.", ed.Rule)
 		}
 	} else {
 		d.Reason = "unprofiled run"

@@ -63,3 +63,20 @@ func TestProxyEnv(t *testing.T) {
 		t.Error("unrelated variables lost")
 	}
 }
+
+func TestTrustEnv(t *testing.T) {
+	env := trustEnv([]string{"SSL_CERT_FILE=/evil", "PATH=/bin"}, "/run/clovisor/ca-bundle.pem", "/run/clovisor/ca.crt")
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	for _, k := range []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"} {
+		if got[k] != "/run/clovisor/ca-bundle.pem" {
+			t.Errorf("%s = %q", k, got[k])
+		}
+	}
+	if got["NODE_EXTRA_CA_CERTS"] != "/run/clovisor/ca.crt" || got["PATH"] != "/bin" || len(got) != 6 {
+		t.Errorf("env %v", got)
+	}
+}

@@ -31,6 +31,9 @@ type NodeAgent struct {
 	recorder   *RunRecorder
 	api        *RunAPIServer
 	extproc    *ExtProcServer
+	proxyOpts  *NodeAgentOptions
+	ca         *NodeCA
+	terminated []string // patterns in the bootstrap last written
 	mcp        *MCPGateway
 	httpEvents chan AuditEvent
 	policyDir  string
@@ -58,6 +61,12 @@ type NodeAgentOptions struct {
 	EnvoyUIDs     []uint32 // uids Envoy runs as, admitted to ext_proc (root always is)
 	// NonRunProxy lets processes outside any run use the proxy.
 	NonRunProxy bool
+
+	// CADir holds the node CA used for termination; /var/lib/clovisor/ca if empty.
+	CADir string
+	// EnvoyUpstreamCA is the system trust store as Envoy sees it, used to
+	// verify origins behind termination.
+	EnvoyUpstreamCA string
 
 	// MCPListen enables the local MCP gateway on a loopback address.
 	MCPListen netip.AddrPort
@@ -143,6 +152,8 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 	}
 
 	var xp *ExtProcServer
+	var proxyCA *NodeCA
+	var proxyTerminated []string
 	httpEvents := make(chan AuditEvent, 1000)
 	if opts.ProxyListen.IsValid() {
 		if opts.ExtProcSocket == "" {
@@ -165,15 +176,27 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		if opts.EnvoyConfig == "" {
 			opts.EnvoyConfig = "/run/clovisor/envoy.json"
 		}
-		boot, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket, AdminSocket: opts.EnvoyAdmin})
+		if opts.CADir == "" {
+			opts.CADir = "/var/lib/clovisor/ca"
+		}
+		if opts.EnvoyUpstreamCA == "" {
+			opts.EnvoyUpstreamCA = "/etc/ssl/certs/ca-certificates.crt"
+		}
+		ca, err := LoadOrCreateCA(opts.CADir)
 		if err == nil {
-			err = writeFileAtomic(opts.EnvoyConfig, boot, 0o644)
+			err = writeTrust(ca)
+		}
+		var terminated []string
+		if err == nil {
+			terminated, err = writeEnvoyConfig(opts, ca, set)
 		}
 		if err != nil {
 			api.Close()
 			audit.reader.Close()
 			return nil, fmt.Errorf("envoy bootstrap: %w", err)
 		}
+		proxyCA, proxyTerminated = ca, terminated
+		api.TrustBundle, api.NodeCACert = TrustBundlePath, NodeCACertPath
 		xp = NewExtProcServer(api, cmgr.GetAgentsDir(), httpEvents)
 		xp.NonRunAllowed = opts.NonRunProxy
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
@@ -207,6 +230,8 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 
 	na := &NodeAgent{
 		mcp:        gw,
+		ca:         proxyCA,
+		terminated: proxyTerminated,
 		cmgr:       cmgr,
 		audit:      audit,
 		recorder:   recorder,
@@ -216,6 +241,10 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		policyDir:  opts.PolicyDir,
 		stopChan:   make(chan bool),
 		running:    false,
+	}
+	if xp != nil {
+		o := opts
+		na.proxyOpts = &o
 	}
 
 	return na, nil
@@ -232,7 +261,96 @@ func (na *NodeAgent) ReloadPolicy() error {
 	if set != nil {
 		na.api.SetPolicy(set)
 	}
+	if na.proxyOpts != nil {
+		terminated, err := writeEnvoyConfig(*na.proxyOpts, na.ca, set)
+		if err != nil {
+			return fmt.Errorf("policy loaded, but the Envoy bootstrap could not be rewritten: %w", err)
+		}
+		if strings.Join(terminated, ",") != strings.Join(na.terminated, ",") {
+			// ext_proc follows the route Envoy actually took, so until
+			// Envoy restarts, newly terminated hosts' path rules are
+			// refused rather than skipped.
+			fmt.Printf("proxy: termination set is now [%s]; restart Envoy to apply it\n", strings.Join(terminated, ", "))
+			na.terminated = terminated
+		}
+	}
 	return nil
+}
+
+// Where runs find the node's trust anchors.
+const (
+	TrustBundlePath = "/run/clovisor/ca-bundle.pem" // system roots plus the node CA
+	NodeCACertPath  = "/run/clovisor/ca.crt"
+)
+
+func writeTrust(ca *NodeCA) error {
+	bundle, err := ca.TrustBundle()
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(TrustBundlePath, append(bundle, '\n'), 0o644); err != nil {
+		return err
+	}
+	return writeFileAtomic(NodeCACertPath, ca.CertPEM, 0o644)
+}
+
+// terminationSet is the node-wide set of patterns whose rules need
+// termination (design §6.6), from the compiled posture.
+func terminationSet(set *policy.Set) []string {
+	if set == nil {
+		return nil
+	}
+	var out []string
+	for _, d := range set.Compiled.Posture {
+		if d.Posture == policy.PostureTerminate {
+			out = append(out, d.Dest)
+		}
+	}
+	return out
+}
+
+// writeEnvoyConfig issues leaves for the termination set into Envoy's
+// private directory and writes the bootstrap.
+func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]string, error) {
+	patterns := terminationSet(set)
+	tlsDir := filepath.Join(filepath.Dir(opts.EnvoyAdmin), "tls")
+	if err := os.MkdirAll(tlsDir, 0o700); err != nil {
+		return nil, err
+	}
+	envoyUID := -1
+	if len(opts.EnvoyUIDs) > 0 {
+		envoyUID = int(opts.EnvoyUIDs[0])
+	}
+	if err := os.Chown(tlsDir, envoyUID, -1); err != nil {
+		return nil, err
+	}
+	var hosts []TerminatedHost
+	for i, p := range patterns {
+		certPEM, keyPEM, err := ca.Issue(p)
+		if err != nil {
+			return nil, err
+		}
+		th := TerminatedHost{Pattern: p, CertPath: filepath.Join(tlsDir, fmt.Sprintf("%d.crt", i)), KeyPath: filepath.Join(tlsDir, fmt.Sprintf("%d.key", i))}
+		if err := writeFileAtomicOwned(th.CertPath, certPEM, 0o600, envoyUID); err != nil {
+			return nil, err
+		}
+		if err := writeFileAtomicOwned(th.KeyPath, keyPEM, 0o600, envoyUID); err != nil {
+			return nil, err
+		}
+		hosts = append(hosts, th)
+	}
+	boot, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket,
+		AdminSocket: opts.EnvoyAdmin, Terminate: hosts, UpstreamCA: opts.EnvoyUpstreamCA})
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomic(opts.EnvoyConfig, boot, 0o644); err != nil {
+		return nil, err
+	}
+	if len(patterns) > 0 {
+		fmt.Printf("proxy: terminating TLS for %s\n", strings.Join(patterns, ", "))
+	}
+	return patterns, nil
 }
 
 // loadNodePolicy loads dir, or returns nil if it does not exist.

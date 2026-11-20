@@ -1792,6 +1792,58 @@ it writes (`make envoy`).
 - **Dependencies.** go-control-plane v1.32.4 and gRPC v1.70.0, the newest that
   keep the module at Go 1.23.
 
+#### 2.4 status (2026-11-20)
+
+Done: termination for exactly the destinations whose rules need it
+([§6.6](#66-tls-posture)), with method and path rules enforced inside.
+
+- **Node CA.** The node agent creates a P-256 CA in `/var/lib/clovisor/ca`
+  (key root-only) and issues 30-day leaves to the RFC 5280 profile: critical
+  `basicConstraints` and `keyUsage`, SKI and AKI. Python 3.14's strict
+  verification accepts them. Envoy only ever holds leaves, in a directory
+  owned by its uid.
+- **Termination set.** It is the compiled node-wide posture: every
+  destination with `http:` rules (or a remote MCP server) in any profile.
+  Each pattern gets a CONNECT route matching `:authority` by regex (a
+  wildcard covers one label, like its certificate) to its own internal
+  listener with its own leaf. The inner hop goes to a dynamic forward proxy
+  cluster that verifies origins (`auto_sni`, `auto_san_validation`).
+  Everything else stays a plain tunnel with the origin's certificate.
+- **`ext_proc` follows Envoy, not a list.** A CONNECT whose deciding rule
+  needs method or path is let through only on a route named
+  `clovisor-terminate-N`, read from `xds.route_name`. So if policy gains a
+  terminated host and Envoy has not restarted, the CONNECT is refused with a
+  message saying so, rather than tunnelled with the rule unenforced. On
+  `SIGHUP` the node agent rewrites certificates and the bootstrap and reports
+  that Envoy needs a restart.
+- **Inner-hop identity.** Spike B's mechanism: filter state crosses the
+  internal hop, and `header_mutation` writes it into `x-clovisor-client`
+  before `ext_proc`. `ext_proc` trusts the header only when the request's
+  source attribute is an Envoy internal address, which no client can set. The
+  outer hop strips client copies before `ext_proc` anyway.
+- **Smuggling check.** Inside a terminated tunnel the request's `Host` must
+  name the CONNECT destination, port included. Otherwise a client could
+  CONNECT to an allowed host and send `Host: anything`, which the dynamic
+  forward proxy would route.
+- **Runs trust the node CA.** `agentctl run` sets `SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `GIT_SSL_CAINFO` to
+  `/run/clovisor/ca-bundle.pem` (system roots plus the node CA, since these
+  variables replace a client's store), and `NODE_EXTRA_CA_CERTS` to the node
+  CA alone. MCP servers get the same.
+- **Verified live** through Envoy 1.34 with curl, Python 3.14 and git:
+  - allowed and denied paths and methods on two terminated hosts, with full
+    JSON narration on denials;
+  - a smuggled `Host` refused;
+  - passthrough hosts keeping their real certificates;
+  - the reload sequence: refused before the Envoy restart, enforced after.
+- **Not yet.**
+  - Body discard for runs with no body rule on a terminated destination: there
+    are no body rules before Phase 5, so `ext_proc` never receives bodies.
+  - Cert-pinned clients fail on terminated destinations, as §6.6 says. The
+    receipt names those destinations.
+  - Leaves are reissued when the node agent starts or reloads, not by a
+    timer; one running continuously for 30 days needs a reload.
+
 #### 2.5 status, part 1: local MCP gateway (2026-11-20)
 
 Done: the local MCP gateway of [§8.3](#83-normalize-the-transport). Enable it

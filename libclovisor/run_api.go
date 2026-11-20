@@ -81,6 +81,9 @@ type RunAPIResponse struct {
 	CgroupID uint64     `json:"cgroup_id,omitempty"`
 	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
 	Proxy    string     `json:"proxy,omitempty"`  // create: the node's proxy URL, if any
+	// create: trust anchors for terminated destinations
+	TrustBundle string `json:"trust_bundle,omitempty"`
+	NodeCACert  string `json:"node_ca_cert,omitempty"`
 	// profiles:
 	Ceiling string   `json:"ceiling,omitempty"`
 	Allow   []string `json:"allow,omitempty"`
@@ -145,6 +148,9 @@ type RunAPIServer struct {
 	ProxyURL string
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
+	// TrustBundle and NodeCACert are handed to runs when the proxy
+	// terminates TLS.
+	TrustBundle, NodeCACert string
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
@@ -593,7 +599,8 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		granted = rp.Layers[0].Profile + "@" + rp.Layers[0].Version + " (" + rp.Reason + ")"
 	}
 	log.Printf("run api: run %s created for uid %d pid %d: %s", runID, ac.cred.Uid, ac.cred.Pid, granted)
-	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL}
+	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL,
+		TrustBundle: ac.s.TrustBundle, NodeCACert: ac.s.NodeCACert}
 }
 
 // caller is the requester's platform identity: uid from SO_PEERCRED,

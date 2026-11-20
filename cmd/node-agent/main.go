@@ -31,6 +31,8 @@ var (
 	envoyUID = flag.String("envoy-uids", "101", "Comma-separated uids Envoy runs as, admitted to ext_proc (root always is)")
 	nonRun   = flag.Bool("proxy-non-run", false, "Let processes outside any run use the proxy")
 	mcpAddr  = flag.String("mcp-listen", "", "Enable the local MCP gateway on this loopback address, e.g. 127.0.0.1:18100")
+	caDir    = flag.String("ca-dir", "/var/lib/clovisor/ca", "Node CA for TLS termination (key is root-only)")
+	upCA     = flag.String("envoy-upstream-ca", "/etc/ssl/certs/ca-certificates.crt", "System trust store as Envoy sees it, to verify origins behind termination")
 )
 
 func proxyAddr() netip.AddrPort { return addrFlag("-proxy-listen", *proxy) }
@@ -67,16 +69,18 @@ func main() {
 
 	// Create and initialize the node agent with BPF audit attached
 	agent, err := clovisor.NewNodeAgentWithBPF(clovisor.NodeAgentOptions{
-		BPFObjPath:    *bpfObj,
-		OutDir:        *outDir,
-		SocketPath:    *socket,
-		PolicyDir:     *policies,
-		ProxyListen:   proxyAddr(),
-		ExtProcSocket: *extSock,
-		EnvoyConfig:   *envoyCfg,
-		EnvoyUIDs:     uids(*envoyUID),
-		NonRunProxy:   *nonRun,
-		MCPListen:     addrFlag("-mcp-listen", *mcpAddr),
+		BPFObjPath:      *bpfObj,
+		OutDir:          *outDir,
+		SocketPath:      *socket,
+		PolicyDir:       *policies,
+		ProxyListen:     proxyAddr(),
+		ExtProcSocket:   *extSock,
+		EnvoyConfig:     *envoyCfg,
+		EnvoyUIDs:       uids(*envoyUID),
+		NonRunProxy:     *nonRun,
+		MCPListen:       addrFlag("-mcp-listen", *mcpAddr),
+		CADir:           *caDir,
+		EnvoyUpstreamCA: *upCA,
 	})
 	// A policy that does not load is fatal at start: running without it
 	// would silently leave runs unprofiled.
