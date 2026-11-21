@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,7 +31,7 @@ import (
 )
 
 func printUsage() {
-	fmt.Println("AgentCtl - Agent Cgroup Control Tool (Phase 1)")
+	fmt.Println("agentctl - run and govern agent processes (see docs/operator-guide.md)")
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--mcp-config file] [--] <command> [args...]")
@@ -49,14 +50,16 @@ func printUsage() {
 	fmt.Println("                                    Show a tool's pinned and changed definitions")
 	fmt.Println("  agentctl pins approve <server> (<tool> <hash> | --all)")
 	fmt.Println("                                    Accept changed definitions as the new pins (root)")
-	fmt.Println("  agentctl cgroups                  List active cgroups")
+	fmt.Println("  agentctl cgroups                  List active run cgroups (cgroup identity)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  agentctl run -- python3 script.py")
 	fmt.Println("  agentctl run -- curl https://example.com")
 	fmt.Println()
-	fmt.Println("agentctl run needs the node agent (sudo make run); agentctl itself")
-	fmt.Println("needs no privileges. Set CLOVISOR_SOCKET to use a non-default socket.")
+	fmt.Println("agentctl run needs a running node agent; agentctl itself needs no privileges.")
+	fmt.Println("It finds the node agent's socket in a per-user directory if one is running")
+	fmt.Println("there, else in the system's; CLOVISOR_SOCKET overrides. Timelines are read")
+	fmt.Println("from the matching directory; CLOVISOR_RUNS or --dir overrides.")
 	os.Exit(0)
 }
 
@@ -82,13 +85,6 @@ func runShim(args []string) {
 	os.Exit(126)
 }
 
-// runCommand runs args in a fresh run and returns the child's exit code.
-//
-// The node agent owns the cgroup. agentctl starts the child as a parked
-// shim, has the node agent move it into the run, and only then lets it
-// exec the command. So no command code ever runs outside the run (design
-// §5.2), and agentctl needs no privileges. clone3(CLONE_INTO_CGROUP)
-// would do this in one step but needs root (see libclovisor/run_api.go).
 // proxyEnv points a run at the node's proxy. Both spellings are set:
 // curl ignores upper-case HTTP_PROXY (the httpoxy mitigation), and some
 // tools read only one or the other. Values already in the environment are
@@ -266,6 +262,17 @@ func trustEnv(env []string, bundle, caCert string) []string {
 	return out
 }
 
+// runCommand runs args in a fresh run and returns the child's exit code.
+//
+// The node agent owns the cgroup. agentctl starts the child as a parked
+// shim, has the node agent move it into the run, and only then lets it
+// exec the command. So no command code ever runs outside the run (design
+// §5.2), and agentctl needs no privileges. clone3(CLONE_INTO_CGROUP)
+// would do this in one step but needs root (see libclovisor/run_api.go).
+//
+// With credential identity there is no cgroup: the command is started
+// directly, and the proxy and MCP gateway know it by the secret in the
+// proxy settings it inherits.
 func runCommand(args []string, profile string, noProxy bool, mcpConfigPath string) (int, error) {
 	if len(args) == 0 {
 		return 0, fmt.Errorf("command required")
@@ -275,10 +282,6 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 		return 0, err
 	}
 	if path, err = filepath.Abs(path); err != nil {
-		return 0, err
-	}
-	self, err := os.Executable()
-	if err != nil {
 		return 0, err
 	}
 
@@ -295,30 +298,25 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 	if err != nil {
 		return 0, err
 	}
-	fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d), %s\n", run.RunID, run.CgroupID, describePolicy(run.Policy))
+	credential := run.Identity == "credential"
+	if credential {
+		fmt.Fprintf(os.Stderr, "agentctl: run %s (credential identity: a claim, design §4.3), %s\n", run.RunID, describePolicy(run.Policy))
+	} else {
+		fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d), %s\n", run.RunID, run.CgroupID, describePolicy(run.Policy))
+	}
 	if run.Policy != nil && profile != "" && run.Policy.Layers[0].Profile != profile {
 		fmt.Fprintf(os.Stderr, "agentctl: WARNING: %s\n", run.Policy.Reason)
 	}
 
-	relR, relW, err := os.Pipe()
-	if err != nil {
-		return 0, err
-	}
-	defer relW.Close()
-
-	pidfd := -1
-	cmd := exec.Command(self, append([]string{shimArg, path}, args...)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.ExtraFiles = []*os.File{relR}
-	cmd.Env = os.Environ()
+	env := os.Environ()
 	if run.Proxy != "" && !noProxy {
-		cmd.Env = proxyEnv(cmd.Env, run.Proxy)
-		fmt.Fprintf(os.Stderr, "agentctl: egress via %s\n", run.Proxy)
+		env = proxyEnv(env, run.Proxy)
+		fmt.Fprintf(os.Stderr, "agentctl: egress via %s\n", redactProxy(run.Proxy))
 		if run.TrustBundle != "" {
-			cmd.Env = trustEnv(cmd.Env, run.TrustBundle, run.NodeCACert)
+			env = trustEnv(env, run.TrustBundle, run.NodeCACert)
 		}
+	} else if credential && run.Proxy != "" {
+		fmt.Fprintf(os.Stderr, "agentctl: WARNING: --no-proxy with credential identity: the proxy will not know this run\n")
 	}
 	if mcpConfigPath != "" {
 		proxy := run.Proxy
@@ -331,14 +329,12 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 		}
 		rewritten, err := prepareMCP(api, mcpConfigPath, proxy, bundle, caCert)
 		if err != nil {
-			relR.Close()
 			return 0, err
 		}
 		defer os.Remove(rewritten)
-		cmd.Env = append(cmd.Env, "CLOVISOR_MCP_CONFIG="+rewritten)
+		env = append(env, "CLOVISOR_MCP_CONFIG="+rewritten)
 		fmt.Fprintf(os.Stderr, "agentctl: MCP config for the harness: $CLOVISOR_MCP_CONFIG (%s)\n", rewritten)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &pidfd}
 
 	// Terminal signals (Ctrl-C, Ctrl-\) already reach the child through the
 	// foreground process group; agentctl ignores them so it survives to
@@ -348,25 +344,18 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 	signal.Notify(fwd, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(fwd)
 
-	if err := cmd.Start(); err != nil {
-		relR.Close()
-		return 0, fmt.Errorf("failed to start %s: %w", args[0], err)
+	var cmd *exec.Cmd
+	if credential {
+		cmd = exec.Command(path, args[1:]...)
+		cmd.Args[0] = args[0]
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		cmd.Env = env
+		if err := cmd.Start(); err != nil {
+			return 0, fmt.Errorf("failed to start %s: %w", args[0], err)
+		}
+	} else if cmd, err = startInRun(api, path, args, env); err != nil {
+		return 0, err
 	}
-	relR.Close()
-
-	attachErr := api.Attach(pidfd)
-	syscall.Close(pidfd)
-	if attachErr != nil {
-		relW.Close() // the shim exits without running the command
-		cmd.Wait()
-		return 0, attachErr
-	}
-	if _, err := relW.Write([]byte{1}); err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		return 0, fmt.Errorf("failed to release %s: %w", args[0], err)
-	}
-	relW.Close()
 
 	go func() {
 		for sig := range fwd {
@@ -385,6 +374,15 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 			"(restarted?); its timeline will lack the exit code: %v\n", run.RunID, err)
 	}
 	return code, nil
+}
+
+// redactProxy hides a proxy URL's credential for display.
+func redactProxy(p string) string {
+	u, err := url.Parse(p)
+	if err != nil || u.User == nil {
+		return p
+	}
+	return u.Redacted()
 }
 
 // describePolicy renders a run's policy layers on one line.
@@ -506,11 +504,19 @@ func exitCode(err error) (int, error) {
 	}
 }
 
+// runsDir is where the node agent the client talks to writes timelines.
+func runsDir() string {
+	if p := os.Getenv("CLOVISOR_RUNS"); p != "" {
+		return p
+	}
+	return clovisor.ClientDirs().Runs()
+}
+
 func socketPath() string {
 	if p := os.Getenv("CLOVISOR_SOCKET"); p != "" {
 		return p
 	}
-	return clovisor.DefaultRunAPISocket
+	return clovisor.ClientDirs().APISocket()
 }
 
 func listCgroups() error {
@@ -543,7 +549,7 @@ func listCgroups() error {
 // showEvents lists recorded runs, or prints one run's timeline.
 func showEvents(argv []string) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
-	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	dir := fs.String("dir", runsDir(), "directory of run timeline files")
 	asJSON := fs.Bool("json", false, "print the raw timeline JSON")
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -617,7 +623,11 @@ func listRuns(dir string) error {
 }
 
 func printTimeline(tl *clovisor.RunTimeline) {
-	fmt.Printf("Run       %s (cgroup %d, %s)\n", tl.RunID, tl.CgroupID, tl.CgroupPath)
+	if strings.HasPrefix(tl.CgroupPath, clovisor.CredentialRunsDir+"/") {
+		fmt.Printf("Run       %s (credential identity: no cgroup, no kernel audit)\n", tl.RunID)
+	} else {
+		fmt.Printf("Run       %s (cgroup %d, %s)\n", tl.RunID, tl.CgroupID, tl.CgroupPath)
+	}
 	if len(tl.Command) > 0 {
 		fmt.Printf("Command   %s\n", strings.Join(tl.Command, " "))
 	}
@@ -880,7 +890,7 @@ var errViolations = errors.New("violations")
 // shadow step, offline).
 func checkProfile(argv []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
-	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	dir := fs.String("dir", runsDir(), "directory of run timeline files")
 	profile := fs.String("profile", "", "profile file to check against (required)")
 	all := fs.Bool("all", false, "check every finished run in -dir")
 	platform := platformFlag(fs)
@@ -911,7 +921,7 @@ func checkProfile(argv []string) error {
 // learnProfile drafts an AgentProfile from recorded runs.
 func learnProfile(argv []string) error {
 	fs := flag.NewFlagSet("learn", flag.ContinueOnError)
-	dir := fs.String("dir", clovisor.DefaultRunOutDir, "directory of run timeline files")
+	dir := fs.String("dir", runsDir(), "directory of run timeline files")
 	name := fs.String("name", "learned-profile", "metadata.name of the drafted profile")
 	out := fs.String("o", "", "write the profile here instead of stdout")
 	all := fs.Bool("all", false, "learn from every finished run in -dir")

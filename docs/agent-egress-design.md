@@ -1,11 +1,12 @@
 # Clovisor II — An Agent Egress Control & Audit Engine
 
-**Status:** design exploration; Phase 1 audit path partly implemented ·
-**Date:** 2026-11-14, revised 2026-11-19 · **Repo:** `clovisor`
+**Status:** Phase 1 (audit) and Phase 2 (explicit proxy and MCP) implemented ·
+**Date:** 2026-11-14, revised 2026-11-21 · **Repo:** `clovisor` ·
+**Operating it:** [operator guide](operator-guide.md)
 
 > A design study on repointing Clovisor's architecture from Istio service-mesh
-> observability toward egress control and audit for AI agents. Phase 1's audit
-> path is partly implemented ([§10](#10-build-order)). Open questions are
+> observability toward egress control and audit for AI agents. Phases 1 and 2
+> are implemented ([§10](#10-build-order)). Open questions are
 > collected in [§12](#12-open-questions). The 2026-11-19 design review and what
 > it changed are summarized under [Revision history](#revision-history).
 
@@ -59,6 +60,7 @@ place:
 | Change | Where |
 |---|---|
 | Learn mode drafts exact method and path rules for hosts seen in full, and `mcp` server rules from the calls let through. `check` replays paths and MCP calls. Tool pins get a review and approve command. | [2.6 status](#26-status-learn-and-audit-2026-11-21) |
+| Credential identity implemented: the portable mode runs on macOS and unprivileged, with a per-run secret in the proxy URL. Docker integration tests and an operator guide. Phase 2 complete. | [2.7 status](#27-status-portability-and-tests-2026-11-21), [operator guide](operator-guide.md) |
 
 ---
 
@@ -2039,6 +2041,84 @@ a draft allows exactly what was let through, never more.
   promoted, so clients decoded entries with no server or tool. `Pin` is now a
   named field, with a round-trip test.
 
+#### 2.7 status: portability and tests (2026-11-21)
+
+Done. Phase 2 is complete.
+
+- **Builds.** `agentctl`, the node agent, `ext_proc` and the MCP gateway
+  build for Linux and macOS, amd64 and arm64. `make check` cross-builds for
+  macOS.
+  - Kernel-backed pieces live in `*_linux.go` files: BPF audit, cgroups,
+    socket diagnostics, `SO_PEERCRED`, the pidfd attach, and the MCP server
+    cgroup spawn.
+  - Elsewhere there are stubs, and peer credentials come from
+    `LOCAL_PEERCRED`/`LOCAL_PEERPID`.
+  - macOS has no `SOCK_SEQPACKET`, so the run API there is a stream socket
+    with one JSON message per line.
+- **Credential identity** ([§4.3](#43-two-deployment-modes)), the default off
+  Linux, or `node-agent -identity credential`. It is recorded as a claim in
+  the receipt.
+  - `create` returns a proxy URL `http://run-<id>:<token>@…`. `agentctl`
+    starts the command directly, with no shim and no cgroup.
+  - `ext_proc` reads `Proxy-Authorization`. Envoy carries it across the
+    internal hop of a terminated tunnel in filter state, written to
+    `x-clovisor-cred` on that hop only, the same way it carries the client
+    address.
+  - A missing or wrong credential gets `407` with a Basic challenge.
+  - The MCP gateway's URLs carry the token in the path.
+  - The run API reports run start and end to the recorder, under a virtual
+    agents directory, since no cgroup mkdir or rmdir does.
+  - Limits, stated in the receipt and the guide:
+    - any holder of the secret speaks for the run;
+    - a run can start another run within its user's ceiling;
+    - nothing below the proxy is observed;
+    - secrets do not survive a node agent restart.
+- **Unprivileged node agent.** Run as a user, it uses per-user directories
+  (XDG on Linux, `~/Library/Application Support` on macOS). It accepts a
+  policy directory the user owns, and says at start that its policy is
+  advisory. `agentctl` finds a user-level agent's socket before the
+  system's.
+- **Integration tests** (`make integration`, `integration/`). They use
+  Docker, credential identity, and Envoy pinned at 1.34.14.
+  - Three containers: a local TLS origin for `origin.test`, `mcp.test` and
+    `other.test`; a Debian client with curl, Python requests and git; and
+    Envoy in the client's network namespace.
+  - They cover path rules and narrated denials, what headers reach the
+    origin, the 407 challenge, a git clone through termination, remote MCP
+    filtering and denials, timelines, `learn` and `check`, and pin drift with
+    approval.
+  - About 3 s once the images are built; nothing leaves the Docker network.
+- **Bugs the integration tests found,** which live tests on a newer host had
+  missed:
+  - **Python before 3.12 sends `CONNECT … HTTP/1.0`.** Envoy refuses it with
+    426 by default, so Python's requests and urllib on Debian 12 could not
+    use the proxy. The listener now accepts HTTP/1.0.
+  - **git sends proxy credentials only after a 407 challenge.** libcurl uses
+    `CURLAUTH_ANY` there. The fix is the challenge above.
+- **Bug found by reading the bootstrap.** On terminated connections, the
+  inner-hop annotations (`x-clovisor-client`, `x-clovisor-connect`) were
+  forwarded to origins, which leaked the client's address and port. Both hops' route
+  configs now strip every `x-clovisor-*` header and `Proxy-Authorization`
+  after `ext_proc` has read them. The integration test asserts the origin
+  sees neither.
+- **Operator guide.** [operator-guide.md](operator-guide.md) covers:
+  - choosing an identity mode, directories and flags;
+  - running Envoy, and restarting it when the termination set changes;
+  - policy layout and ceilings;
+  - the path from observation to enforcement;
+  - MCP and pin review, TLS termination, incident response and audit data;
+  - limits and troubleshooting.
+- **Verified live.**
+  - A node agent run as uid 1000 with credential identity, with Envoy as
+    uid 1000 in Docker: path rules on terminated hosts, remote MCP filtering
+    through the carried credential, and the local gateway with the token in
+    the URL. The gateway's server egress was attributed to the run. Origins
+    saw no Clovisor headers.
+  - Cgroup identity as root, rerun after the refactor: pidfd attach over the
+    new transport, BPF exec events, and path decisions.
+- **Not in Phase 2.** Per-server MCP attenuation (§7.8); `ask` (Phase 5);
+  transparent redirect (Phase 3); exec gating (Phase 4).
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT
@@ -2046,7 +2126,8 @@ a draft allows exactly what was let through, never more.
 - **One engine.** A Go library called by both `ext_proc` and the MCP gateway:
   two enforcement points, one definition of each rule.
 - **macOS identity.** The per-run credential, labelled a claim in the receipt,
-  rather than declaring macOS audit-only.
+  rather than declaring macOS audit-only. *Implemented in 2.7*, also
+  available on Linux for unprivileged and containerized use.
 - **Repository** ([§12](#12-open-questions) item 7). *Decided 2026-11-20:* Phase 2
   stays in the `clovisor` repository.
 
@@ -2115,7 +2196,11 @@ development kernel. Use `tp_btf` or cgroup hooks instead.
    fail-closed ordering needs care.
 5. **Explicit-proxy identity** — per-run listener or per-run credential, and how
    a laptop harness obtains either without a privileged helper. See
-   [§4.3](#43-two-deployment-modes).
+   [§4.3](#43-two-deployment-modes). *Answered in Phase 2:* the cgroup by
+   socket diagnostics on Linux, and elsewhere a per-run credential that
+   `agentctl run` puts in the proxy URL, needing no privileged helper. A
+   per-run listener remains the upgrade where a sandbox can restrict a run to
+   it.
 6. **Allowed-channel exfiltration** — how far to go beyond method/path rules and
    `ask` for write-capable destinations. See
    [§11](#11-non-goals-and-honest-limits).

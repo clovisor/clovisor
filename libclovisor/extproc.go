@@ -9,6 +9,7 @@ package clovisor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -130,7 +132,7 @@ func (l *peerCheckListener) Accept() (net.Conn, error) {
 }
 
 // Listen serves on a unix socket, admitting only the given peer uids
-// (root is always admitted).
+// (root and the node agent's own uid always are).
 func (s *ExtProcServer) Listen(path string, peerUIDs []uint32) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
@@ -144,7 +146,9 @@ func (s *ExtProcServer) Listen(path string, peerUIDs []uint32) error {
 		ln.Close()
 		return err
 	}
-	allowed := map[uint32]bool{0: true}
+	// Root, and the node agent's own uid: a node agent run by a user
+	// (credential identity, as on a laptop) has Envoy run as that user.
+	allowed := map[uint32]bool{0: true, uint32(os.Getuid()): true}
 	for _, u := range peerUIDs {
 		allowed[u] = true
 	}
@@ -389,12 +393,24 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		src, err1 = attrAddrPort(req, "source.address", "source.port")
 		dst, err2 = attrAddrPort(req, "destination.address", "destination.port")
 	}
-	if err1 == nil && err2 == nil {
+	switch {
+	case s.api.CredentialIdentity():
+		// The run's secret, from the proxy URL agentctl gave it: on the
+		// request itself, or, inside a terminated tunnel, as Envoy carried
+		// it from the CONNECT (trusted only on that hop).
+		auth := headerValue(hm, "proxy-authorization")
+		if inner {
+			auth = headerValue(hm, hdrCred)
+		}
+		if user, token, ok := parseProxyBasic(auth); ok {
+			runID, runCg, eff, isRun = s.api.RunForCredential(user, token)
+		}
+	case err1 == nil && err2 == nil:
 		cg, err = SockCgroup(src, dst)
-	} else {
+	default:
 		err = fmt.Errorf("no client address")
 	}
-	if err == nil {
+	if err == nil && !s.api.CredentialIdentity() {
 		runID, runCg, eff, isRun = s.api.RunFor(cg)
 		if !isRun {
 			if p := findRunCgroupPath(s.agentsDir, cg); p != "" {
@@ -411,6 +427,16 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	case !isRun && !s.NonRunAllowed:
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "not a run"
 		d.Message = "This proxy serves governed agent runs only; start the command with agentctl run."
+		if s.api.CredentialIdentity() {
+			d.Reason = "no run credential"
+			d.Message = "This proxy serves governed agent runs only, known by the credential in the proxy URL " +
+				"agentctl run sets; this request carried none that is valid."
+			if !inner {
+				// Clients such as git (libcurl with CURLAUTH_ANY) send
+				// proxy credentials only when challenged.
+				return proxyAuthRequired(s.deny(d, "")), headerOutcome{}
+			}
+		}
 		return s.deny(d, ""), headerOutcome{}
 	}
 
@@ -465,6 +491,23 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	}}, out
 }
 
+// parseProxyBasic decodes a Basic Proxy-Authorization value.
+func parseProxyBasic(v string) (user, pass string, ok bool) {
+	scheme, cred, found := strings.Cut(strings.TrimSpace(v), " ")
+	if !found || !strings.EqualFold(scheme, "Basic") {
+		return "", "", false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cred))
+	if err != nil {
+		return "", "", false
+	}
+	user, pass, ok = strings.Cut(string(raw), ":")
+	if u, err := url.PathUnescape(user); err == nil {
+		user = u
+	}
+	return user, pass, ok
+}
+
 // record files a decision under the run's own cgroup id, which is how
 // the recorder keys runs, whichever child cgroup the client was in.
 func (s *ExtProcServer) record(runCg uint64, runID string, d HTTPData) {
@@ -493,6 +536,16 @@ func headerSafe(s string) string {
 
 // deny answers with the narrated 403 (design §7.7). On CONNECT most
 // clients drop the body, so the message is also in x-clovisor-denial.
+// proxyAuthRequired turns a denial into a 407 challenge for Basic proxy
+// credentials, keeping its narration.
+func proxyAuthRequired(r *extprocv3.ProcessingResponse) *extprocv3.ProcessingResponse {
+	ir := r.GetImmediateResponse()
+	ir.Status = &typev3.HttpStatus{Code: typev3.StatusCode_ProxyAuthenticationRequired}
+	ir.Headers.SetHeaders = append(ir.Headers.SetHeaders, &corev3.HeaderValueOption{
+		Header: &corev3.HeaderValue{Key: "proxy-authenticate", RawValue: []byte(`Basic realm="clovisor run"`)}})
+	return r
+}
+
 func (s *ExtProcServer) deny(d HTTPData, runID string) *extprocv3.ProcessingResponse {
 	target := net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port)))
 	if d.Method != "CONNECT" {

@@ -231,14 +231,29 @@ func (g *MCPGateway) Register(run *mcpRun, specs []MCPServerSpec) []MCPRegistrat
 		}
 		run.servers[s.Name] = &mcpServer{run: run, spec: s, drifted: map[string]bool{}}
 		reg.URL = g.base + "/mcp/" + s.Name
+		if g.api.CredentialIdentity() {
+			// No socket cgroup to know the caller by: the URL carries the
+			// run's secret, as its proxy URL does.
+			reg.URL = g.base + "/r/" + g.api.TokenFor(run.runID) + "/mcp/" + s.Name
+		}
 		reg.WouldDeny = d.WouldDeny
 		out = append(out, reg)
 	}
 	return out
 }
 
-// identify returns the run of the HTTP client, by its socket's cgroup.
-func (g *MCPGateway) identify(r *http.Request) (string, error) {
+// identify returns the run of the HTTP client, by its socket's cgroup,
+// or with credential identity by the token in the URL.
+func (g *MCPGateway) identify(r *http.Request, token string) (string, error) {
+	if g.api.CredentialIdentity() {
+		g.api.mu.Lock()
+		runID, ok := g.api.tokens[token]
+		g.api.mu.Unlock()
+		if !ok || token == "" {
+			return "", fmt.Errorf("no valid run credential in the URL")
+		}
+		return runID, nil
+	}
 	local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
 	if !ok {
 		return "", fmt.Errorf("no local address")
@@ -293,12 +308,23 @@ func httpRPCError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (g *MCPGateway) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	name, ok := strings.CutPrefix(r.URL.Path, "/mcp/")
+	p := r.URL.Path
+	var token string
+	if g.api.CredentialIdentity() {
+		rest, ok := strings.CutPrefix(p, "/r/")
+		token, p, _ = strings.Cut(rest, "/")
+		if !ok {
+			httpRPCError(w, http.StatusNotFound, "use the server URL agentctl run gave the harness")
+			return
+		}
+		p = "/" + p
+	}
+	name, ok := strings.CutPrefix(p, "/mcp/")
 	if !ok || name == "" {
 		httpRPCError(w, http.StatusNotFound, "use /mcp/<server>")
 		return
 	}
-	runID, err := g.identify(r)
+	runID, err := g.identify(r, token)
 	if err != nil {
 		httpRPCError(w, http.StatusForbidden, "This MCP gateway serves governed agent runs only ("+err.Error()+").")
 		return
@@ -628,24 +654,30 @@ func (g *MCPGateway) start(srv *mcpServer) (*mcpProc, error) {
 	return p, nil
 }
 
-// launchGoverned prepares the server as the run's user, spawned
-// directly into a child cgroup of the run.
+// launchGoverned prepares the server as the run's user. With cgroup
+// identity it is spawned directly into a child cgroup of the run; with
+// credential identity it gets the run's proxy settings, from the
+// registration, and its egress is the run's by that credential.
 func (g *MCPGateway) launchGoverned(srv *mcpServer) (*exec.Cmd, func(), error) {
 	run := srv.run
-	cgPath := filepath.Join(run.cgPath, "mcp-"+srv.spec.Name)
-	if err := os.Mkdir(cgPath, 0o755); err != nil && !os.IsExist(err) {
-		return nil, nil, err
-	}
-	cgID, err := GetCgroupID(cgPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Egress from the server is the run's: register its cgroup so the
-	// proxy attributes it.
-	g.api.addRunCgroup(run.runID, cgID)
-	cgDir, err := os.Open(cgPath)
-	if err != nil {
-		return nil, nil, err
+	cgFD, cleanup := -1, func() {}
+	if run.cgPath != "" {
+		cgPath := filepath.Join(run.cgPath, "mcp-"+srv.spec.Name)
+		if err := os.Mkdir(cgPath, 0o755); err != nil && !os.IsExist(err) {
+			return nil, nil, err
+		}
+		cgID, err := GetCgroupID(cgPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Egress from the server is the run's: register its cgroup so the
+		// proxy attributes it.
+		g.api.addRunCgroup(run.runID, cgID)
+		cgDir, err := os.Open(cgPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		cgFD, cleanup = int(cgDir.Fd()), func() { cgDir.Close() }
 	}
 
 	env := make([]string, 0, len(srv.spec.Env))
@@ -655,17 +687,18 @@ func (g *MCPGateway) launchGoverned(srv *mcpServer) (*exec.Cmd, func(), error) {
 	cmd := exec.Command(srv.spec.Command[0], srv.spec.Command[1:]...)
 	cmd.Dir = run.cwd
 	cmd.Env = env
-	groups := make([]uint32, len(run.groups))
-	for i, gid := range run.groups {
-		groups[i] = uint32(gid)
+	var cred *syscall.Credential
+	if os.Geteuid() == 0 {
+		// A root node agent drops to the run's user; one run by the user
+		// already is that user.
+		groups := make([]uint32, len(run.groups))
+		for i, gid := range run.groups {
+			groups[i] = uint32(gid)
+		}
+		cred = &syscall.Credential{Uid: uint32(run.uid), Gid: uint32(run.gid), Groups: groups}
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential:  &syscall.Credential{Uid: uint32(run.uid), Gid: uint32(run.gid), Groups: groups},
-		UseCgroupFD: true,
-		CgroupFD:    int(cgDir.Fd()),
-		Setsid:      true,
-	}
-	return cmd, func() { cgDir.Close() }, nil
+	cmd.SysProcAttr = serverProcAttr(cred, cgFD)
+	return cmd, cleanup, nil
 }
 
 func (g *MCPGateway) spawn(srv *mcpServer) (*mcpProc, error) {

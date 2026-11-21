@@ -21,19 +21,42 @@ import (
 )
 
 var (
-	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object")
-	outDir   = flag.String("out", clovisor.DefaultRunOutDir, "Directory for per-run timeline files")
-	socket   = flag.String("socket", clovisor.DefaultRunAPISocket, "Unix socket for the run API used by agentctl")
-	policies = flag.String("policy-dir", clovisor.DefaultPolicyDir, "Root-owned directory of profiles and ceilings; reloaded on SIGHUP")
+	identity = flag.String("identity", "", "How runs are known: cgroup (Linux, kernel audit) or credential (anywhere, a per-run proxy secret; a claim). Default: cgroup on Linux, credential elsewhere")
+	rtDir    = flag.String("runtime-dir", "", "Directory for sockets and generated files (default /run/clovisor as root, a per-user directory otherwise)")
+	stDir    = flag.String("state-dir", "", "Directory for timelines, the node CA and tool pins (default /var/lib/clovisor as root, a per-user directory otherwise)")
+	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object (cgroup identity)")
+	outDir   = flag.String("out", "", "Directory for per-run timeline files (default <state-dir>/runs)")
+	socket   = flag.String("socket", "", "Unix socket for the run API used by agentctl (default <runtime-dir>/agent.sock)")
+	policies = flag.String("policy-dir", clovisor.DefaultPolicyDir, "Directory of profiles and ceilings, root-owned when run as root; reloaded on SIGHUP")
 	proxy    = flag.String("proxy-listen", "", "Enable the explicit proxy: Envoy listen address for runs, e.g. 127.0.0.1:18000")
-	extSock  = flag.String("extproc-socket", clovisor.DefaultExtProcSocket, "Unix socket where ext_proc serves Envoy")
-	envoyCfg = flag.String("envoy-config", "/run/clovisor/envoy.json", "Where to write the generated Envoy bootstrap")
-	envoyUID = flag.String("envoy-uids", "101", "Comma-separated uids Envoy runs as, admitted to ext_proc (root always is)")
+	extSock  = flag.String("extproc-socket", "", "Unix socket where ext_proc serves Envoy (default <runtime-dir>/extproc.sock)")
+	envoyCfg = flag.String("envoy-config", "", "Where to write the generated Envoy bootstrap (default <runtime-dir>/envoy.json)")
+	envoyUID = flag.String("envoy-uids", defaultEnvoyUIDs(), "Comma-separated uids Envoy runs as, admitted to ext_proc (root and the node agent's uid always are)")
 	nonRun   = flag.Bool("proxy-non-run", false, "Let processes outside any run use the proxy")
 	mcpAddr  = flag.String("mcp-listen", "", "Enable the local MCP gateway on this loopback address, e.g. 127.0.0.1:18100")
-	caDir    = flag.String("ca-dir", "/var/lib/clovisor/ca", "Node CA for TLS termination (key is root-only)")
-	upCA     = flag.String("envoy-upstream-ca", "/etc/ssl/certs/ca-certificates.crt", "System trust store as Envoy sees it, to verify origins behind termination")
+	caDir    = flag.String("ca-dir", "", "Node CA for TLS termination, key readable only by the node agent (default <state-dir>/ca)")
+	upCA     = flag.String("envoy-upstream-ca", "", "System trust store as Envoy sees it, to verify origins behind termination (default: the host's)")
 )
+
+// defaultEnvoyUIDs is the uid of the official Envoy image's user when the
+// node agent is root; a user's node agent runs Envoy as that user.
+func defaultEnvoyUIDs() string {
+	if os.Geteuid() == 0 {
+		return "101"
+	}
+	return ""
+}
+
+func dirs() clovisor.Dirs {
+	d := clovisor.DefaultDirs()
+	if *rtDir != "" {
+		d.Runtime = *rtDir
+	}
+	if *stDir != "" {
+		d.State = *stDir
+	}
+	return d
+}
 
 func proxyAddr() netip.AddrPort { return addrFlag("-proxy-listen", *proxy) }
 
@@ -68,7 +91,9 @@ func main() {
 	log.Info("Clovisor Node Agent starting...")
 
 	// Create and initialize the node agent with BPF audit attached
-	agent, err := clovisor.NewNodeAgentWithBPF(clovisor.NodeAgentOptions{
+	agent, err := clovisor.NewNodeAgentFromOptions(clovisor.NodeAgentOptions{
+		Identity:        *identity,
+		Dirs:            dirs(),
 		BPFObjPath:      *bpfObj,
 		OutDir:          *outDir,
 		SocketPath:      *socket,

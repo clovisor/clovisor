@@ -59,6 +59,7 @@ const TerminateRoutePrefix = "clovisor-terminate-"
 const (
 	hdrClient  = "x-clovisor-client"  // "<client addr:port>,<proxy addr:port>"
 	hdrConnect = "x-clovisor-connect" // the CONNECT authority
+	hdrCred    = "x-clovisor-cred"    // the outer request's Proxy-Authorization (credential identity)
 )
 
 type obj = map[string]interface{}
@@ -104,7 +105,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	// as filter state that crosses the internal hop.
 	stripOwn := obj{"name": "envoy.filters.http.header_mutation", "typed_config": typed(
 		"type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
-		obj{"mutations": obj{"request_mutations": arr{obj{"remove": hdrClient}, obj{"remove": hdrConnect}, obj{"remove": "x-clovisor-run"}}}})}
+		obj{"mutations": obj{"request_mutations": arr{obj{"remove": hdrClient}, obj{"remove": hdrConnect}, obj{"remove": hdrCred}, obj{"remove": "x-clovisor-run"}}}})}
 	fsEntry := func(key, format string) obj {
 		return obj{"object_key": key, "factory_key": "envoy.string", "shared_with_upstream": "TRANSITIVE",
 			"format_string": obj{"text_format_source": obj{"inline_string": format}}}
@@ -114,6 +115,9 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		obj{"on_request_headers": arr{
 			fsEntry("clovisor.client", "%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_LOCAL_ADDRESS%"),
 			fsEntry("clovisor.connect", "%REQ(:AUTHORITY)%"),
+			// With credential identity the run's secret is on the CONNECT
+			// only; the requests inside a terminated tunnel need it too.
+			fsEntry("clovisor.cred", "%REQ(PROXY-AUTHORIZATION)%"),
 		}})}
 	var terminateRoutes arr
 	for i, th := range c.Terminate {
@@ -131,10 +135,15 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	hcm := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
 		"stat_prefix":     "proxy",
 		"upgrade_configs": arr{obj{"upgrade_type": "CONNECT"}},
+		// Python before 3.12 sends CONNECT as HTTP/1.0, which Envoy
+		// otherwise refuses with 426.
+		"http_protocol_options": obj{"accept_http_10": true},
 		"route_config": obj{
 			// Strip headers a client could use to impersonate the proxy's
-			// own annotations; ext_proc trusts only attributes.
-			"request_headers_to_remove": arr{"x-clovisor-client", "x-clovisor-run"},
+			// own annotations; ext_proc trusts only attributes. The router
+			// applies this after ext_proc, which has read the run's
+			// credential by then: it must not reach the origin.
+			"request_headers_to_remove": arr{hdrClient, hdrConnect, hdrCred, "x-clovisor-run", "proxy-authorization"},
 			"virtual_hosts": arr{obj{
 				"name":    "all",
 				"domains": arr{"*"},
@@ -169,16 +178,22 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			obj{"mutations": obj{"request_mutations": arr{
 				obj{"append": obj{"header": obj{"key": hdrClient, "value": "%FILTER_STATE(clovisor.client:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
 				obj{"append": obj{"header": obj{"key": hdrConnect, "value": "%FILTER_STATE(clovisor.connect:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
+				obj{"append": obj{"header": obj{"key": hdrCred, "value": "%FILTER_STATE(clovisor.cred:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
 			}}})}
 		for i, th := range c.Terminate {
 			name := fmt.Sprintf("mitm-%d", i)
 			inner := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
 				"stat_prefix": name,
 				"codec_type":  "AUTO",
-				"route_config": obj{"virtual_hosts": arr{obj{
-					"name": "all", "domains": arr{"*"},
-					"routes": arr{obj{"match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp_tls"}}},
-				}}},
+				"route_config": obj{
+					// The inner-hop annotations are for ext_proc only: the
+					// router drops them before the origin sees them.
+					"request_headers_to_remove": arr{hdrClient, hdrConnect, hdrCred, "proxy-authorization"},
+					"virtual_hosts": arr{obj{
+						"name": "all", "domains": arr{"*"},
+						"routes": arr{obj{"match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp_tls"}}},
+					}},
+				},
 				"http_filters": arr{setHeaders, extproc, dfpFilter, router},
 			})
 			listeners = append(listeners, obj{

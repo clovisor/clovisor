@@ -264,6 +264,12 @@ func NewRunRecorder(agentsDir, outDir string, meta *RunRegistry) (*RunRecorder, 
 	}, nil
 }
 
+// NewCredentialRunRecorder records runs with credential identity, whose
+// start and end the run API reports under CredentialRunsDir.
+func NewCredentialRunRecorder(outDir string, meta *RunRegistry) (*RunRecorder, error) {
+	return NewRunRecorder(filepath.Join(CgroupV2Root, CredentialRunsDir), outDir, meta)
+}
+
 // findRunCgroupPath returns the cgroup-root-relative path of the run
 // cgroup under agentsDir with the given id, or "".
 func findRunCgroupPath(agentsDir string, id uint64) string {

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,16 @@ type NodeAgent struct {
 
 // NodeAgentOptions configures where run timelines go.
 type NodeAgentOptions struct {
+	// Identity is how the proxy and the MCP gateway know a run: "cgroup"
+	// (Linux; kernel audit and enforcement-grade identity) or
+	// "credential" (anywhere; a per-run secret in the proxy URL, which is
+	// a claim, design §4.3). Empty means cgroup on Linux, credential
+	// elsewhere.
+	Identity string
+	// Dirs holds sockets, generated files and state; DefaultDirs() if
+	// empty. Paths below left empty are derived from it.
+	Dirs Dirs
+
 	BPFObjPath string
 	OutDir     string // finished timelines; DefaultRunOutDir if empty
 	SocketPath string // run API socket; DefaultRunAPISocket if empty
@@ -96,56 +107,104 @@ func NewNodeAgent() (*NodeAgent, error) {
 	return na, nil
 }
 
-// NewNodeAgentWithBPF creates a node agent that loads and attaches the
-// audit BPF program, scoped to the agents cgroup subtree, and writes one
-// timeline per run.
+// NewNodeAgentWithBPF creates a node agent; see NewNodeAgentFromOptions.
 func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
+	return NewNodeAgentFromOptions(opts)
+}
+
+// NewNodeAgentFromOptions creates a node agent. With cgroup identity it
+// loads and attaches the audit BPF program, scoped to the agents cgroup
+// subtree; with credential identity it needs no kernel features and no
+// root. Either way it writes one timeline per run.
+func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
+	if opts.Dirs == (Dirs{}) {
+		opts.Dirs = DefaultDirs()
+	}
+	switch opts.Identity {
+	case "":
+		opts.Identity = "credential"
+		if runtime.GOOS == "linux" {
+			opts.Identity = "cgroup"
+		}
+	case "cgroup":
+		if runtime.GOOS != "linux" {
+			return nil, fmt.Errorf("cgroup identity needs Linux; use credential identity")
+		}
+	case "credential":
+	default:
+		return nil, fmt.Errorf("identity must be cgroup or credential, not %q", opts.Identity)
+	}
+	credential := opts.Identity == "credential"
+	d := opts.Dirs
 	if opts.OutDir == "" {
-		opts.OutDir = DefaultRunOutDir
+		opts.OutDir = d.Runs()
 	}
 	if opts.SocketPath == "" {
-		opts.SocketPath = DefaultRunAPISocket
+		opts.SocketPath = d.APISocket()
 	}
 	if opts.PolicyDir == "" {
 		opts.PolicyDir = DefaultPolicyDir
 	}
 	// Load policy before touching the kernel or the socket: a policy that
 	// does not load is fatal, and failing here leaves nothing behind.
-	set, err := loadNodePolicy(opts.PolicyDir)
+	set, err := loadNodePolicy(opts.PolicyDir, !credential)
 	if err != nil {
 		return nil, err
 	}
-
-	cmgr, err := NewCgroupManager()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cgroup manager: %w", err)
-	}
-
-	agentsID, err := GetCgroupID(cmgr.GetAgentsDir())
-	if err != nil {
-		return nil, fmt.Errorf("failed to read agents cgroup id: %w", err)
-	}
-	level, err := cgroupLevel(cmgr.GetAgentsDir())
-	if err != nil {
-		return nil, err
+	if os.Geteuid() != 0 {
+		fmt.Printf("identity: %s; the node agent runs as uid %d, so the user can stop it or edit its files: policy is advisory\n",
+			opts.Identity, os.Geteuid())
+	} else {
+		fmt.Printf("identity: %s\n", opts.Identity)
 	}
 
 	registry := NewRunRegistry()
-	recorder, err := NewRunRecorder(cmgr.GetAgentsDir(), opts.OutDir, registry)
-	if err != nil {
-		return nil, err
+	httpEvents := make(chan AuditEvent, 1000)
+	var cmgr *CgroupManager
+	var audit *AgentAudit
+	var recorder *RunRecorder
+	agentsDir := ""
+	if credential {
+		if audit, err = NewAgentAudit(); err != nil {
+			return nil, err
+		}
+		if recorder, err = NewCredentialRunRecorder(opts.OutDir, registry); err != nil {
+			return nil, err
+		}
+	} else {
+		if cmgr, err = NewCgroupManager(); err != nil {
+			return nil, fmt.Errorf("failed to create cgroup manager: %w", err)
+		}
+		agentsDir = cmgr.GetAgentsDir()
+		agentsID, err := GetCgroupID(agentsDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read agents cgroup id: %w", err)
+		}
+		level, err := cgroupLevel(agentsDir)
+		if err != nil {
+			return nil, err
+		}
+		if recorder, err = NewRunRecorder(agentsDir, opts.OutDir, registry); err != nil {
+			return nil, err
+		}
+		if audit, err = NewAgentAuditWithBPF(opts.BPFObjPath, agentsDir, agentsID, level); err != nil {
+			return nil, fmt.Errorf("failed to create agent audit: %w", err)
+		}
 	}
-
-	audit, err := NewAgentAuditWithBPF(opts.BPFObjPath, cmgr.GetAgentsDir(), agentsID, level)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create agent audit: %w", err)
+	closeAudit := func() {
+		if audit.reader != nil {
+			audit.reader.Close()
+		}
 	}
 
 	// Listen only once BPF is attached, so no run can start unobserved.
 	api, err := NewRunAPIServer(opts.SocketPath, cmgr, registry)
 	if err != nil {
-		audit.reader.Close()
+		closeAudit()
 		return nil, err
+	}
+	if credential {
+		api.Events = httpEvents
 	}
 	if set != nil {
 		api.SetPolicy(set)
@@ -154,15 +213,14 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 	var xp *ExtProcServer
 	var proxyCA *NodeCA
 	var proxyTerminated []string
-	httpEvents := make(chan AuditEvent, 1000)
 	if opts.ProxyListen.IsValid() {
 		if opts.ExtProcSocket == "" {
-			opts.ExtProcSocket = DefaultExtProcSocket
+			opts.ExtProcSocket = d.ExtProcSocket()
 		}
 		if opts.EnvoyAdmin == "" {
 			// In a directory only Envoy can use, since Envoy creates the
 			// socket and must not be able to touch anything else here.
-			dir := "/run/clovisor/envoy"
+			dir := d.EnvoyDir()
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, err
 			}
@@ -174,17 +232,17 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 			opts.EnvoyAdmin = dir + "/admin.sock"
 		}
 		if opts.EnvoyConfig == "" {
-			opts.EnvoyConfig = "/run/clovisor/envoy.json"
+			opts.EnvoyConfig = d.EnvoyConfig()
 		}
 		if opts.CADir == "" {
-			opts.CADir = "/var/lib/clovisor/ca"
+			opts.CADir = d.CADir()
 		}
 		if opts.EnvoyUpstreamCA == "" {
-			opts.EnvoyUpstreamCA = "/etc/ssl/certs/ca-certificates.crt"
+			opts.EnvoyUpstreamCA = systemUpstreamCA()
 		}
 		ca, err := LoadOrCreateCA(opts.CADir)
 		if err == nil {
-			err = writeTrust(ca)
+			err = writeTrust(ca, d)
 		}
 		var terminated []string
 		if err == nil {
@@ -192,22 +250,22 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		}
 		if err != nil {
 			api.Close()
-			audit.reader.Close()
+			closeAudit()
 			return nil, fmt.Errorf("envoy bootstrap: %w", err)
 		}
 		proxyCA, proxyTerminated = ca, terminated
-		api.TrustBundle, api.NodeCACert = TrustBundlePath, NodeCACertPath
-		xp = NewExtProcServer(api, cmgr.GetAgentsDir(), httpEvents)
+		api.TrustBundle, api.NodeCACert = d.TrustBundle(), d.NodeCACert()
+		xp = NewExtProcServer(api, agentsDir, httpEvents)
 		if xp.Pins, err = openPins(&opts); err != nil {
 			api.Close()
-			audit.reader.Close()
+			closeAudit()
 			return nil, err
 		}
 		api.Pins = xp.Pins
 		xp.NonRunAllowed = opts.NonRunProxy
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
 			api.Close()
-			audit.reader.Close()
+			closeAudit()
 			return nil, err
 		}
 		api.ProxyURL = "http://" + opts.ProxyListen.String()
@@ -258,7 +316,7 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil)
 	if err != nil {
 		return err
 	}
@@ -290,7 +348,7 @@ var (
 // (local servers) and ext_proc (remote servers).
 func openPins(opts *NodeAgentOptions) (*PinStore, error) {
 	if opts.MCPPins == "" {
-		opts.MCPPins = "/var/lib/clovisor/mcp-pins.json"
+		opts.MCPPins = opts.Dirs.Pins()
 	}
 	if pinsOnce != nil && pinsPath == opts.MCPPins {
 		return pinsOnce, nil
@@ -303,21 +361,17 @@ func openPins(opts *NodeAgentOptions) (*PinStore, error) {
 	return ps, nil
 }
 
-// Where runs find the node's trust anchors.
-const (
-	TrustBundlePath = "/run/clovisor/ca-bundle.pem" // system roots plus the node CA
-	NodeCACertPath  = "/run/clovisor/ca.crt"
-)
-
-func writeTrust(ca *NodeCA) error {
+// writeTrust publishes the node's trust anchors for runs: the system
+// roots plus the node CA, and the node CA alone.
+func writeTrust(ca *NodeCA, d Dirs) error {
 	bundle, err := ca.TrustBundle()
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(TrustBundlePath, append(bundle, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(d.TrustBundle(), append(bundle, '\n'), 0o644); err != nil {
 		return err
 	}
-	return writeFileAtomic(NodeCACertPath, ca.CertPEM, 0o644)
+	return writeFileAtomic(d.NodeCACert(), ca.CertPEM, 0o644)
 }
 
 // terminationSet is the node-wide set of patterns whose rules need
@@ -380,12 +434,15 @@ func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]str
 }
 
 // loadNodePolicy loads dir, or returns nil if it does not exist.
-func loadNodePolicy(dir string) (*policy.Set, error) {
+// loadNodePolicy loads the policy directory. A root node agent requires
+// it to be root-owned. kernelIdentity says runs are known by cgroup,
+// which the receipt reports as enforcement-grade identity.
+func loadNodePolicy(dir string, kernelIdentity bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: policy.ExplicitProxy, Linux: true}, true)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: policy.ExplicitProxy, Linux: kernelIdentity}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}

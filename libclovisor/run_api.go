@@ -8,25 +8,24 @@
 package clovisor
 
 import (
-	"bufio"
-	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/clovisor/clovisor/libclovisor/policy"
-
-	"golang.org/x/sys/unix"
 )
 
 // DefaultRunAPISocket is where the node agent serves the run API.
@@ -98,6 +97,9 @@ type RunAPIResponse struct {
 	Clamp   string   `json:"clamp,omitempty"`
 	// mcp_register:
 	MCP []MCPRegistration `json:"mcp,omitempty"`
+	// create: "cgroup", or "credential" when the proxy knows the run by the
+	// secret in Proxy and the client starts the run's process itself.
+	Identity string `json:"identity,omitempty"`
 	// pins, pin_approve:
 	Pins     []PinEntry `json:"pins,omitempty"`
 	Approved []string   `json:"approved,omitempty"`
@@ -163,6 +165,13 @@ type RunAPIServer struct {
 	// TrustBundle and NodeCACert are handed to runs when the proxy
 	// terminates TLS.
 	TrustBundle, NodeCACert string
+	// Events receives run start and end with credential identity, where
+	// no cgroup mkdir or rmdir reports them.
+	Events chan<- AuditEvent
+
+	nextCg uint64            // credential identity: synthetic run ids
+	tokens map[string]string // credential identity: token -> run id
+	tokOf  map[string]string // run id -> token
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
@@ -228,13 +237,30 @@ func (s *RunAPIServer) RunFor(cgroupID uint64) (runID string, runCg uint64, eff 
 // reapInterval is how often orphaned run cgroups are checked.
 const reapInterval = 5 * time.Second
 
+// CredentialRunsDir is the virtual agents directory under which runs
+// with credential identity are recorded: they have no cgroup.
+const CredentialRunsDir = "/clovisor-credential-runs"
+
+// credentialCgBase marks synthetic run ids, which no cgroup id reaches.
+const credentialCgBase = uint64(1) << 62
+
 // NewRunAPIServer listens on path. The socket is world-connectable:
 // every request is checked against the caller's kernel credentials, and
 // a caller can only ever confine its own children.
+//
+// With cm nil, runs have credential identity (design §4.3): no cgroup,
+// and the proxy knows a run by the secret in its proxy URL. That is a
+// claim, not an enforcement-grade identity: any process holding the
+// secret speaks for the run, and one that does not use the proxy is not
+// governed at all.
 func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIServer, error) {
-	rel, err := filepath.Rel(CgroupV2Root, cm.GetAgentsDir())
-	if err != nil {
-		return nil, err
+	rel := ""
+	if cm != nil {
+		r, err := filepath.Rel(CgroupV2Root, cm.GetAgentsDir())
+		if err != nil {
+			return nil, err
+		}
+		rel = "/" + r
 	}
 	// The directory must be traversable by everyone; it may predate us
 	// with a tighter mode, which MkdirAll would leave alone.
@@ -247,7 +273,7 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	ln, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
+	ln, err := net.ListenUnix(apiNet, &net.UnixAddr{Name: path, Net: apiNet})
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", path, err)
 	}
@@ -258,7 +284,7 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 	return &RunAPIServer{
 		cm:        cm,
 		reg:       reg,
-		agentsRel: "/" + rel,
+		agentsRel: rel,
 		ln:        ln,
 		path:      path,
 		conns:     map[*net.UnixConn]struct{}{},
@@ -267,6 +293,9 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		byCg:      map[uint64]*boundRun{},
 		runByCg:   map[uint64]string{},
 		runCg:     map[string]uint64{},
+		tokens:    map[string]string{},
+		tokOf:     map[string]string{},
+		nextCg:    credentialCgBase,
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -275,6 +304,9 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 // runs left behind by an earlier node agent, or by a client whose end
 // failed. Removing the cgroup is what finalizes the run's timeline.
 func (s *RunAPIServer) reap() {
+	if s.cm == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, cg := range s.cm.ListActiveCgroups() {
@@ -350,92 +382,57 @@ func (s *RunAPIServer) Close() {
 	os.Remove(s.path)
 }
 
-func peerCred(c *net.UnixConn) (*unix.Ucred, error) {
-	raw, err := c.SyscallConn()
-	if err != nil {
-		return nil, err
+// CredentialIdentity reports whether runs are known by proxy credential
+// rather than by cgroup.
+func (s *RunAPIServer) CredentialIdentity() bool { return s.cm == nil }
+
+// RunForCredential returns the live run a proxy credential (user
+// run-<id>, password the run's token) names.
+func (s *RunAPIServer) RunForCredential(user, token string) (runID string, runCg uint64, eff *policy.Effective, ok bool) {
+	if token == "" {
+		return "", 0, nil, false
 	}
-	var cred *unix.Ucred
-	var serr error
-	if err := raw.Control(func(fd uintptr) {
-		cred, serr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); err != nil {
-		return nil, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, found := s.tokens[token]
+	if !found || subtle.ConstantTimeCompare([]byte(user), []byte(RunPrefix+id)) != 1 {
+		return "", 0, nil, false
 	}
-	return cred, serr
+	cg := s.runCg[id]
+	if b, ok := s.byCg[cg]; ok {
+		eff = b.eff
+	}
+	return id, cg, eff, true
 }
 
-// procCgroup returns a process's cgroup v2 path, e.g. /user.slice/x.scope.
-func procCgroup(pid int) (string, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			return strings.TrimPrefix(line, "0::"), nil
-		}
-	}
-	return "", fmt.Errorf("pid %d has no cgroup v2 membership", pid)
+// TokenFor returns a live run's credential token.
+func (s *RunAPIServer) TokenFor(runID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tokOf[runID]
 }
 
-// procStatus returns the parent pid and real uid of a process.
-func procStatus(pid int) (ppid int, uid int, err error) {
-	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0, 0, err
+// emit sends a run lifecycle event to the recorder. It blocks rather
+// than drop: a lost start or end would lose the run's timeline.
+func (s *RunAPIServer) emit(typ int, runID string, cg uint64) {
+	if s.Events == nil {
+		return
 	}
-	defer f.Close()
-	ppid, uid = -1, -1
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		k, v, ok := strings.Cut(sc.Text(), ":")
-		if !ok {
-			continue
-		}
-		fields := strings.Fields(v)
-		if len(fields) == 0 {
-			continue
-		}
-		switch k {
-		case "PPid":
-			ppid, _ = strconv.Atoi(fields[0])
-		case "Uid":
-			uid, _ = strconv.Atoi(fields[0])
-		}
-	}
-	if ppid < 0 || uid < 0 {
-		return 0, 0, fmt.Errorf("cannot parse /proc/%d/status", pid)
-	}
-	return ppid, uid, sc.Err()
-}
-
-// pidfdPid returns the pid a pidfd refers to.
-func pidfdPid(fd int) (int, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", fd))
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if v, ok := strings.CutPrefix(line, "Pid:"); ok {
-			pid, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || pid <= 0 {
-				return 0, fmt.Errorf("fd %d is not a live pidfd", fd)
-			}
-			return pid, nil
-		}
-	}
-	return 0, fmt.Errorf("fd %d is not a pidfd", fd)
+	s.Events <- AuditEvent{Type: typ, Timestamp: time.Now(), CgroupID: cg, RunCgroupID: cg,
+		Data: RunData{CgroupPath: CredentialRunsDir + "/" + RunPrefix + runID}}
 }
 
 func (s *RunAPIServer) inAgents(cg string) bool {
+	if s.agentsRel == "" {
+		return false
+	}
 	return cg == s.agentsRel || strings.HasPrefix(cg, s.agentsRel+"/")
 }
 
 type apiConn struct {
 	s        *RunAPIServer
 	c        *net.UnixConn
-	cred     *unix.Ucred
+	cred     *peerInfo
 	runID    string
 	runPath  string
 	cgID     uint64
@@ -453,14 +450,11 @@ func (s *RunAPIServer) handle(c *net.UnixConn) {
 	ac := &apiConn{s: s, c: c, cred: cred}
 	defer ac.abandon()
 
-	buf := make([]byte, maxAPIMessage)
-	oob := make([]byte, unix.CmsgSpace(4*4))
+	mc := newMsgConn(c)
 	for {
-		n, oobn, flags, _, err := c.ReadMsgUnix(buf, oob)
-		fds := parseFDs(oob[:oobn])
-		if err != nil || n == 0 {
-			closeFDs(fds)
-			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		msg, fds, err := mc.recv()
+		if err != nil && !errors.Is(err, errMsgTooLarge) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("run api: read: %v", err)
 			}
 			return
@@ -468,10 +462,10 @@ func (s *RunAPIServer) handle(c *net.UnixConn) {
 		var resp RunAPIResponse
 		var req RunAPIRequest
 		switch {
-		case flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0:
+		case err != nil:
 			resp.Error = "message too large"
 		default:
-			if err := json.Unmarshal(buf[:n], &req); err != nil {
+			if err := json.Unmarshal(msg, &req); err != nil {
 				resp.Error = "bad request: " + err.Error()
 			} else {
 				resp = ac.dispatch(req, fds)
@@ -480,35 +474,12 @@ func (s *RunAPIServer) handle(c *net.UnixConn) {
 		}
 		closeFDs(fds)
 		out, _ := json.Marshal(resp)
-		if _, err := c.Write(out); err != nil {
+		if err := mc.send(out); err != nil {
 			return
 		}
 		if req.Op == "end" && resp.OK {
 			return
 		}
-	}
-}
-
-func parseFDs(oob []byte) []int {
-	if len(oob) == 0 {
-		return nil
-	}
-	msgs, err := unix.ParseSocketControlMessage(oob)
-	if err != nil {
-		return nil
-	}
-	var fds []int
-	for _, m := range msgs {
-		if got, err := unix.ParseUnixRights(&m); err == nil {
-			fds = append(fds, got...)
-		}
-	}
-	return fds
-}
-
-func closeFDs(fds []int) {
-	for _, fd := range fds {
-		unix.Close(fd)
 	}
 }
 
@@ -522,6 +493,9 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 	case "create":
 		return ac.create(req)
 	case "attach":
+		if ac.s.cm == nil {
+			return fail("runs have credential identity here: there is no cgroup to attach to, start the process with the run's proxy settings")
+		}
 		if len(fds) != 1 {
 			return fail("attach needs exactly one pidfd, got %d fds", len(fds))
 		}
@@ -550,13 +524,18 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	}
 	// A run must not be able to start another run: that would let a
 	// confined process move its children out from under its own policy.
-	// Nested runs belong to sub-agent attenuation (design §7.8).
-	cg, err := procCgroup(int(ac.cred.Pid))
-	if err != nil {
-		return fail("cannot read caller's cgroup: %v", err)
-	}
-	if ac.s.inAgents(cg) {
-		return fail("caller is inside a run (%s); runs cannot create runs", cg)
+	// Nested runs belong to sub-agent attenuation (design §7.8). With
+	// credential identity there is no cgroup to check, so a run can start
+	// another run within its user's ceiling, escaping its own clamps; the
+	// receipt says identity is a claim there.
+	if ac.s.cm != nil {
+		cg, err := procCgroup(int(ac.cred.Pid))
+		if err != nil {
+			return fail("cannot read caller's cgroup: %v", err)
+		}
+		if ac.s.inAgents(cg) {
+			return fail("caller is inside a run (%s); runs cannot create runs", cg)
+		}
 	}
 
 	// Bind the profile before the cgroup exists, so that no process ever
@@ -583,7 +562,20 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		return fail("%v", err)
 	}
 	ac.s.mu.Lock()
-	path, id, err := ac.s.cm.CreateRunCgroup(runID)
+	var path, token string
+	var id uint64
+	if ac.s.cm != nil {
+		path, id, err = ac.s.cm.CreateRunCgroup(runID)
+	} else {
+		ac.s.nextCg++
+		id = ac.s.nextCg
+		var t [16]byte
+		if _, err = rand.Read(t[:]); err == nil {
+			token = hex.EncodeToString(t[:])
+			ac.s.tokens[token] = runID
+			ac.s.tokOf[runID] = token
+		}
+	}
 	if err == nil {
 		ac.s.active[runID] = true
 		ac.s.runByCg[id] = runID
@@ -608,47 +600,36 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		StartedAt: time.Now().UTC(),
 		Policy:    rp,
 	})
+	if ac.s.cm == nil {
+		ac.s.emit(EventRunStart, runID, id)
+	}
 	granted := "unprofiled"
 	if rp != nil {
 		granted = rp.Layers[0].Profile + "@" + rp.Layers[0].Version + " (" + rp.Reason + ")"
 	}
 	log.Printf("run api: run %s created for uid %d pid %d: %s", runID, ac.cred.Uid, ac.cred.Pid, granted)
-	return RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL,
-		TrustBundle: ac.s.TrustBundle, NodeCACert: ac.s.NodeCACert}
+	resp := RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL,
+		TrustBundle: ac.s.TrustBundle, NodeCACert: ac.s.NodeCACert, Identity: "cgroup"}
+	if ac.s.cm == nil {
+		resp.CgroupID, resp.Identity = 0, "credential"
+		if u, err := url.Parse(ac.s.ProxyURL); err == nil && ac.s.ProxyURL != "" {
+			u.User = url.UserPassword(RunPrefix+runID, token)
+			resp.Proxy = u.String()
+		}
+	}
+	return resp
 }
 
 // caller is the requester's platform identity: uid from SO_PEERCRED,
 // groups from the kernel's view of the requesting process.
 func (ac *apiConn) caller() (policy.Caller, error) {
 	c := policy.Caller{UID: int(ac.cred.Uid), GIDs: []int{int(ac.cred.Gid)}}
-	groups, err := procGroups(int(ac.cred.Pid))
+	groups, err := ac.cred.groups()
 	if err != nil {
 		return c, fmt.Errorf("cannot read caller's groups: %v", err)
 	}
 	c.GIDs = append(c.GIDs, groups...)
 	return c, nil
-}
-
-// procGroups returns a process's supplementary groups.
-func procGroups(pid int) ([]int, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return nil, err
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if v, ok := strings.CutPrefix(line, "Groups:"); ok {
-			var gs []int
-			for _, f := range strings.Fields(v) {
-				g, err := strconv.Atoi(f)
-				if err != nil {
-					return nil, err
-				}
-				gs = append(gs, g)
-			}
-			return gs, nil
-		}
-	}
-	return nil, nil
 }
 
 func layerRecord(l policy.Layer, at time.Time) PolicyLayer {
@@ -707,9 +688,6 @@ func (ac *apiConn) mcpRegister(req RunAPIRequest) RunAPIResponse {
 	return RunAPIResponse{OK: true, RunID: ac.runID, MCP: ac.s.MCP.Register(run, req.MCPServers)}
 }
 
-// clamp layers a profile onto a live run, or revokes its egress. A layer
-// can only remove permissions, so the run's owner may do it as well as
-// root: it is the incident-response lever of §5.6.
 // pins lists tool pins, or approves changed definitions. Pins are node
 // state that governs every run, so only root outside any run may touch
 // them.
@@ -717,8 +695,10 @@ func (ac *apiConn) pins(req RunAPIRequest) RunAPIResponse {
 	if ac.cred.Uid != 0 {
 		return fail("tool pins are node state: run as root")
 	}
-	if cg, err := procCgroup(int(ac.cred.Pid)); err != nil || ac.s.inAgents(cg) {
-		return fail("tool pins cannot be reviewed from inside a run")
+	if ac.s.cm != nil {
+		if cg, err := procCgroup(int(ac.cred.Pid)); err != nil || ac.s.inAgents(cg) {
+			return fail("tool pins cannot be reviewed from inside a run")
+		}
 	}
 	if ac.s.Pins == nil {
 		return fail("the node agent has no MCP pin store (no proxy and no MCP gateway)")
@@ -760,6 +740,9 @@ func (ac *apiConn) pins(req RunAPIRequest) RunAPIResponse {
 	return resp
 }
 
+// clamp layers a profile onto a live run, or revokes its egress. A layer
+// can only remove permissions, so the run's owner may do it as well as
+// root: it is the incident-response lever of §5.6.
 func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 	runID := strings.TrimPrefix(req.RunID, RunPrefix)
 	var layer policy.Layer
@@ -807,48 +790,6 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 	return RunAPIResponse{OK: true, RunID: runID, Policy: rp}
 }
 
-// attach moves the process behind pidfd into the run. The process must be
-// a direct child of the caller, have the caller's real uid, and not
-// already be in a run.
-func (ac *apiConn) attach(pidfd int) RunAPIResponse {
-	if ac.runID == "" {
-		return fail("no run: send create first")
-	}
-	if ac.attached {
-		return fail("run %s already has its process", ac.runID)
-	}
-	pid, err := pidfdPid(pidfd)
-	if err != nil {
-		return fail("%v", err)
-	}
-	ppid, uid, err := procStatus(pid)
-	if err != nil {
-		return fail("%v", err)
-	}
-	if ppid != int(ac.cred.Pid) {
-		return fail("pid %d is not a child of the caller", pid)
-	}
-	if uid != int(ac.cred.Uid) {
-		return fail("pid %d does not belong to uid %d", pid, ac.cred.Uid)
-	}
-	if cg, err := procCgroup(pid); err != nil || ac.s.inAgents(cg) {
-		return fail("pid %d is already in a run, or its cgroup is unreadable", pid)
-	}
-
-	if err := os.WriteFile(filepath.Join(ac.runPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
-		return fail("failed to move pid %d into run: %v", pid, err)
-	}
-	// The pid cannot have been reused between the checks and the move
-	// while the pidfd's process is alive: an unreaped process keeps its
-	// pid. Confirm it still is.
-	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
-		log.Printf("run api: run %s: process %d exited during attach; the pid may have been reused", ac.runID, pid)
-		return fail("process exited during attach")
-	}
-	ac.attached = true
-	return RunAPIResponse{OK: true, RunID: ac.runID}
-}
-
 func (ac *apiConn) end(exitCode *int) RunAPIResponse {
 	if ac.runID == "" {
 		return fail("no run")
@@ -887,10 +828,20 @@ func (ac *apiConn) finish(exitCode *int) {
 	if ac.s.MCP != nil {
 		ac.s.MCP.EndRun(ac.runID)
 	}
-	if err := ac.s.cm.DestroyRunCgroup(ac.runID); err != nil {
-		log.Printf("run api: run %s: %v", ac.runID, err)
+	if ac.s.cm != nil {
+		if err := ac.s.cm.DestroyRunCgroup(ac.runID); err != nil {
+			log.Printf("run api: run %s: %v", ac.runID, err)
+		}
+	} else {
+		// No rmdir will report the end: the metadata is in place, so
+		// the recorder can finish the timeline.
+		ac.s.emit(EventRunEnd, ac.runID, ac.cgID)
 	}
 	ac.s.mu.Lock()
+	if t := ac.s.tokOf[ac.runID]; t != "" {
+		delete(ac.s.tokens, t)
+		delete(ac.s.tokOf, ac.runID)
+	}
 	delete(ac.s.active, ac.runID)
 	if b, ok := ac.s.bound[ac.runID]; ok {
 		for cg, bb := range ac.s.byCg {
@@ -912,16 +863,17 @@ func (ac *apiConn) finish(exitCode *int) {
 
 // RunAPIClient is the client side of the run API.
 type RunAPIClient struct {
-	c *net.UnixConn
+	c  *net.UnixConn
+	mc *msgConn
 }
 
 // DialRunAPI connects to the node agent.
 func DialRunAPI(path string) (*RunAPIClient, error) {
-	c, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
+	c, err := net.DialUnix(apiNet, nil, &net.UnixAddr{Name: path, Net: apiNet})
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach the node agent at %s (is it running?): %w", path, err)
 	}
-	return &RunAPIClient{c: c}, nil
+	return &RunAPIClient{c: c, mc: newMsgConn(c)}, nil
 }
 
 // Close closes the connection. If the run has not ended, the node agent
@@ -934,19 +886,14 @@ func (rc *RunAPIClient) call(req RunAPIRequest, fds ...int) (RunAPIResponse, err
 	if err != nil {
 		return resp, err
 	}
-	var oob []byte
-	if len(fds) > 0 {
-		oob = unix.UnixRights(fds...)
-	}
-	if _, _, err := rc.c.WriteMsgUnix(msg, oob, nil); err != nil {
+	if err := rc.mc.send(msg, fds...); err != nil {
 		return resp, err
 	}
-	buf := make([]byte, maxAPIMessage)
-	n, err := rc.c.Read(buf)
+	reply, _, err := rc.mc.recv()
 	if err != nil {
 		return resp, err
 	}
-	if err := json.NewDecoder(bytes.NewReader(buf[:n])).Decode(&resp); err != nil {
+	if err := json.Unmarshal(reply, &resp); err != nil {
 		return resp, err
 	}
 	if !resp.OK {

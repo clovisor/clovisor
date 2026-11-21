@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check format doc
+.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration format doc
 
 # Compiler and flags
 CC = clang
@@ -57,7 +57,8 @@ run: node-agent
 # Run the node agent with the explicit proxy (milestone 2.3), then Envoy
 # from the bootstrap it writes. Envoy runs as uid 101 in the image.
 PROXY_LISTEN ?= 127.0.0.1:18000
-ENVOY_IMAGE ?= envoyproxy/envoy:v1.34-latest
+# The Envoy release the integration tests pin.
+ENVOY_IMAGE ?= envoyproxy/envoy:v1.34.14
 
 run-proxy: node-agent
 	sudo bin/node-agent -bpf $(BPF_OBJ) -proxy-listen $(PROXY_LISTEN)
@@ -82,7 +83,18 @@ format:
 # (legacy, bcc-tagged), libclovisor/libproto (Go plugin sources, built one
 # file at a time) and k8s-ctlr (stale client-go API, does not build).
 GO_PKGS = ./cmd/... ./libclovisor ./libclovisor/policy
-check:
+check: cross
 	$(GO) vet $(GO_PKGS)
 	$(GO) build $(GO_PKGS)
 	$(GO) test $(GO_PKGS)
+
+# End-to-end tests in Docker against a pinned Envoy (design 2.7). Set
+# DOCKER="sudo docker" where the docker CLI needs it.
+integration:
+	CLOVISOR_IT_ENVOY_IMAGE=$(ENVOY_IMAGE) $(GO) test -tags integration -count=1 -v ./integration/
+
+# The portable pieces (agentctl, the node agent with credential identity,
+# ext_proc, the MCP gateway) must keep building without Linux (design §4.3).
+cross:
+	GOOS=darwin GOARCH=arm64 $(GO) vet $(GO_PKGS)
+	GOOS=darwin GOARCH=amd64 $(GO) build $(GO_PKGS)

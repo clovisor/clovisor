@@ -8,54 +8,8 @@
 package clovisor
 
 import (
-	"os"
-	"os/exec"
-	"strings"
-	"syscall"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
-
-func TestProcHelpers(t *testing.T) {
-	ppid, uid, err := procStatus(os.Getpid())
-	if err != nil || ppid != os.Getppid() || uid != os.Getuid() {
-		t.Fatalf("procStatus = %d, %d, %v; want %d, %d", ppid, uid, err, os.Getppid(), os.Getuid())
-	}
-	cg, err := procCgroup(os.Getpid())
-	if err != nil || !strings.HasPrefix(cg, "/") {
-		t.Fatalf("procCgroup = %q, %v", cg, err)
-	}
-}
-
-func TestPidfdPid(t *testing.T) {
-	pidfd := -1
-	cmd := exec.Command("sleep", "5")
-	cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &pidfd}
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start child: %v", err)
-	}
-	defer func() { cmd.Process.Kill(); cmd.Wait() }()
-	defer unix.Close(pidfd)
-
-	pid, err := pidfdPid(pidfd)
-	if err != nil || pid != cmd.Process.Pid {
-		t.Fatalf("pidfdPid = %d, %v; want %d", pid, err, cmd.Process.Pid)
-	}
-	ppid, _, err := procStatus(pid)
-	if err != nil || ppid != os.Getpid() {
-		t.Fatalf("child ppid = %d, %v", ppid, err)
-	}
-
-	f, err := os.Open("/dev/null")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if _, err := pidfdPid(int(f.Fd())); err == nil {
-		t.Fatal("a regular file was accepted as a pidfd")
-	}
-}
 
 func TestRunRegistry(t *testing.T) {
 	r := NewRunRegistry()

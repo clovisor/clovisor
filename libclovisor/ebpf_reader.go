@@ -312,40 +312,6 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 	return ev, nil
 }
 
-// cString returns b up to its first NUL.
-func cString(b []byte) string {
-	if i := bytes.IndexByte(b, 0); i >= 0 {
-		b = b[:i]
-	}
-	return string(b)
-}
-
-// splitArgs splits a NUL-separated argv block. A block cut off at the
-// capture limit keeps its partial last argument.
-func splitArgs(b []byte) []string {
-	b = bytes.TrimRight(b, "\x00")
-	if len(b) == 0 {
-		return nil
-	}
-	parts := bytes.Split(b, []byte{0})
-	args := make([]string, len(parts))
-	for i, p := range parts {
-		args[i] = string(p)
-	}
-	return args
-}
-
-func protoName(p uint32) string {
-	switch p {
-	case unix.IPPROTO_TCP:
-		return "TCP"
-	case unix.IPPROTO_UDP:
-		return "UDP"
-	default:
-		return fmt.Sprintf("proto-%d", p)
-	}
-}
-
 // Stop detaches the programs and stops the read loop. Safe to call more
 // than once.
 func (r *EBPFReader) Stop() error {

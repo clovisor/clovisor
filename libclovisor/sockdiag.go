@@ -5,11 +5,12 @@
 // which accompanies this distribution, and is available at
 // http://www.apache.org/licenses/LICENSE-2.0
 
+//go:build linux
+
 package clovisor
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net/netip"
 	"syscall"
@@ -22,9 +23,6 @@ const (
 	inetDiagCgroupID = 21
 	inetDiagNoCookie = ^uint32(0)
 )
-
-// ErrSockNotFound means no socket has that 4-tuple.
-var ErrSockNotFound = errors.New("socket not found")
 
 // SockCgroup returns the cgroup id of the TCP socket bound to local and
 // connected to remote, as seen from that socket's side, via

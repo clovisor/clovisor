@@ -1,0 +1,24 @@
+kind: AgentProfile
+metadata: { name: it }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-read
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed", "/headers", "/repo.git/*"] }
+        action: allow
+      - name: no-secret
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "The secret endpoint is off limits for this agent."
+      - { name: mcp, to: { fqdn: ["mcp.test"], ports: [443] }, action: allow }
+  mcp:
+    default: deny
+    servers:
+      - name: origin-mcp
+        match: { fqdn: "mcp.test" }
+        tools: { allow: ["search", "get_*"], deny: ["delete_*"] }
+        pin_tool_definitions: true
