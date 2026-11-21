@@ -83,6 +83,9 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			"grpc_service": obj{"envoy_grpc": obj{"cluster_name": "ext_proc"}, "timeout": "2s"},
 			// Fail closed: without a decision, nothing passes.
 			"failure_mode_allow": false,
+			// Lets ext_proc turn on body processing for the streams that
+			// need it (remote MCP) and only those.
+			"allow_mode_override": true,
 			"request_attributes": arr{"source.address", "source.port", "destination.address", "destination.port", "xds.route_name"},
 			"processing_mode": obj{
 				"request_header_mode":  "SEND",

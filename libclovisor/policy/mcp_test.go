@@ -89,7 +89,47 @@ spec: { mode: enforce, egress: { default: deny, rules: [] } }
 	if d := e.DecideMCP(MCPRequest{Kind: "tool", Argv: fs, Tool: "rm_rf"}); !d.Allowed() {
 		t.Errorf("egress-only layer decided MCP: %+v", d)
 	}
-	if !grant.PinsToolDefinitions(fs) || grant.PinsToolDefinitions([]string{"mcp-anything"}) {
+	if !grant.PinsToolDefinitions(fs, "") || grant.PinsToolDefinitions([]string{"mcp-anything"}, "") {
 		t.Error("pinning lookup wrong")
+	}
+}
+
+func TestDecideRemoteMCP(t *testing.T) {
+	c := mustCompile(t, Options{Linux: true}, `
+kind: AgentProfile
+metadata: { name: remote }
+spec:
+  mode: enforce
+  egress: { default: deny, rules: [ { name: gh, to: { fqdn: ["mcp.github.internal"] }, action: allow } ] }
+  mcp:
+    default: deny
+    servers:
+      - name: github
+        match: { fqdn: "mcp.github.internal" }
+        tools: { allow: ["search_*"], deny: ["delete_*"] }
+        pin_tool_definitions: true
+      - name: local
+        match: { stdio: "mcp.github.internal" }
+`)
+	e := &Effective{Layers: []Layer{{Profile: c.Profile("remote")}}}
+	if !e.GovernsRemoteMCP("MCP.GitHub.internal.") || e.GovernsRemoteMCP("api.github.com") {
+		t.Error("GovernsRemoteMCP wrong")
+	}
+	if d := e.DecideMCP(MCPRequest{Kind: "tool", Host: "mcp.github.internal", Tool: "search_code"}); !d.Allowed() || d.Rule != "github" {
+		t.Errorf("remote allow: %+v", d)
+	}
+	if d := e.DecideMCP(MCPRequest{Kind: "tool", Host: "mcp.github.internal", Tool: "delete_repo"}); d.Allowed() {
+		t.Errorf("remote deny: %+v", d)
+	}
+	// A host no rule names is left to egress rules: MCP abstains.
+	if d := e.DecideMCP(MCPRequest{Kind: "tool", Host: "elsewhere.example", Tool: "delete_repo"}); !d.Allowed() {
+		t.Errorf("unnamed host: %+v", d)
+	}
+	// fqdn rules never match a stdio command line, and vice versa.
+	if r := c.Profile("remote").MCPServerRule([]string{"mcp.github.internal"}, ""); r != "local" {
+		t.Errorf("stdio match picked %q", r)
+	}
+	if !e.PinsToolDefinitions(nil, "mcp.github.internal") {
+		t.Error("remote pinning lookup")
 	}
 }

@@ -30,37 +30,44 @@ func matchStdio(pattern string, argv []string) bool {
 	return false
 }
 
-// mcpServerFor returns the first server rule whose stdio match names
-// argv, or nil.
-func mcpServerFor(m *MCP, argv []string) *MCPServer {
+// mcpServerFor returns the first server rule naming the server: by
+// match.fqdn for a remote server (host set), by match.stdio for a local
+// one (argv set); or nil.
+func mcpServerFor(m *MCP, argv []string, host string) *MCPServer {
+	host = NormalizeHost(host)
 	for i := range m.Servers {
 		s := &m.Servers[i]
-		if s.Match.Stdio != "" && matchStdio(s.Match.Stdio, argv) {
+		switch {
+		case host != "" && s.Match.FQDN != "":
+			if hp, err := parseHost(s.Match.FQDN); err == nil && hp.match(host) {
+				return s
+			}
+		case host == "" && s.Match.Stdio != "" && matchStdio(s.Match.Stdio, argv):
 			return s
 		}
 	}
 	return nil
 }
 
-// MCPServerRule returns the name of the server rule that governs a
-// stdio command line in this profile, or "".
-func (cp *CompiledProfile) MCPServerRule(argv []string) string {
+// MCPServerRule returns the name of the server rule that governs a server
+// (a stdio command line, or a remote host) in this profile, or "".
+func (cp *CompiledProfile) MCPServerRule(argv []string, host string) string {
 	if cp.mcp == nil {
 		return ""
 	}
-	if s := mcpServerFor(cp.mcp, argv); s != nil {
+	if s := mcpServerFor(cp.mcp, argv, host); s != nil {
 		return s.Name
 	}
 	return ""
 }
 
-// PinsToolDefinitions reports whether the server rule governing argv
+// PinsToolDefinitions reports whether the server rule governing a server
 // asks for tools/list pinning.
-func (cp *CompiledProfile) PinsToolDefinitions(argv []string) bool {
+func (cp *CompiledProfile) PinsToolDefinitions(argv []string, host string) bool {
 	if cp.mcp == nil {
 		return false
 	}
-	s := mcpServerFor(cp.mcp, argv)
+	s := mcpServerFor(cp.mcp, argv, host)
 	return s != nil && s.PinToolDefinitions
 }
 
@@ -69,7 +76,8 @@ func (cp *CompiledProfile) PinsToolDefinitions(argv []string) bool {
 type MCPRequest struct {
 	Kind   string
 	Server string   // the harness's name for the server, for messages
-	Argv   []string // its command line, which the policy matches
+	Argv   []string // a local server's command line, which match.stdio matches
+	Host   string   // a remote server's hostname, which match.fqdn matches
 	Tool   string
 	URI    string
 }
@@ -79,7 +87,12 @@ func (cp *CompiledProfile) decideMCP(r MCPRequest) (Decision, bool) {
 	if m == nil {
 		return Decision{}, false // abstain
 	}
-	s := mcpServerFor(m, r.Argv)
+	s := mcpServerFor(m, r.Argv, r.Host)
+	if r.Host != "" && s == nil {
+		// A host no server rule names is not MCP to this profile: egress
+		// rules alone govern it, so the layer abstains.
+		return Decision{}, false
+	}
 	if r.Kind == "sampling" {
 		if m.Sampling != nil && m.Sampling.Action == ActionAllow {
 			return Decision{Action: ActionAllow, Rule: "sampling"}, true
@@ -145,9 +158,20 @@ func (e *Effective) DecideMCP(r MCPRequest) EffectiveDecision {
 }
 
 // PinsToolDefinitions reports whether any layer asks for pinning.
-func (e *Effective) PinsToolDefinitions(argv []string) bool {
+func (e *Effective) PinsToolDefinitions(argv []string, host string) bool {
 	for _, l := range e.Layers {
-		if l.Profile.PinsToolDefinitions(argv) {
+		if l.Profile.PinsToolDefinitions(argv, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// GovernsRemoteMCP reports whether any layer names host as a remote MCP
+// server, i.e. whether its requests need JSON-RPC inspection.
+func (e *Effective) GovernsRemoteMCP(host string) bool {
+	for _, l := range e.Layers {
+		if l.Profile.MCPServerRule(nil, host) != "" {
 			return true
 		}
 	}

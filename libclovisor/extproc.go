@@ -72,6 +72,10 @@ type ExtProcServer struct {
 	grpc *grpc.Server
 	ln   net.Listener
 	path string
+
+	// Pins is the tool-definition pin store, shared with the gateway.
+	Pins  *PinStore
+	drift mcpDrift
 }
 
 type resolved struct {
@@ -167,6 +171,7 @@ func (s *ExtProcServer) Close() {
 
 // Process handles one HTTP stream from Envoy.
 func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
+	var mcp *remoteMCP // set when this stream's JSON-RPC is inspected
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -178,13 +183,25 @@ func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer
 		var resp *extprocv3.ProcessingResponse
 		switch r := req.GetRequest().(type) {
 		case *extprocv3.ProcessingRequest_RequestHeaders:
-			resp = s.onHeaders(stream.Context(), req, r.RequestHeaders)
+			resp, mcp = s.onHeaders(stream.Context(), req, r.RequestHeaders)
 		case *extprocv3.ProcessingRequest_RequestBody:
-			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestBody{RequestBody: &extprocv3.BodyResponse{}}}
+			if mcp != nil {
+				resp = s.onMCPRequestBody(mcp, r.RequestBody.GetBody())
+			} else {
+				resp = continueBody()
+			}
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
-			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extprocv3.HeadersResponse{}}}
+			if mcp != nil {
+				resp = s.onMCPResponseHeaders(mcp, r.ResponseHeaders)
+			} else {
+				resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extprocv3.HeadersResponse{}}}
+			}
 		case *extprocv3.ProcessingRequest_ResponseBody:
-			resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: &extprocv3.BodyResponse{}}}
+			if mcp != nil {
+				resp = s.onMCPResponseBody(mcp, r.ResponseBody.GetBody(), r.ResponseBody.GetEndOfStream())
+			} else {
+				resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: &extprocv3.BodyResponse{}}}
+			}
 		default:
 			continue
 		}
@@ -298,7 +315,22 @@ func (s *ExtProcServer) guard(ctx context.Context, host string, ip netip.Addr) s
 	return ""
 }
 
-func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) *extprocv3.ProcessingResponse {
+func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *remoteMCP) {
+	resp, decided := s.decideHeaders(ctx, req, h)
+	m := decided.mcp
+	if m != nil && resp.GetImmediateResponse() == nil {
+		resp.ModeOverride = mcpModes
+		return resp, m
+	}
+	return resp, nil
+}
+
+// headerOutcome carries what decideHeaders learned beyond the response.
+type headerOutcome struct {
+	mcp *remoteMCP
+}
+
+func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, headerOutcome) {
 	hm := h.GetHeaders()
 	method := headerValue(hm, ":method")
 	authority := headerValue(hm, ":authority")
@@ -322,7 +354,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	if err != nil || host == "" {
 		d.Host, d.Decision, d.Reason = authority, policy.ActionDeny, "bad authority"
 		d.Message = "The proxy could not parse the destination " + strconv.Quote(authority) + "."
-		return s.deny(d, "")
+		return s.deny(d, ""), headerOutcome{}
 	}
 	d.Host, d.Port = host, port
 	ip, _ := netip.ParseAddr(host)
@@ -348,7 +380,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "host mismatch"
 			d.Message = fmt.Sprintf("The request's Host %s does not match the tunnel's destination %s.",
 				net.JoinHostPort(host, strconv.Itoa(int(port))), headerValue(hm, hdrConnect))
-			return s.deny(d, "")
+			return s.deny(d, ""), headerOutcome{}
 		}
 	} else {
 		src, err1 = attrAddrPort(req, "source.address", "source.port")
@@ -372,18 +404,18 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	case err != nil:
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "unidentified client"
 		d.Message = "The proxy could not identify which run this connection belongs to."
-		return s.deny(d, "")
+		return s.deny(d, ""), headerOutcome{}
 	case !isRun && !s.NonRunAllowed:
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "not a run"
 		d.Message = "This proxy serves governed agent runs only; start the command with agentctl run."
-		return s.deny(d, "")
+		return s.deny(d, ""), headerOutcome{}
 	}
 
 	if reason := s.guard(ctx, host, ip); reason != "" {
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "guard: "+reason
 		d.Message = "Egress to " + net.JoinHostPort(host, strconv.Itoa(int(port))) + " is refused: " + reason + "."
 		s.record(runCg, runID, d)
-		return s.deny(d, runID)
+		return s.deny(d, runID), headerOutcome{}
 	}
 
 	d.Decision = policy.ActionAllow
@@ -415,11 +447,16 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	}
 	s.record(runCg, runID, d)
 	if d.Decision == policy.ActionDeny && d.Enforced {
-		return s.deny(d, runID)
+		return s.deny(d, runID), headerOutcome{}
+	}
+	var out headerOutcome
+	if eff != nil && phase == policy.PhaseRequest && eff.GovernsRemoteMCP(host) {
+		// A remote MCP server for this run: inspect its JSON-RPC.
+		out.mcp = &remoteMCP{host: policy.NormalizeHost(host), runID: runID, runCg: runCg, eff: eff}
 	}
 	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
 		RequestHeaders: &extprocv3.HeadersResponse{},
-	}}
+	}}, out
 }
 
 // record files a decision under the run's own cgroup id, which is how

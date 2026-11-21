@@ -1909,6 +1909,48 @@ with `node-agent -mcp-listen 127.0.0.1:18100`.
   - The bypass of §8.3 stands: an agent can spawn a stdio server itself, and
     exec policy is the backstop (Phase 4).
 
+#### 2.5 status, part 2: remote MCP (2026-11-20)
+
+Done: tool-level policy for remote MCP servers ([§8.1](#81-remote-mcp-streamable-http--already-covered-and-richer)),
+with the same rules, narration and pinning as local ones.
+
+- **Matching.** A server rule with `match.fqdn` governs requests to that
+  host. A host no rule names is not MCP to the profile: egress rules alone
+  apply, and the MCP layer abstains. The host must also be allowed by an
+  egress rule. Termination is derived as before, since MCP rules are body
+  rules.
+- **Body processing only where needed.** Envoy sends `ext_proc` headers only.
+  When a terminated request goes to a host the run's own layers name as an MCP
+  server, `ext_proc` answers its headers with a `mode_override`: buffered
+  request body, response headers, and streamed response body, for that stream
+  alone. Runs whose policy has no body rule for a destination never have its
+  bodies sent (§6.6), even though termination is node-wide.
+- **Requests.** `tools/call` and `resources/read` are decided from the
+  buffered JSON-RPC. A denied call is answered in place, HTTP 200 with an
+  `isError` tool result carrying the narration, and never reaches the server.
+  In a batch with a denied member, the other members are refused too, with a
+  reason, because part of a POST cannot be forwarded.
+- **Responses** are rewritten as they stream: `content-length` is dropped, and
+  JSON is held until complete.
+  - SSE passes event by event, reassembled across chunk boundaries.
+  - `tools/list` results are filtered and pinned exactly as for local servers;
+    the code is shared.
+  - A server-initiated `sampling/createMessage` is cut out of the stream, so
+    the client never runs it (§8.4). The server is not told: it waits for a
+    reply that never comes, which is the cost of enforcing at a proxy that
+    cannot originate requests.
+- **Pins** are shared with the gateway, keyed by profile and server rule, so
+  a drift seen in one run blocks the tool in every later run until it is
+  re-approved.
+- **Verified live** through Envoy 1.34 against a TLS MCP server answering
+  `tools/list` over SSE with a sampling request first:
+  - the sampling request was removed and `delete_repo` was filtered;
+  - a direct `delete_repo` call was answered by the proxy;
+  - after the server changed its tool descriptions, a new run saw no tools,
+    and its calls were refused with the drift message.
+- **Not yet.** A command to review and re-approve pins. Per-server
+  attenuation (§7.8).
+
 #### Decisions
 
 - **Envoy, or a Go proxy for explicit mode.** *Settled by 2.0:* Envoy. CONNECT

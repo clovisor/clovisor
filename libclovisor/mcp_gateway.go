@@ -467,11 +467,38 @@ func (g *MCPGateway) enforce(srv *mcpServer, m *rpcMsg) []byte {
 	return nil
 }
 
-// filterTools removes tools the run may not call from a tools/list
-// response, and pins definitions where the policy asks (design §8.4).
-func (g *MCPGateway) filterTools(srv *mcpServer, resp []byte) []byte {
+// toolFilter decides which tools a tools/list result offers, and pins
+// definitions where the policy asks (design §8.4). Local (gateway) and
+// remote (ext_proc) servers share it.
+type toolFilter struct {
+	decide    func(tool string) policy.EffectiveDecision
+	pins      *PinStore
+	pinKey    string // "" disables pinning
+	enforcing bool
+	// drift is called for a tool whose definition differs from its pin;
+	// blocked says whether it was withheld.
+	drift func(tool string, blocked bool)
+}
+
+// apply filters one JSON-RPC response (or a batch of them).
+func (f toolFilter) apply(resp []byte) []byte {
+	trimmed := bytes.TrimSpace(resp)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if json.Unmarshal(trimmed, &batch) != nil {
+			return resp
+		}
+		for i := range batch {
+			batch[i] = f.apply(batch[i])
+		}
+		out, err := json.Marshal(batch)
+		if err != nil {
+			return resp
+		}
+		return out
+	}
 	var m map[string]json.RawMessage
-	if json.Unmarshal(resp, &m) != nil || m["result"] == nil {
+	if json.Unmarshal(trimmed, &m) != nil || m["result"] == nil {
 		return resp
 	}
 	var result map[string]json.RawMessage
@@ -482,34 +509,25 @@ func (g *MCPGateway) filterTools(srv *mcpServer, resp []byte) []byte {
 	if json.Unmarshal(result["tools"], &tools) != nil {
 		return resp
 	}
-	eff := g.effective(srv.run.runID)
-	pin := eff != nil && eff.PinsToolDefinitions(srv.spec.Command)
 	kept := tools[:0:0]
 	for _, t := range tools {
 		var head struct {
 			Name string `json:"name"`
 		}
 		json.Unmarshal(t, &head)
-		d := decideMCP(eff, policy.MCPRequest{Kind: "tool", Server: srv.spec.Name, Argv: srv.spec.Command, Tool: head.Name})
-		if !d.Allowed() {
+		if !f.decide(head.Name).Allowed() {
 			continue // not offered: the model never sees a tool it cannot call
 		}
-		if pin && g.pins != nil {
-			if changed, err := g.pins.Check(srv.pinKey(eff), head.Name, t); err != nil {
-				log.Printf("mcp gateway: pin store: %v", err)
+		if f.pinKey != "" && f.pins != nil {
+			if changed, err := f.pins.Check(f.pinKey, head.Name, t); err != nil {
+				log.Printf("mcp: pin store: %v", err)
 			} else if changed {
-				srv.mu.Lock()
-				srv.drifted[head.Name] = true
-				srv.mu.Unlock()
-				data := MCPData{Server: srv.spec.Name, Method: "tools/list", Name: head.Name, Reason: "tool definition changed since pinned"}
-				if eff.Enforcing() {
-					data.Decision, data.Enforced = policy.ActionDeny, true
-					g.record(srv.run, data)
+				if f.drift != nil {
+					f.drift(head.Name, f.enforcing)
+				}
+				if f.enforcing {
 					continue
 				}
-				data.Decision = policy.ActionAllow
-				data.WouldDeny = []string{"pin"}
-				g.record(srv.run, data)
 			}
 		}
 		kept = append(kept, t)
@@ -523,11 +541,44 @@ func (g *MCPGateway) filterTools(srv *mcpServer, resp []byte) []byte {
 	return out
 }
 
+// driftData is the event for a tool whose definition changed.
+func driftData(server, tool string, blocked bool) MCPData {
+	d := MCPData{Server: server, Method: "tools/list", Name: tool, Reason: "tool definition changed since pinned"}
+	if blocked {
+		d.Decision, d.Enforced = policy.ActionDeny, true
+	} else {
+		d.Decision, d.WouldDeny = policy.ActionAllow, []string{"pin"}
+	}
+	return d
+}
+
+// filterTools removes tools the run may not call from a tools/list
+// response, and pins definitions where the policy asks.
+func (g *MCPGateway) filterTools(srv *mcpServer, resp []byte) []byte {
+	eff := g.effective(srv.run.runID)
+	f := toolFilter{
+		decide: func(tool string) policy.EffectiveDecision {
+			return decideMCP(eff, policy.MCPRequest{Kind: "tool", Server: srv.spec.Name, Argv: srv.spec.Command, Tool: tool})
+		},
+		pins: g.pins,
+		drift: func(tool string, blocked bool) {
+			srv.mu.Lock()
+			srv.drifted[tool] = true
+			srv.mu.Unlock()
+			g.record(srv.run, driftData(srv.spec.Name, tool, blocked))
+		},
+	}
+	if eff != nil && eff.PinsToolDefinitions(srv.spec.Command, "") {
+		f.pinKey, f.enforcing = srv.pinKey(eff), eff.Enforcing()
+	}
+	return f.apply(resp)
+}
+
 // pinKey identifies a server for pinning: the policy rule that governs
 // it, so pins are shared by every run using that rule on this node.
 func (s *mcpServer) pinKey(eff *policy.Effective) string {
 	for _, l := range eff.Layers {
-		if r := l.Profile.MCPServerRule(s.spec.Command); r != "" {
+		if r := l.Profile.MCPServerRule(s.spec.Command, ""); r != "" {
 			return l.Profile.Name + "/" + r
 		}
 	}

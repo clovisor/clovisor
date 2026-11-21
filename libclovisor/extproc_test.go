@@ -124,7 +124,7 @@ func newTestExtProc(t *testing.T, profiled bool) (*ExtProcServer, chan AuditEven
 func decide(t *testing.T, xp *ExtProcServer, c testClient, method, authority, path string) (allowed bool, body map[string]interface{}, hdr map[string]string) {
 	t.Helper()
 	req, h := headersReq(c, method, authority, path)
-	resp := xp.onHeaders(context.Background(), req, h)
+	resp, _ := xp.onHeaders(context.Background(), req, h)
 	ir := resp.GetImmediateResponse()
 	if ir == nil {
 		return true, nil, nil
@@ -210,10 +210,12 @@ func TestExtProcIdentity(t *testing.T) {
 
 	// A 4-tuple with no socket behind it cannot be attributed: refused.
 	req, h := headersReq(testClient{src: netip.MustParseAddrPort("127.0.0.1:1"), dst: c.dst}, "CONNECT", "github.com:443", "")
-	if xp.onHeaders(context.Background(), req, h).GetImmediateResponse() == nil {
+	if first(xp.onHeaders(context.Background(), req, h)).GetImmediateResponse() == nil {
 		t.Fatal("unidentified client allowed")
 	}
 }
+
+func first(r *extprocv3.ProcessingResponse, _ *remoteMCP) *extprocv3.ProcessingResponse { return r }
 
 func TestEnvoyBootstrap(t *testing.T) {
 	b, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: netip.MustParseAddrPort("127.0.0.1:18000"),
@@ -313,7 +315,7 @@ func reqWith(attrs map[string]interface{}, method, authority, path string, extra
 func TestExtProcTermination(t *testing.T) {
 	xp, _, c := newTestExtProc(t, true)
 	allowed := func(req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (bool, string) {
-		ir := xp.onHeaders(context.Background(), req, h).GetImmediateResponse()
+		ir := first(xp.onHeaders(context.Background(), req, h)).GetImmediateResponse()
 		if ir == nil {
 			return true, ""
 		}

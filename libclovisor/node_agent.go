@@ -198,6 +198,11 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		proxyCA, proxyTerminated = ca, terminated
 		api.TrustBundle, api.NodeCACert = TrustBundlePath, NodeCACertPath
 		xp = NewExtProcServer(api, cmgr.GetAgentsDir(), httpEvents)
+		if xp.Pins, err = openPins(&opts); err != nil {
+			api.Close()
+			audit.reader.Close()
+			return nil, err
+		}
 		xp.NonRunAllowed = opts.NonRunProxy
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
 			api.Close()
@@ -214,10 +219,7 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		if !opts.MCPListen.Addr().IsLoopback() {
 			return nil, fmt.Errorf("the MCP gateway must listen on loopback, not %s", opts.MCPListen)
 		}
-		if opts.MCPPins == "" {
-			opts.MCPPins = "/var/lib/clovisor/mcp-pins.json"
-		}
-		pins, err := OpenPinStore(opts.MCPPins)
+		pins, err := openPins(&opts)
 		if err != nil {
 			return nil, err
 		}
@@ -275,6 +277,28 @@ func (na *NodeAgent) ReloadPolicy() error {
 		}
 	}
 	return nil
+}
+
+var (
+	pinsOnce *PinStore
+	pinsPath string
+)
+
+// openPins opens the node's one pin store, shared by the MCP gateway
+// (local servers) and ext_proc (remote servers).
+func openPins(opts *NodeAgentOptions) (*PinStore, error) {
+	if opts.MCPPins == "" {
+		opts.MCPPins = "/var/lib/clovisor/mcp-pins.json"
+	}
+	if pinsOnce != nil && pinsPath == opts.MCPPins {
+		return pinsOnce, nil
+	}
+	ps, err := OpenPinStore(opts.MCPPins)
+	if err != nil {
+		return nil, err
+	}
+	pinsOnce, pinsPath = ps, opts.MCPPins
+	return ps, nil
 }
 
 // Where runs find the node's trust anchors.
