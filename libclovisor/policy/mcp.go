@@ -82,7 +82,10 @@ type MCPRequest struct {
 	URI    string
 }
 
-func (cp *CompiledProfile) decideMCP(r MCPRequest) (Decision, bool) {
+// DecideMCP decides an MCP operation against this profile alone. It
+// reports false when the profile abstains: it has no mcp block, or the
+// host is not one of its MCP servers.
+func (cp *CompiledProfile) DecideMCP(r MCPRequest) (Decision, bool) {
 	m := cp.mcp
 	if m == nil {
 		return Decision{}, false // abstain
@@ -136,7 +139,7 @@ func (cp *CompiledProfile) decideMCP(r MCPRequest) (Decision, bool) {
 func (e *Effective) DecideMCP(r MCPRequest) EffectiveDecision {
 	out := EffectiveDecision{Decision: Decision{Action: ActionAllow}}
 	for _, l := range e.Layers {
-		d, ok := l.Profile.decideMCP(r)
+		d, ok := l.Profile.DecideMCP(r)
 		if !ok {
 			continue
 		}

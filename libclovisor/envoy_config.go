@@ -86,7 +86,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			// Lets ext_proc turn on body processing for the streams that
 			// need it (remote MCP) and only those.
 			"allow_mode_override": true,
-			"request_attributes": arr{"source.address", "source.port", "destination.address", "destination.port", "xds.route_name"},
+			"request_attributes":  arr{"source.address", "source.port", "destination.address", "destination.port", "xds.route_name"},
 			"processing_mode": obj{
 				"request_header_mode":  "SEND",
 				"response_header_mode": "SKIP",

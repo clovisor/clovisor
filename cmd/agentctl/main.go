@@ -44,6 +44,11 @@ func printUsage() {
 	fmt.Println("  agentctl explain profile.yaml...  Compile profiles and print the enforcement receipt")
 	fmt.Println("  agentctl check --profile p.yaml (--all | run-id...)")
 	fmt.Println("                                    Replay recorded runs against a profile; exit 1 on violations")
+	fmt.Println("  agentctl pins [--all]             List MCP tools whose definitions changed since pinned")
+	fmt.Println("  agentctl pins show <server> <tool>")
+	fmt.Println("                                    Show a tool's pinned and changed definitions")
+	fmt.Println("  agentctl pins approve <server> (<tool> <hash> | --all)")
+	fmt.Println("                                    Accept changed definitions as the new pins (root)")
 	fmt.Println("  agentctl cgroups                  List active cgroups")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -745,7 +750,23 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if p.WouldDeny > 0 {
 				note += fmt.Sprintf(" would-deny %d", p.WouldDeny)
 			}
+			if p.Tunnels > 0 {
+				note += fmt.Sprintf(" opaque tunnels %d", p.Tunnels)
+			}
 			fmt.Printf("  %-46s x%-4d%s\n", net.JoinHostPort(p.Host, strconv.Itoa(int(p.Port))), p.Requests, note)
+			for _, u := range p.Paths {
+				note := ""
+				if u.Denied > 0 {
+					note += fmt.Sprintf(" denied %d", u.Denied)
+				}
+				if u.WouldDeny > 0 {
+					note += fmt.Sprintf(" would-deny %d", u.WouldDeny)
+				}
+				fmt.Printf("    %-7s %-37s x%-4d%s\n", u.Method, truncate(u.Path, 37), u.Requests, note)
+			}
+			if p.PathsDropped > 0 {
+				fmt.Printf("    (%d more requests to paths past the per-run cap of %d)\n", p.PathsDropped, clovisor.MaxPaths)
+			}
 		}
 	}
 	fmt.Printf("Destinations (%d)\n", len(tl.Summary.Destinations))
@@ -960,6 +981,11 @@ func main() {
 		}
 	case "clamp", "revoke":
 		if err := clampRun(command, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "pins":
+		if err := pinsCommand(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

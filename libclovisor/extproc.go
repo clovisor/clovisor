@@ -48,6 +48,9 @@ type HTTPData struct {
 	WouldDeny []string // audit-mode layers that would have denied
 	Reason    string   // why, when not a policy rule (guard, identity, termination)
 	Message   string
+	// Terminated marks a CONNECT that Envoy terminates: its requests are
+	// decided, and recorded, one by one.
+	Terminated bool
 }
 
 // ExtProcServer decides proxied requests for runs (milestone 2.3). It
@@ -419,6 +422,10 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	}
 
 	d.Decision = policy.ActionAllow
+	terminated := phase == policy.PhaseConnect && strings.HasPrefix(attribute(req, "xds.route_name"), TerminateRoutePrefix)
+	// Envoy ends a terminated tunnel and sends each request inside it
+	// back through here, so what the run does inside it is recorded.
+	d.Terminated = terminated
 	if eff != nil {
 		r := policy.Request{Port: port, Method: method, Path: path, Phase: phase}
 		if ip.IsValid() {
@@ -428,7 +435,6 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		}
 		ed := eff.Decide(r)
 		d.Decision, d.Rule, d.Layer, d.WouldDeny, d.Enforced, d.Message = ed.Action, ed.Rule, ed.Layer, ed.WouldDeny, ed.Enforced, ed.Message
-		terminated := strings.HasPrefix(attribute(req, "xds.route_name"), TerminateRoutePrefix)
 		switch {
 		case ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() && terminated:
 			// Envoy terminates this tunnel; each request inside it is

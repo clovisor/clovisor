@@ -226,7 +226,8 @@ func TestRunRecorderProxiedRequests(t *testing.T) {
 	if tl.Summary.ProxyConnects != 2 || tl.Summary.Connects != 0 || len(tl.Summary.Destinations) != 0 {
 		t.Fatalf("proxy connects not separated: %+v", tl.Summary)
 	}
-	want := []ProxiedDest{{Host: "evil.example", Port: 443, Requests: 1, Denied: 1}, {Host: "github.com", Port: 443, Requests: 2, WouldDeny: 1}}
+	want := []ProxiedDest{{Host: "evil.example", Port: 443, Requests: 1, Denied: 1, Connects: 1},
+		{Host: "github.com", Port: 443, Requests: 2, WouldDeny: 1, Connects: 2, Tunnels: 2}}
 	if !reflect.DeepEqual(tl.Summary.Proxied, want) {
 		t.Fatalf("proxied %+v", tl.Summary.Proxied)
 	}

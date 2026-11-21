@@ -76,6 +76,13 @@ type Draft struct {
 	lookedUp   []string                // names looked up but never connected to
 	badNames   map[string]int          // connected-to names that are not valid fqdn entries
 	binaryRuns map[string]map[string]bool
+
+	httpGroups map[string]*httpGroup // http rules, by rule name
+	opaque     map[string]bool       // host rules for hosts used through opaque tunnels
+	badPaths   []string              // requests no exact path rule can express
+	mcpSeen    []*mcpSeen
+	mcpRules   []*mcpSeen // parallel to Profile.Spec.MCP.Servers
+	mcpNotes   []string
 }
 
 // LearnProfile drafts an AgentProfile that would allow exactly the
@@ -91,12 +98,14 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		dnsServers: map[string]int{},
 		binaryRuns: map[string]map[string]bool{},
 		badNames:   map[string]int{},
+		httpGroups: map[string]*httpGroup{},
+		opaque:     map[string]bool{},
 	}
 	d.Profile.Kind = "AgentProfile"
 	d.Profile.Metadata.Name = name
 	d.Profile.Spec.Mode = "audit"
 	d.Profile.Spec.Egress.Default = "deny"
-	d.Profile.Spec.Exec = &policy.Exec{Default: "deny", RequireReadonlyOrigin: true}
+	d.Profile.Spec.Exec = &policy.Exec{Default: "deny", RequireReadonlyOrigin: true, Allow: []policy.ExecAllow{}}
 
 	byHost := map[string]*learnedHost{}
 	ipDests := map[destKey]*learnedIP{}
@@ -162,6 +171,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 	}
 	sort.Strings(hostNames)
 	used := map[string]bool{}
+	l7 := collectL7(runs)
 	for _, n := range hostNames {
 		h := byHost[n]
 		rn := uniqueRuleName(ruleName(n), used)
@@ -169,6 +179,12 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		d.ruleHost[rn] = n
 		if len(h.ports) == 0 {
 			continue // UDP only: reported, not allowed
+		}
+		if d.httpRules(rn, n, h, l7[n], used) {
+			continue
+		}
+		if x := l7[n]; x != nil && x.tunnels > 0 {
+			d.opaque[rn] = true
 		}
 		d.Profile.Spec.Egress.Rules = append(d.Profile.Spec.Egress.Rules, policy.EgressRule{
 			Name:   rn,
@@ -220,6 +236,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		}
 		d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
 	}
+	d.learnMCP(runs)
 	return d
 }
 
@@ -329,8 +346,17 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		p("    rules:")
 	}
 	for _, r := range d.Profile.Spec.Egress.Rules {
+		if g := d.httpGroups[r.Name]; g != nil {
+			d.writeHTTPRule(p, r, g, total)
+			continue
+		}
 		h := d.hosts[r.Name]
 		p("      # %s%s", hostSeen(h), runsNote(h.runs, total))
+		if d.opaque[r.Name] {
+			p("      # Used through a TLS tunnel the proxy did not terminate, so the paths are")
+			p("      # unseen. To learn them, run under an audit profile whose rule for this")
+			p("      # host has http: { paths: [\"*\"] }.")
+		}
 		p("      - name: %s", q(r.Name))
 		p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
 		p("        action: %s", r.Action)
@@ -405,6 +431,15 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		}
 	}
 
+	if len(d.badPaths) > 0 {
+		sort.Strings(d.badPaths)
+		p("")
+		p("      # Requests no exact http rule can express (not allowed):")
+		for _, b := range d.badPaths {
+			p("      #   %s", commentSafe(b))
+		}
+	}
+
 	p("")
 	p("  exec:")
 	p("    default: %s", d.Profile.Spec.Exec.Default)
@@ -424,6 +459,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			p("        note: %s", q(a.Note))
 		}
 	}
+	d.writeMCP(p, total)
 
 	_, err := io.WriteString(w, b.String())
 	return err

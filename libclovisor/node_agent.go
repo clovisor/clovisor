@@ -203,6 +203,7 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 			audit.reader.Close()
 			return nil, err
 		}
+		api.Pins = xp.Pins
 		xp.NonRunAllowed = opts.NonRunProxy
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
 			api.Close()
@@ -223,6 +224,7 @@ func NewNodeAgentWithBPF(opts NodeAgentOptions) (*NodeAgent, error) {
 		if err != nil {
 			return nil, err
 		}
+		api.Pins = pins
 		if gw, err = NewMCPGateway(api, opts.MCPListen, pins, httpEvents); err != nil {
 			return nil, err
 		}

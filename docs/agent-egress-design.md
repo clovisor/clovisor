@@ -54,6 +54,12 @@ place:
 | `clone3(CLONE_INTO_CGROUP)` needs root, so the run API moves a parked child by pidfd instead of handing out a cgroup fd. | [§5.2](#52-enforcement-identity-cgroup-v2), [Phase 1 status](#phase-1-status-2026-11-20) |
 | Phase 1 complete; Phase 2 broken into milestones, with explicit-proxy identity from socket diagnostics on Linux. | [Phase 2 plan](#phase-2-plan-2026-11-20) |
 
+### 2026-11-21 — Phase 2 learn and audit
+
+| Change | Where |
+|---|---|
+| Learn mode drafts exact method and path rules for hosts seen in full, and `mcp` server rules from the calls let through. `check` replays paths and MCP calls. Tool pins get a review and approve command. | [2.6 status](#26-status-learn-and-audit-2026-11-21) |
+
 ---
 
 ## 1. Provenance: what Clovisor was
@@ -1904,8 +1910,8 @@ with `node-agent -mcp-listen 127.0.0.1:18100`.
   - Per-server attenuation ([§7.8](#78-sub-agent-delegation-monotonic-attenuation)):
     servers inherit the run's effective policy rather than a narrower profile
     of their own.
-  - A command to review and re-approve pins.
-  - Learning tool lists (2.6).
+  - A command to review and re-approve pins (done in 2.6).
+  - Learning tool lists (done in 2.6).
   - The bypass of §8.3 stands: an agent can spawn a stdio server itself, and
     exec policy is the backstop (Phase 4).
 
@@ -1948,8 +1954,90 @@ with the same rules, narration and pinning as local ones.
   - a direct `delete_repo` call was answered by the proxy;
   - after the server changed its tool descriptions, a new run saw no tools,
     and its calls were refused with the drift message.
-- **Not yet.** A command to review and re-approve pins. Per-server
-  attenuation (§7.8).
+- **Not yet.** Per-server attenuation (§7.8). (Pin review came in 2.6.)
+
+#### 2.6 status: learn and audit (2026-11-21)
+
+Done: learn mode drafts rules below the host, from what the proxy and the MCP
+gateway recorded, and `check` replays them. The invariant of Phase 1 holds:
+a draft allows exactly what was let through, never more.
+
+- **Timeline.** Each proxied destination in the run summary now records:
+  - requests by method and path, for plain HTTP and requests inside
+    terminated tunnels, capped at 256 distinct pairs per destination and
+    counted past the cap;
+  - CONNECTs, and the *opaque tunnels* among them: CONNECTs let through
+    without termination, whose contents the proxy never saw.
+
+  A CONNECT is marked terminated from Envoy's route alone, whatever the
+  run's profile, so an unprofiled run on a node that terminates a host is
+  recorded by path too. `agentctl events` lists the paths under each
+  destination.
+- **HTTP rules.** A host gets `http` rules only when every use of it was seen
+  by method and path: no opaque tunnel, and no direct connect.
+  - Paths are exact, grouped into one rule per method set and port set. For
+    example, `GET` and `POST /repos/a/b/issues` together, and `GET`-only paths
+    in a second rule.
+  - Paths containing `*` (the glob character) or `?` cannot be written as an
+    exact rule, so they are reported, not allowed.
+  - Globs are only *suggested*, in comments, where several paths differ in
+    id-like segments (digits, hex, UUIDs). Each one widens the rule, since
+    `*` also matches `/`.
+  - Any other host keeps a host-level rule. If it was used through an opaque
+    tunnel, a comment says how to learn its paths: run once under an audit
+    profile whose rule for it has `http: { paths: ["*"] }`, which terminates
+    it.
+- **MCP.** The draft gets an `mcp` block with `default: deny` and one server
+  rule per server used:
+  - `match.stdio` for a server registered with the gateway, taken from its
+    command line: the package or script a launcher (`npx`, `uvx`, an
+    interpreter) starts, less any `@version`, else the executable's name.
+    `match.fqdn` for a remote host.
+  - `tools.allow` lists the tools called and let through; with none, it is
+    `deny: ["*"]`, because an empty allow list allows every tool.
+  - `resources.allow_uri` lists the URIs read, possibly none, since an absent
+    `resources` block allows every resource.
+  - `pin_tool_definitions: true`.
+  - Comments record calls that were blocked during learning, drifted tools,
+    and sampling requests. Sampling stays denied. A server whose every
+    registration was refused is left out.
+- **Check.** `agentctl check` replays the recorded requests by method and
+  path, and the MCP calls, against the profile. Requests that were seen by
+  path are no longer "unverifiable". Only opaque tunnels remain decided at
+  host level, as before. A draft checked against its own runs reports only
+  what was blocked during learning.
+- **Pin review.** `agentctl pins` lists tools whose definitions changed since
+  pinned.
+  - `pins show <server> <tool>` prints the pinned and changed definitions and
+    names the fields that differ.
+  - `pins approve <server> <tool> <hash>` accepts the change. The hash must
+    prefix the pending definition's hash, so only the reviewed definition is
+    approved; if the server changed it again, approval is refused. `--all`
+    approves every pending tool of a server.
+  - The pin store now keeps definitions, and a changed one as *pending*, so
+    review survives restarts. It still reads the first format, which kept
+    hashes only.
+  - The run API ops `pins` and `pin_approve` are root-only, and refused from
+    inside a run, since pins govern every run on the node.
+  - A run that already saw a tool change keeps it blocked; runs offered the
+    tool after approval can call it.
+- **Verified live** through Envoy 1.34:
+  1. A learning run under an audit profile that terminates `api.github.com`
+     and the remote MCP host: curl to four GitHub API paths and to
+     github.com, then the MCP client.
+  2. `agentctl learn` drafted a `GET` rule with the four paths, with a glob
+     suggestion for the two issue paths. It drafted a host rule for
+     `github.com` with the opaque-tunnel note, `POST /mcp` for the MCP host,
+     and the three tools called. `check` reported only the sampling request.
+  3. With `delete_repo` removed and `mode: enforce`, a path not learned got a
+     narrated 403, and `delete_repo` was filtered and refused.
+  4. After the server changed its tool descriptions, `pins show` showed the
+     changed description. Approving `get_file` with a stale hash was refused;
+     with the reviewed hash it worked. The next run was offered `get_file`
+     and could call it, while `search_code` stayed blocked.
+- **Bug found.** `PinEntry` embedded `Pin`, whose custom `UnmarshalJSON` was
+  promoted, so clients decoded entries with no server or tool. `Pin` is now a
+  named field, with a round-trip test.
 
 #### Decisions
 

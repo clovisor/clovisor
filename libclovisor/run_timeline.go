@@ -81,6 +81,68 @@ type ProxiedDest struct {
 	Requests  int    `json:"requests"`
 	Denied    int    `json:"denied,omitempty"`     // blocked
 	WouldDeny int    `json:"would_deny,omitempty"` // allowed, but an audit layer would deny
+	// Tunnels counts CONNECTs let through without termination: what went
+	// inside them is unseen, so the host was used without path limits.
+	Tunnels int `json:"tunnels,omitempty"`
+	// Connects counts every CONNECT, so that Requests minus Connects is
+	// the requests recorded by path.
+	Connects int `json:"connects,omitempty"`
+	// Paths are the requests the proxy saw by method and path: plain HTTP,
+	// and requests inside terminated tunnels. At most MaxPaths distinct
+	// entries are kept; requests beyond that are counted in PathsDropped.
+	Paths        []PathUse `json:"paths,omitempty"`
+	PathsDropped int       `json:"paths_dropped,omitempty"`
+}
+
+// PathUse aggregates proxied requests with one method and path.
+type PathUse struct {
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Requests  int    `json:"requests"`
+	Denied    int    `json:"denied,omitempty"`
+	WouldDeny int    `json:"would_deny,omitempty"`
+}
+
+// MaxPaths bounds the distinct method and path pairs kept per proxied
+// destination, since paths carry ids and a run controls them.
+const MaxPaths = 256
+
+func (pd *ProxiedDest) addRequest(d HTTPData) {
+	pd.Requests++
+	blocked := d.Decision == "deny" && d.Enforced
+	if blocked {
+		pd.Denied++
+	} else if len(d.WouldDeny) > 0 {
+		pd.WouldDeny++
+	}
+	if d.Method == "CONNECT" {
+		pd.Connects++
+		if !blocked && !d.Terminated {
+			pd.Tunnels++
+		}
+		return
+	}
+	var u *PathUse
+	for i := range pd.Paths {
+		if pd.Paths[i].Method == d.Method && pd.Paths[i].Path == d.Path {
+			u = &pd.Paths[i]
+			break
+		}
+	}
+	if u == nil {
+		if len(pd.Paths) >= MaxPaths {
+			pd.PathsDropped++
+			return
+		}
+		pd.Paths = append(pd.Paths, PathUse{Method: d.Method, Path: d.Path})
+		u = &pd.Paths[len(pd.Paths)-1]
+	}
+	u.Requests++
+	if blocked {
+		u.Denied++
+	} else if len(d.WouldDeny) > 0 {
+		u.WouldDeny++
+	}
 }
 
 // Destination is one distinct (protocol, address, port) a run connected to.
@@ -447,12 +509,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			pd = &ProxiedDest{Host: d.Host, Port: d.Port}
 			st.proxied[k] = pd
 		}
-		pd.Requests++
-		if d.Decision == "deny" && d.Enforced {
-			pd.Denied++
-		} else if len(d.WouldDeny) > 0 {
-			pd.WouldDeny++
-		}
+		pd.addRequest(d)
 		st.add(TimelineEvent{
 			Time:      ev.Timestamp,
 			Type:      "http",
@@ -565,7 +622,15 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 
 	tl.Summary.Proxied = nil
 	for _, pd := range st.proxied {
-		tl.Summary.Proxied = append(tl.Summary.Proxied, *pd)
+		c := *pd
+		c.Paths = append([]PathUse(nil), pd.Paths...)
+		sort.Slice(c.Paths, func(i, j int) bool {
+			if c.Paths[i].Path != c.Paths[j].Path {
+				return c.Paths[i].Path < c.Paths[j].Path
+			}
+			return c.Paths[i].Method < c.Paths[j].Method
+		})
+		tl.Summary.Proxied = append(tl.Summary.Proxied, c)
 	}
 	sort.Slice(tl.Summary.Proxied, func(i, j int) bool {
 		a, b := tl.Summary.Proxied[i], tl.Summary.Proxied[j]

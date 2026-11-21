@@ -58,7 +58,7 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke
+	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke, mcp_register, pins, pin_approve
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
@@ -71,6 +71,13 @@ type RunAPIRequest struct {
 	// MCPServers are stdio servers to expose through the MCP gateway
 	// (op mcp_register, on the run's own connection).
 	MCPServers []MCPServerSpec `json:"mcp_servers,omitempty"`
+	// PinServer, PinTool and PinHash select tool pins (ops pins and
+	// pin_approve). PinHash, a prefix of the pending definition's hash,
+	// makes an approval apply only to the definition that was reviewed.
+	PinServer string `json:"pin_server,omitempty"`
+	PinTool   string `json:"pin_tool,omitempty"`
+	PinHash   string `json:"pin_hash,omitempty"`
+	PinsAll   bool   `json:"pins_all,omitempty"` // pins: include pins with no pending change
 }
 
 // RunAPIResponse is the agent's reply to each request.
@@ -91,6 +98,9 @@ type RunAPIResponse struct {
 	Clamp   string   `json:"clamp,omitempty"`
 	// mcp_register:
 	MCP []MCPRegistration `json:"mcp,omitempty"`
+	// pins, pin_approve:
+	Pins     []PinEntry `json:"pins,omitempty"`
+	Approved []string   `json:"approved,omitempty"`
 }
 
 // RunRegistry holds metadata for runs created through the API until the
@@ -148,6 +158,8 @@ type RunAPIServer struct {
 	ProxyURL string
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
+	// Pins is the node's tool-definition pin store, if MCP is governed.
+	Pins *PinStore
 	// TrustBundle and NodeCACert are handed to runs when the proxy
 	// terminates TLS.
 	TrustBundle, NodeCACert string
@@ -522,6 +534,8 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		return ac.clamp(req)
 	case "mcp_register":
 		return ac.mcpRegister(req)
+	case "pins", "pin_approve":
+		return ac.pins(req)
 	default:
 		return fail("unknown op %q", req.Op)
 	}
@@ -696,6 +710,56 @@ func (ac *apiConn) mcpRegister(req RunAPIRequest) RunAPIResponse {
 // clamp layers a profile onto a live run, or revokes its egress. A layer
 // can only remove permissions, so the run's owner may do it as well as
 // root: it is the incident-response lever of §5.6.
+// pins lists tool pins, or approves changed definitions. Pins are node
+// state that governs every run, so only root outside any run may touch
+// them.
+func (ac *apiConn) pins(req RunAPIRequest) RunAPIResponse {
+	if ac.cred.Uid != 0 {
+		return fail("tool pins are node state: run as root")
+	}
+	if cg, err := procCgroup(int(ac.cred.Pid)); err != nil || ac.s.inAgents(cg) {
+		return fail("tool pins cannot be reviewed from inside a run")
+	}
+	if ac.s.Pins == nil {
+		return fail("the node agent has no MCP pin store (no proxy and no MCP gateway)")
+	}
+	if req.Op == "pin_approve" {
+		if req.PinServer == "" {
+			return fail("pin_approve needs a server")
+		}
+		done, err := ac.s.Pins.Approve(req.PinServer, req.PinTool, req.PinHash)
+		if len(done) > 0 {
+			log.Printf("run api: uid %d approved tool definitions %s on %s", ac.cred.Uid, strings.Join(done, ", "), req.PinServer)
+		}
+		if err != nil {
+			return RunAPIResponse{Error: err.Error(), Approved: done}
+		}
+		if len(done) == 0 {
+			return fail("no changed tool definitions to approve on %s", req.PinServer)
+		}
+		return RunAPIResponse{OK: true, Approved: done}
+	}
+	var out []PinEntry
+	for _, e := range ac.s.Pins.List(!req.PinsAll && req.PinTool == "") {
+		if req.PinServer != "" && e.Server != req.PinServer || req.PinTool != "" && e.Tool != req.PinTool {
+			continue
+		}
+		if req.PinTool == "" {
+			// Definitions only for one tool: a listing must fit a message.
+			e.Pin.Def = nil
+			if e.Pin.Pending != nil {
+				e.Pin.Pending.Def = nil
+			}
+		}
+		out = append(out, e)
+	}
+	resp := RunAPIResponse{OK: true, Pins: out}
+	if b, _ := json.Marshal(resp); len(b) > maxAPIMessage-256 {
+		return fail("the answer is too large for the run API; read %s as root", ac.s.Pins.path)
+	}
+	return resp
+}
+
 func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 	runID := strings.TrimPrefix(req.RunID, RunPrefix)
 	var layer policy.Layer
@@ -910,6 +974,19 @@ func (rc *RunAPIClient) Clamp(runID, profile string) (RunAPIResponse, error) {
 // connection.
 func (rc *RunAPIClient) RegisterMCP(servers []MCPServerSpec) (RunAPIResponse, error) {
 	return rc.call(RunAPIRequest{Op: "mcp_register", MCPServers: servers})
+}
+
+// Pins lists tool pins: those with a changed definition awaiting review,
+// or all with all. Naming a tool returns its definitions too.
+func (rc *RunAPIClient) Pins(server, tool string, all bool) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "pins", PinServer: server, PinTool: tool, PinsAll: all})
+}
+
+// ApprovePin makes a tool's changed definition its pin; with tool "",
+// every changed tool on the server. hash, if set, must prefix the pending
+// definition's hash.
+func (rc *RunAPIClient) ApprovePin(server, tool, hash string) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "pin_approve", PinServer: server, PinTool: tool, PinHash: hash})
 }
 
 // Revoke denies all further egress for a live run.

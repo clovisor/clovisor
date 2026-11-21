@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -827,67 +826,5 @@ func (p *mcpProc) readLoop(stdout io.Reader) {
 		case p.out <- line:
 		default: // no GET stream draining it; drop rather than block
 		}
-	}
-}
-
-// PinStore keeps tool-definition hashes across runs (design §8.4), so a
-// server that changes a tool after review is caught.
-type PinStore struct {
-	path string
-	mu   sync.Mutex
-	pins map[string]map[string]string // server key -> tool -> sha256
-}
-
-// OpenPinStore loads (or starts) the store at path.
-func OpenPinStore(path string) (*PinStore, error) {
-	ps := &PinStore{path: path, pins: map[string]map[string]string{}}
-	data, err := os.ReadFile(path)
-	if err == nil {
-		if err := json.Unmarshal(data, &ps.pins); err != nil {
-			return nil, fmt.Errorf("pin store %s: %w", path, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	return ps, nil
-}
-
-// canonicalHash hashes a tool definition independent of key order and
-// whitespace.
-func canonicalHash(def json.RawMessage) (string, error) {
-	var v interface{}
-	if err := json.Unmarshal(def, &v); err != nil {
-		return "", err
-	}
-	b, err := json.Marshal(v) // map keys are sorted
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-// Check pins a tool definition on first sight and reports whether it
-// differs from the pinned one.
-func (ps *PinStore) Check(server, tool string, def json.RawMessage) (changed bool, err error) {
-	h, err := canonicalHash(def)
-	if err != nil {
-		return false, err
-	}
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if ps.pins[server] == nil {
-		ps.pins[server] = map[string]string{}
-	}
-	switch prev, ok := ps.pins[server][tool]; {
-	case !ok:
-		ps.pins[server][tool] = h
-		data, _ := json.MarshalIndent(ps.pins, "", "  ")
-		if err := os.MkdirAll(filepath.Dir(ps.path), 0o755); err != nil {
-			return false, err
-		}
-		return false, writeFileAtomic(ps.path, data, 0o600)
-	default:
-		return prev != h, nil
 	}
 }
