@@ -60,6 +60,12 @@ type RunSummary struct {
 	// not listed as destinations.
 	Proxied       []ProxiedDest `json:"proxied,omitempty"`
 	ProxyConnects int           `json:"proxy_connects,omitempty"`
+	// Redirected counts connects transparent mode sent to the proxy
+	// (milestone 3.1); what they were for arrives as http events, so they
+	// are not listed as destinations. Refused counts connects refused
+	// because the node agent was down.
+	Redirected int `json:"redirected,omitempty"`
+	Refused    int `json:"refused,omitempty"`
 	// MCP is what the run did through the local MCP gateway.
 	MCP []MCPUse `json:"mcp,omitempty"`
 }
@@ -87,6 +93,11 @@ type ProxiedDest struct {
 	// Connects counts every CONNECT, so that Requests minus Connects is
 	// the requests recorded by path.
 	Connects int `json:"connects,omitempty"`
+	// Transparent counts requests the connect hooks redirected here;
+	// AddrMismatches those sent to an address the name does not resolve
+	// to (they reached the name's address instead).
+	Transparent    int `json:"transparent,omitempty"`
+	AddrMismatches int `json:"addr_mismatches,omitempty"`
 	// Paths are the requests the proxy saw by method and path: plain HTTP,
 	// and requests inside terminated tunnels. At most MaxPaths distinct
 	// entries are kept; requests beyond that are counted in PathsDropped.
@@ -109,6 +120,12 @@ const MaxPaths = 256
 
 func (pd *ProxiedDest) addRequest(d HTTPData) {
 	pd.Requests++
+	if d.Transparent {
+		pd.Transparent++
+	}
+	if d.AddrMismatch {
+		pd.AddrMismatches++
+	}
 	blocked := d.Decision == "deny" && d.Enforced
 	if blocked {
 		pd.Denied++
@@ -185,6 +202,14 @@ type TimelineEvent struct {
 	Layer     string   `json:"layer,omitempty"`
 	WouldDeny []string `json:"would_deny,omitempty"`
 	Reason    string   `json:"reason,omitempty"`
+	// Transparent marks traffic the connect hooks redirected; OrigDst is
+	// the address the run connected to, SNI its TLS server name.
+	Transparent  bool   `json:"transparent,omitempty"`
+	OrigDst      string `json:"orig_dst,omitempty"`
+	SNI          string `json:"sni,omitempty"`
+	AddrMismatch bool   `json:"addr_mismatch,omitempty"`
+	// Verdict is what transparent mode did with a connect.
+	Verdict string `json:"verdict,omitempty"`
 	// mcp events:
 	MCPServer string `json:"mcp_server,omitempty"`
 	MCPName   string `json:"mcp_name,omitempty"` // tool or resource
@@ -447,6 +472,19 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			st.tl.Summary.ProxyConnects++
 			return nil, nil
 		}
+		if d.Verdict == VerdictRedirect || d.Verdict == VerdictRefused {
+			// Redirected: it went to the proxy, and what it was for
+			// arrives as http events. Refused: it went nowhere. Neither
+			// is a destination the run reached directly.
+			if d.Verdict == VerdictRedirect {
+				st.tl.Summary.Redirected++
+			} else {
+				st.tl.Summary.Refused++
+			}
+			st.add(TimelineEvent{Time: ev.Timestamp, Type: "connect", PID: ev.PID, CgroupID: ev.CgroupID,
+				Proto: d.Protocol, DstIP: d.DstIP, DstPort: d.DstPort, DstName: st.ipName[d.DstIP], Verdict: d.Verdict}, r.MaxEvents)
+			return nil, nil
+		}
 		st.tl.Summary.Connects++
 		k := destKey{d.Protocol, d.DstIP, d.DstPort}
 		ds := st.dests[k]
@@ -468,6 +506,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			DstIP:    d.DstIP,
 			DstPort:  d.DstPort,
 			DstName:  name,
+			Verdict:  d.Verdict,
 		}, r.MaxEvents)
 
 	case EventMCP:
@@ -530,6 +569,11 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Layer:     d.Layer,
 			WouldDeny: d.WouldDeny,
 			Reason:    d.Reason,
+
+			Transparent:  d.Transparent,
+			OrigDst:      d.OrigDst,
+			SNI:          d.SNI,
+			AddrMismatch: d.AddrMismatch,
 		}, r.MaxEvents)
 
 	case EventDNS:

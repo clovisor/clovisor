@@ -29,8 +29,19 @@ func (c *Compiled) WriteReceipt(w io.Writer) error {
 	}
 	p("Deployment  %s on %s", c.Options.Mode, platform)
 	p("Identity    %s", identity)
-	p("Routing     advisory: only traffic sent to the proxy is governed. Pair with a")
-	p("            sandbox, or transparent mode (Phase 3), to make it binding (design §4.3).")
+	switch c.Options.Mode {
+	case Transparent:
+		p("Routing     enforced for TCP: every connect from a run reaches the proxy or is refused,")
+		p("            and refused while the node agent is down (design §6.5). Not yet covered:")
+		p("            UDP (milestone 3.3), sockets created before the process joined the run")
+		p("            (refused at attach), raw and Unix sockets, host daemons (Phase 4).")
+	case TransparentAudit:
+		p("Routing     advisory, auditing: connects that bypass the proxy go direct and are")
+		p("            recorded with what transparent mode would have done.")
+	default:
+		p("Routing     advisory: only traffic sent to the proxy is governed. Pair with a")
+		p("            sandbox, or transparent mode, to make it binding (design §4.3).")
+	}
 	p("Narration   on CONNECT, denials reach clients as x-clovisor-denial only; the JSON")
 	p("            body arrives on plain HTTP and terminated connections.")
 

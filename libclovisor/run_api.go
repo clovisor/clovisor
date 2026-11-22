@@ -158,6 +158,11 @@ type RunAPIServer struct {
 	policy atomic.Pointer[policy.Set] // nil: no policy loaded; runs are unprofiled
 	// ProxyURL is the node's explicit proxy, handed to clients for runs.
 	ProxyURL string
+	// Transparent is the node's transparent mode. In enforce, a process
+	// holding network sockets is refused at attach: the kernel runs a
+	// socket's cgroup hooks by the cgroup it was created in, so those
+	// sockets would bypass redirect-or-deny (3.0 spike).
+	Transparent string
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.

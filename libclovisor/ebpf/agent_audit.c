@@ -12,8 +12,27 @@
  *          system-wide; filtered in-program to the agents cgroup subtree.
  * connect: cgroup/connect4 + cgroup/connect6, attached once to the agents
  *          cgroup (/sys/fs/cgroup/agents), so the kernel scopes it to the
- *          subtree. Always returns 1 (allow) in Phase 1; this is the same
- *          hook Phase 2 turns into fail-closed enforcement.
+ *          subtree. Every connect is reported. What else happens depends on
+ *          the transparent mode (Phase 3, design §6.5 rule 1):
+ *            off      allow (Phase 1 and 2 behaviour)
+ *            audit    allow, reporting what enforce would have done
+ *            enforce  TCP: redirect to the transparent listener, or EPERM
+ *                     when the node agent's heartbeat is stale. Exceptions:
+ *                     the configured addresses (explicit proxy, MCP
+ *                     gateway), a loopback listener bound by the same run,
+ *                     and loopback ports nobody listens on (they fail with
+ *                     ECONNREFUSED as they would anyway). UDP is left to
+ *                     3.3.
+ *
+ * transparent (mode audit or enforce, milestone 3.1):
+ *          cgroup/bind4,6 on agents/ tag each socket with its run, for the
+ *          same-run loopback check. sockops on agents/ re-keys a redirected
+ *          socket's original destination by its local address and port,
+ *          which is what the proxy sees as its peer. cgroup/getpeername4,6
+ *          on agents/ report the original peer. cgroup/getsockopt, on the
+ *          cgroup root, answers SO_ORIGINAL_DST for tasks outside agents/
+ *          (the proxy). In enforce mode these links are pinned, so they
+ *          outlive the node agent and connects fail closed when it dies.
  *
  * Syscall tracepoints (syscalls/sys_enter_*) are deliberately not used:
  * attached via perf_event they only fire on the CPU the perf event was
@@ -50,6 +69,8 @@
 #define IPPROTO_UDP  17
 #define DNS_PORT     53
 
+#define SOCK_STREAM 1
+
 #define AF_INET  2
 #define AF_INET6 10
 
@@ -84,11 +105,60 @@ struct cgroup {
     int level;
 } __attribute__((preserve_access_index));
 
-/* Written once by the node agent: which cgroup is the agents root. */
+#define MAX_EXCEPTIONS 4
+
+#define MODE_OFF     0
+#define MODE_AUDIT   1
+#define MODE_ENFORCE 2
+
+/* Connect verdicts, reported in connect_event.verdict. */
+#define V_NONE           0 /* mode off */
+#define V_REDIRECT       1
+#define V_DENY_UNHEALTHY 2
+#define V_SAME_RUN       3
+#define V_EXCEPTION      4
+#define V_UNBOUND        5 /* loopback, nobody listening: left alone */
+#define V_AUDIT_REDIRECT 6
+#define V_AUDIT_DENY     7
+
+/* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
+struct addr {
+    __u32 a[4];
+};
+
+/* An address runs reach directly. An all-zero ip means any loopback. */
+struct exception {
+    struct addr ip;
+    __u16 port;           /* host order; 0 ends the list */
+    __u16 _pad;
+    __u32 _pad2;
+};
+
+/* Written by the node agent at start. */
 struct audit_config {
     __u64 agents_cgroup_id;
     __u32 agents_level;   /* depth of agents dir below cgroup root */
+    __u32 mode;           /* MODE_* */
+    __u64 stale_ns;       /* heartbeat older than this: unhealthy */
+    __u16 tproxy_port;    /* transparent listener on 127.0.0.1 and ::1, host order */
+    __u16 _pad;
+    __u32 _pad2;
+    struct exception exc[MAX_EXCEPTIONS];
+};
+
+/* Original destination of a redirected socket. */
+struct orig {
+    struct addr ip;
+    __u16 port;           /* network order */
+    __u16 family;         /* of the original destination */
     __u32 _pad;
+};
+
+struct tuple_key {
+    struct addr ip;       /* the client's local address */
+    __u16 port;           /* the client's local port, network order */
+    __u16 _pad;
+    __u32 _pad2;
 };
 
 struct event_hdr {
@@ -113,6 +183,8 @@ struct connect_event {
     __u16 dport;          /* host byte order */
     __u32 protocol;       /* IPPROTO_TCP / IPPROTO_UDP */
     __u8  daddr[16];      /* v4 in first 4 bytes, network order */
+    __u32 verdict;        /* V_* */
+    __u32 _pad;
 };
 
 /* hdr.cgroup_id and hdr.run_cgroup_id are both the run cgroup's id. */
@@ -142,6 +214,50 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
+
+/* CLOCK_MONOTONIC ns of the node agent's last heartbeat. Its own map, so a
+ * heartbeat never rewrites the config another CPU is reading. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} heartbeat SEC(".maps");
+
+/* Original destination of a redirected socket, freed with the socket. */
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct orig);
+} orig_by_sk SEC(".maps");
+
+/* Run cgroup id of the task that bound the socket. */
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, __u64);
+} run_by_sk SEC(".maps");
+
+/* The proxy's view: its peer (the client) to the original destination. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct tuple_key);
+    __type(value, struct orig);
+} orig_by_tuple SEC(".maps");
+
+/*
+ * A direct 32-bit load of a ctx or sock field. Plain C lets the compiler fold
+ * loads of neighbouring fields behind a branch into one load at a computed
+ * offset, which the verifier refuses for sock and ctx pointers (3.0 spike).
+ */
+#define LOAD32(ptr, type, field) ({                                            \
+    __u32 __v;                                                                \
+    asm volatile("%0 = *(u32 *)(%1 + %2)"                                     \
+                 : "=r"(__v) : "r"(ptr), "i"(__builtin_offsetof(type, field))); \
+    __v; })
 
 /*
  * Returns nonzero if the current task lives in a run cgroup under the
@@ -209,7 +325,7 @@ int on_exec(__u64 *ctx)
     return 0;
 }
 
-static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family)
+static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family, struct addr *ip, __u16 dport, __u32 verdict)
 {
     struct event_hdr hdr = {};
     if (!fill_hdr(&hdr, EVENT_CONNECT))
@@ -221,21 +337,15 @@ static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family
 
     e->hdr = hdr;
     e->family = family;
-    e->dport = bpf_ntohs((__u16)ctx->user_port);
+    e->dport = bpf_ntohs(dport);
     e->protocol = ctx->protocol;
+    e->verdict = verdict;
+    e->_pad = 0;
     __builtin_memset(e->daddr, 0, sizeof(e->daddr));
-
-    if (family == AF_INET) {
-        __u32 a = ctx->user_ip4;
-        __builtin_memcpy(e->daddr, &a, 4);
-    } else {
-        __u32 a0 = ctx->user_ip6[0], a1 = ctx->user_ip6[1];
-        __u32 a2 = ctx->user_ip6[2], a3 = ctx->user_ip6[3];
-        __builtin_memcpy(&e->daddr[0], &a0, 4);
-        __builtin_memcpy(&e->daddr[4], &a1, 4);
-        __builtin_memcpy(&e->daddr[8], &a2, 4);
-        __builtin_memcpy(&e->daddr[12], &a3, 4);
-    }
+    if (family == AF_INET)
+        __builtin_memcpy(e->daddr, &ip->a[3], 4);
+    else
+        __builtin_memcpy(e->daddr, ip->a, 16);
 
     bpf_ringbuf_submit(e, 0);
 }
@@ -365,18 +475,368 @@ int on_ingress(struct __sk_buff *skb)
     return 1;
 }
 
+static __always_inline struct audit_config *get_config(void)
+{
+    __u32 zero = 0;
+    struct audit_config *cfg = bpf_map_lookup_elem(&config, &zero);
+    if (!cfg || cfg->agents_cgroup_id == 0)
+        return 0;
+    return cfg;
+}
+
+/* Run cgroup id of the current task, 0 if it is not in a run. */
+static __always_inline __u64 current_run(struct audit_config *cfg)
+{
+    if (bpf_get_current_ancestor_cgroup_id(cfg->agents_level) != cfg->agents_cgroup_id)
+        return 0;
+    return bpf_get_current_ancestor_cgroup_id(cfg->agents_level + 1);
+}
+
+static __always_inline int healthy(struct audit_config *cfg)
+{
+    __u32 zero = 0;
+    __u64 *hb = bpf_map_lookup_elem(&heartbeat, &zero);
+    if (!hb || *hb == 0)
+        return 0;
+    return bpf_ktime_get_ns() - *hb < cfg->stale_ns;
+}
+
+static __always_inline void v4mapped(struct addr *a, __u32 ip4)
+{
+    a->a[0] = 0;
+    a->a[1] = 0;
+    a->a[2] = bpf_htonl(0x0000ffff);
+    a->a[3] = ip4;
+}
+
+static __always_inline int is_v4mapped(struct addr *a)
+{
+    return a->a[0] == 0 && a->a[1] == 0 && a->a[2] == bpf_htonl(0x0000ffff);
+}
+
+static __always_inline int is_loopback(struct addr *a)
+{
+    if (is_v4mapped(a))
+        return (bpf_ntohl(a->a[3]) >> 24) == 127;
+    return a->a[0] == 0 && a->a[1] == 0 && a->a[2] == 0 && a->a[3] == bpf_htonl(1);
+}
+
+static __always_inline int is_exception(struct audit_config *cfg, struct addr *ip, __u16 hport)
+{
+#pragma unroll
+    for (int i = 0; i < MAX_EXCEPTIONS; i++) {
+        struct exception *x = &cfg->exc[i];
+        if (x->port == 0)
+            break;
+        if (x->port != hport)
+            continue;
+        if (x->ip.a[0] == 0 && x->ip.a[1] == 0 && x->ip.a[2] == 0 && x->ip.a[3] == 0) {
+            if (is_loopback(ip))
+                return 1;
+            continue;
+        }
+        if (x->ip.a[0] == ip->a[0] && x->ip.a[1] == ip->a[1] &&
+            x->ip.a[2] == ip->a[2] && x->ip.a[3] == ip->a[3])
+            return 1;
+    }
+    return 0;
+}
+
+#define LISTENER_NONE  0
+#define LISTENER_SAME  1
+#define LISTENER_OTHER 2
+
+/*
+ * Who listens at ip:port: nobody, this run (the socket was bound by it), or
+ * someone else. With nobody listening the connect is left alone: it fails
+ * with ECONNREFUSED, as it would without Clovisor, and a client trying ::1
+ * before 127.0.0.1 falls back (3.0 spike).
+ */
+static __always_inline int loopback_listener(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u64 run)
+{
+    struct bpf_sock_tuple t = {};
+    struct bpf_sock *sk;
+
+    if (is_v4mapped(ip)) {
+        t.ipv4.daddr = ip->a[3];
+        t.ipv4.dport = port;
+        sk = bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv4), BPF_F_CURRENT_NETNS, 0);
+    } else {
+        __builtin_memcpy(t.ipv6.daddr, ip->a, 16);
+        t.ipv6.dport = port;
+        sk = bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv6), BPF_F_CURRENT_NETNS, 0);
+    }
+    if (!sk)
+        return LISTENER_NONE;
+    int who = LISTENER_OTHER;
+    __u64 *owner = bpf_sk_storage_get(&run_by_sk, sk, 0, 0);
+    if (owner && *owner == run)
+        who = LISTENER_SAME;
+    bpf_sk_release(sk);
+    return who;
+}
+
+/*
+ * The connect decision. Returns the verdict; *rewrite is set when the
+ * destination must be rewritten to the transparent listener.
+ */
+static __always_inline __u32 decide(struct bpf_sock_addr *ctx, struct audit_config *cfg, __u64 run,
+                                    struct addr *ip, __u16 port, int *rewrite)
+{
+    *rewrite = 0;
+    if (cfg->mode == MODE_OFF || ctx->type != SOCK_STREAM)
+        return V_NONE;
+    __u16 hport = bpf_ntohs(port);
+    if (is_exception(cfg, ip, hport))
+        return V_EXCEPTION;
+    if (is_loopback(ip)) {
+        int who = loopback_listener(ctx, ip, port, run);
+        if (who == LISTENER_SAME)
+            return V_SAME_RUN;
+        if (who == LISTENER_NONE)
+            return V_UNBOUND;
+    }
+    int ok = healthy(cfg);
+    if (cfg->mode != MODE_ENFORCE)
+        return ok ? V_AUDIT_REDIRECT : V_AUDIT_DENY;
+    if (!ok)
+        return V_DENY_UNHEALTHY;
+    *rewrite = 1;
+    return V_REDIRECT;
+}
+
+static __always_inline void stash(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u16 family)
+{
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+    if (!o)
+        return;
+    o->ip = *ip;
+    o->port = port;
+    o->family = family;
+    o->_pad = 0;
+}
+
 SEC("cgroup/connect4")
 int on_connect4(struct bpf_sock_addr *ctx)
 {
-    emit_connect(ctx, AF_INET);
-    return 1; /* Phase 1: audit only, always allow */
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 1;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 1;
+    struct addr ip;
+    v4mapped(&ip, ctx->user_ip4);
+    __u16 port = (__u16)ctx->user_port;
+    int rewrite;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &rewrite);
+    emit_connect(ctx, AF_INET, &ip, port, v);
+    if (v == V_DENY_UNHEALTHY)
+        return 0;
+    if (rewrite) {
+        stash(ctx, &ip, port, AF_INET);
+        ctx->user_ip4 = bpf_htonl(0x7f000001);
+        ctx->user_port = bpf_htons(cfg->tproxy_port);
+    }
+    return 1;
 }
 
 SEC("cgroup/connect6")
 int on_connect6(struct bpf_sock_addr *ctx)
 {
-    emit_connect(ctx, AF_INET6);
-    return 1; /* Phase 1: audit only, always allow */
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 1;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 1;
+    struct addr ip;
+    ip.a[0] = ctx->user_ip6[0];
+    ip.a[1] = ctx->user_ip6[1];
+    ip.a[2] = ctx->user_ip6[2];
+    ip.a[3] = ctx->user_ip6[3];
+    __u16 port = (__u16)ctx->user_port;
+    int mapped = is_v4mapped(&ip);
+    int rewrite;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &rewrite);
+    /* An IPv4-mapped destination is reported as IPv4. */
+    emit_connect(ctx, mapped ? AF_INET : AF_INET6, &ip, port, v);
+    if (v == V_DENY_UNHEALTHY)
+        return 0;
+    if (rewrite) {
+        stash(ctx, &ip, port, mapped ? AF_INET : AF_INET6);
+        if (mapped) {
+            /* Dual-stack socket to an IPv4 address: keep it IPv4. */
+            ctx->user_ip6[3] = bpf_htonl(0x7f000001);
+        } else {
+            ctx->user_ip6[0] = 0;
+            ctx->user_ip6[1] = 0;
+            ctx->user_ip6[2] = 0;
+            ctx->user_ip6[3] = bpf_htonl(1);
+        }
+        ctx->user_port = bpf_htons(cfg->tproxy_port);
+    }
+    return 1;
+}
+
+static __always_inline int tag_run(struct bpf_sock_addr *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 1;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 1;
+    __u64 *v = bpf_sk_storage_get(&run_by_sk, ctx->sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+    if (v)
+        *v = run;
+    return 1;
+}
+
+SEC("cgroup/bind4")
+int on_bind4(struct bpf_sock_addr *ctx) { return tag_run(ctx); }
+
+SEC("cgroup/bind6")
+int on_bind6(struct bpf_sock_addr *ctx) { return tag_run(ctx); }
+
+SEC("cgroup/getpeername4")
+int on_getpeername4(struct bpf_sock_addr *ctx)
+{
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
+    if (o && o->family == AF_INET && ctx->user_ip4 == bpf_htonl(0x7f000001)) {
+        ctx->user_ip4 = o->ip.a[3];
+        ctx->user_port = o->port;
+    }
+    return 1;
+}
+
+SEC("cgroup/getpeername6")
+int on_getpeername6(struct bpf_sock_addr *ctx)
+{
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
+    if (o) {
+        ctx->user_ip6[0] = o->ip.a[0];
+        ctx->user_ip6[1] = o->ip.a[1];
+        ctx->user_ip6[2] = o->ip.a[2];
+        ctx->user_ip6[3] = o->ip.a[3];
+        ctx->user_port = o->port;
+    }
+    return 1;
+}
+
+SEC("sockops")
+int on_sockops(struct bpf_sock_ops *skops)
+{
+    if (skops->op != BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
+        return 1;
+    struct bpf_sock *sk = skops->sk;
+    if (!sk)
+        return 1;
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, sk, 0, 0);
+    if (!o)
+        return 1;
+    __u32 family = LOAD32(skops, struct bpf_sock_ops, family);
+    __u32 l4 = LOAD32(skops, struct bpf_sock_ops, local_ip4);
+    __u32 l0 = LOAD32(skops, struct bpf_sock_ops, local_ip6[0]);
+    __u32 l1 = LOAD32(skops, struct bpf_sock_ops, local_ip6[1]);
+    __u32 l2 = LOAD32(skops, struct bpf_sock_ops, local_ip6[2]);
+    __u32 l3 = LOAD32(skops, struct bpf_sock_ops, local_ip6[3]);
+    __u32 lport = LOAD32(skops, struct bpf_sock_ops, local_port); /* host order */
+    struct tuple_key k = {};
+    if (family == AF_INET) {
+        v4mapped(&k.ip, l4);
+    } else {
+        k.ip.a[0] = l0;
+        k.ip.a[1] = l1;
+        k.ip.a[2] = l2;
+        k.ip.a[3] = l3;
+    }
+    k.port = bpf_htons((__u16)lport);
+    struct orig v = *o;
+    bpf_map_update_elem(&orig_by_tuple, &k, &v, BPF_ANY);
+    return 1;
+}
+
+struct sockaddr_in_ {
+    __u16 family;
+    __u16 port;
+    __u32 addr;
+    __u8  zero[8];
+};
+
+struct sockaddr_in6_ {
+    __u16 family;
+    __u16 port;
+    __u32 flowinfo;
+    __u32 addr[4];
+    __u32 scope_id;
+};
+
+#define SOL_IP_         0
+#define SOL_IPV6_       41
+#define SO_ORIGINAL_DST 80 /* also IP6T_SO_ORIGINAL_DST */
+
+/* On the cgroup root: answers the proxy's SO_ORIGINAL_DST. Runs never get
+ * an answer, so they cannot read another run's destinations. */
+SEC("cgroup/getsockopt")
+int on_getsockopt(struct bpf_sockopt *ctx)
+{
+    if (ctx->optname != SO_ORIGINAL_DST || (ctx->level != SOL_IP_ && ctx->level != SOL_IPV6_))
+        return 1;
+    struct audit_config *cfg = get_config();
+    if (!cfg || bpf_get_current_ancestor_cgroup_id(cfg->agents_level) == cfg->agents_cgroup_id)
+        return 1;
+    struct bpf_sock *sk = ctx->sk;
+    if (!sk)
+        return 1;
+
+    __u32 family = LOAD32(sk, struct bpf_sock, family);
+    __u32 d4 = LOAD32(sk, struct bpf_sock, dst_ip4);
+    __u32 d0 = LOAD32(sk, struct bpf_sock, dst_ip6[0]);
+    __u32 d1 = LOAD32(sk, struct bpf_sock, dst_ip6[1]);
+    __u32 d2 = LOAD32(sk, struct bpf_sock, dst_ip6[2]);
+    __u32 d3 = LOAD32(sk, struct bpf_sock, dst_ip6[3]);
+    __u32 dport = LOAD32(sk, struct bpf_sock, dst_port); /* network order, low 16 bits */
+    struct tuple_key k = {};
+    if (family == AF_INET) {
+        v4mapped(&k.ip, d4);
+    } else {
+        k.ip.a[0] = d0;
+        k.ip.a[1] = d1;
+        k.ip.a[2] = d2;
+        k.ip.a[3] = d3;
+    }
+    k.port = (__u16)dport;
+    struct orig *o = bpf_map_lookup_elem(&orig_by_tuple, &k);
+    if (!o)
+        return 1;
+
+    void *start = ctx->optval, *end = ctx->optval_end;
+    if (ctx->level == SOL_IP_) {
+        struct sockaddr_in_ *sa = start;
+        if ((void *)(sa + 1) > end || o->family != AF_INET)
+            return 1;
+        sa->family = AF_INET;
+        sa->port = o->port;
+        sa->addr = o->ip.a[3];
+        __builtin_memset(sa->zero, 0, sizeof(sa->zero));
+        ctx->optlen = sizeof(*sa);
+    } else {
+        struct sockaddr_in6_ *sa = start;
+        if ((void *)(sa + 1) > end)
+            return 1;
+        sa->family = AF_INET6;
+        sa->port = o->port;
+        sa->flowinfo = 0;
+        sa->addr[0] = o->ip.a[0];
+        sa->addr[1] = o->ip.a[1];
+        sa->addr[2] = o->ip.a[2];
+        sa->addr[3] = o->ip.a[3];
+        sa->scope_id = 0;
+        ctx->optlen = sizeof(*sa);
+    }
+    ctx->retval = 0;
+    return 1;
 }
 
 char LICENSE[] SEC("license") = "GPL";

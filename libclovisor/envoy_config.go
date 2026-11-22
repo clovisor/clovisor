@@ -34,6 +34,10 @@ type EnvoyConfig struct {
 	// UpstreamCA verifies origin certificates behind termination, as
 	// Envoy sees the file system.
 	UpstreamCA string
+	// TransparentPort, if not 0, adds the transparent listener on
+	// 127.0.0.1 and ::1 (milestone 3.2), where the connect hooks send
+	// every TCP connect from a run.
+	TransparentPort uint16
 }
 
 // TerminatedHost is one terminated pattern and its leaf certificate.
@@ -54,13 +58,25 @@ func authorityRegex(pattern string) string {
 // TerminateRoutePrefix names the routes that end a CONNECT for termination.
 const TerminateRoutePrefix = "clovisor-terminate-"
 
-// Header names Envoy sets on the inner (terminated) hop. ext_proc trusts
-// them only on requests arriving over an internal listener.
+// TransparentHTTPRoute names the route of plain HTTP that arrived on the
+// transparent listener. ext_proc trusts the identity headers Envoy wrote
+// on requests that took it.
+const TransparentHTTPRoute = "clovisor-transparent-http"
+
+// Header names Envoy sets on the inner (terminated or transparent) hop.
+// ext_proc trusts them only on requests arriving over an internal
+// listener, or on TransparentHTTPRoute.
 const (
-	hdrClient  = "x-clovisor-client"  // "<client addr:port>,<proxy addr:port>"
-	hdrConnect = "x-clovisor-connect" // the CONNECT authority
-	hdrCred    = "x-clovisor-cred"    // the outer request's Proxy-Authorization (credential identity)
+	hdrClient  = "x-clovisor-client"   // "<client addr:port>,<proxy addr:port>"
+	hdrConnect = "x-clovisor-connect"  // the CONNECT authority
+	hdrCred    = "x-clovisor-cred"     // the outer request's Proxy-Authorization (credential identity)
+	hdrOrigDst = "x-clovisor-orig-dst" // the address a transparent connection was made to
+	hdrSNI     = "x-clovisor-sni"      // its TLS server name, if any
 )
+
+// ownHeaders are the headers only Envoy may set; clients' copies are
+// removed, and none reach an origin.
+var ownHeaders = []string{hdrClient, hdrConnect, hdrCred, hdrOrigDst, hdrSNI, "x-clovisor-run"}
 
 type obj = map[string]interface{}
 type arr = []interface{}
@@ -103,22 +119,37 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	// Before ext_proc on the outer hop: drop any client copies of the
 	// inner-hop headers, and record the client address and CONNECT target
 	// as filter state that crosses the internal hop.
-	stripOwn := obj{"name": "envoy.filters.http.header_mutation", "typed_config": typed(
-		"type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
-		obj{"mutations": obj{"request_mutations": arr{obj{"remove": hdrClient}, obj{"remove": hdrConnect}, obj{"remove": hdrCred}, obj{"remove": "x-clovisor-run"}}}})}
+	headerMutation := func(muts arr) obj {
+		return obj{"name": "envoy.filters.http.header_mutation", "typed_config": typed(
+			"type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
+			obj{"mutations": obj{"request_mutations": muts}})}
+	}
+	remove := func(names ...string) arr {
+		var a arr
+		for _, n := range names {
+			a = append(a, obj{"remove": n})
+		}
+		return a
+	}
+	overwrite := func(name, format string) obj {
+		return obj{"append": obj{"header": obj{"key": name, "value": format}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}}
+	}
+	stripOwn := headerMutation(remove(ownHeaders...))
 	fsEntry := func(key, format string) obj {
 		return obj{"object_key": key, "factory_key": "envoy.string", "shared_with_upstream": "TRANSITIVE",
 			"format_string": obj{"text_format_source": obj{"inline_string": format}}}
 	}
-	setState := obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(
-		"type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config",
-		obj{"on_request_headers": arr{
-			fsEntry("clovisor.client", "%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_LOCAL_ADDRESS%"),
-			fsEntry("clovisor.connect", "%REQ(:AUTHORITY)%"),
-			// With credential identity the run's secret is on the CONNECT
-			// only; the requests inside a terminated tunnel need it too.
-			fsEntry("clovisor.cred", "%REQ(PROXY-AUTHORIZATION)%"),
-		}})}
+	setState := func(client string) obj {
+		return obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(
+			"type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config",
+			obj{"on_request_headers": arr{
+				fsEntry("clovisor.client", client),
+				fsEntry("clovisor.connect", "%REQ(:AUTHORITY)%"),
+				// With credential identity the run's secret is on the CONNECT
+				// only; the requests inside a terminated tunnel need it too.
+				fsEntry("clovisor.cred", "%REQ(PROXY-AUTHORIZATION)%"),
+			}})}
+	}
 	var terminateRoutes arr
 	for i, th := range c.Terminate {
 		terminateRoutes = append(terminateRoutes, obj{
@@ -132,32 +163,39 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			"route": obj{"cluster": fmt.Sprintf("terminate-%d", i), "upgrade_configs": arr{obj{"upgrade_type": "CONNECT", "connect_config": obj{}}}},
 		})
 	}
-	hcm := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
-		"stat_prefix":     "proxy",
-		"upgrade_configs": arr{obj{"upgrade_type": "CONNECT"}},
-		// Python before 3.12 sends CONNECT as HTTP/1.0, which Envoy
-		// otherwise refuses with 426.
-		"http_protocol_options": obj{"accept_http_10": true},
-		"route_config": obj{
-			// Strip headers a client could use to impersonate the proxy's
-			// own annotations; ext_proc trusts only attributes. The router
-			// applies this after ext_proc, which has read the run's
-			// credential by then: it must not reach the origin.
-			"request_headers_to_remove": arr{hdrClient, hdrConnect, hdrCred, "x-clovisor-run", "proxy-authorization"},
-			"virtual_hosts": arr{obj{
-				"name":    "all",
-				"domains": arr{"*"},
-				"routes": append(terminateRoutes,
-					obj{
-						"match": obj{"connect_matcher": obj{}},
-						"route": obj{"cluster": "dfp", "upgrade_configs": arr{obj{"upgrade_type": "CONNECT", "connect_config": obj{}}}},
-					},
-					obj{"match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp"}},
-				),
-			}},
-		},
-		"http_filters": arr{stripOwn, setState, extproc, dfpFilter, router},
-	})
+	// Strip headers a client could use to impersonate the proxy's own
+	// annotations; ext_proc trusts only attributes. The router applies
+	// this after ext_proc, which has read the run's credential by then: it
+	// must not reach the origin.
+	routerStrip := append(append(arr{}, strSlice(ownHeaders)...), "proxy-authorization")
+	// connectHCM is the CONNECT and plain-HTTP pipeline: on the explicit
+	// listener, and on the internal listener transparent TLS and TCP are
+	// tunnelled into.
+	connectHCM := func(stat string, filters arr) obj {
+		return typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
+			"stat_prefix":     stat,
+			"upgrade_configs": arr{obj{"upgrade_type": "CONNECT"}},
+			// Python before 3.12 sends CONNECT as HTTP/1.0, which Envoy
+			// otherwise refuses with 426.
+			"http_protocol_options": obj{"accept_http_10": true},
+			"route_config": obj{
+				"request_headers_to_remove": routerStrip,
+				"virtual_hosts": arr{obj{
+					"name":    "all",
+					"domains": arr{"*"},
+					"routes": append(append(arr{}, terminateRoutes...),
+						obj{
+							"match": obj{"connect_matcher": obj{}},
+							"route": obj{"cluster": "dfp", "upgrade_configs": arr{obj{"upgrade_type": "CONNECT", "connect_config": obj{}}}},
+						},
+						obj{"match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp"}},
+					),
+				}},
+			},
+			"http_filters": filters,
+		})
+	}
+	hcm := connectHCM("proxy", arr{stripOwn, setState("%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_LOCAL_ADDRESS%"), extproc, dfpFilter, router})
 
 	listeners := arr{obj{
 		"name": "proxy",
@@ -167,19 +205,139 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			"name": "envoy.filters.network.http_connection_manager", "typed_config": hcm}}}},
 	}}
 	clusters := arr{}
+	internal := len(c.Terminate) > 0
+	if c.TransparentPort != 0 {
+		internal = true
+		// The tunnel's headers come from Envoy's tcp_proxy, over an
+		// internal listener no client can reach: keep them, and carry the
+		// client across a further terminating hop. Credentials do not
+		// apply (transparent mode is cgroup identity only).
+		tconnect := connectHCM("transparent_connect", arr{
+			headerMutation(remove(hdrCred, "x-clovisor-run", "proxy-authorization")),
+			setState("%REQ(" + hdrClient + ")%"), extproc, dfpFilter, router})
+		// Plain HTTP on the transparent listener: no CONNECT, routed by
+		// Host. Envoy writes the identity headers itself, overwriting any
+		// client value; ext_proc trusts them on this route only.
+		thttp := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
+			"stat_prefix":           "transparent_http",
+			"http_protocol_options": obj{"accept_http_10": true},
+			"route_config": obj{
+				"request_headers_to_remove": routerStrip,
+				"virtual_hosts": arr{obj{
+					"name": "all", "domains": arr{"*"},
+					"routes": arr{obj{"name": TransparentHTTPRoute, "match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp"}}},
+				}},
+			},
+			"http_filters": arr{
+				headerMutation(append(remove(hdrConnect, hdrCred, hdrSNI, "x-clovisor-run"),
+					// The client socket is connected to the listener's own
+					// address, which the original destination replaced as
+					// the local address: sock_diag needs the former.
+					overwrite(hdrClient, "%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_DIRECT_LOCAL_ADDRESS%"),
+					overwrite(hdrOrigDst, "%DOWNSTREAM_LOCAL_ADDRESS%"))),
+				extproc, dfpFilter, router},
+		})
+		tunnel := func(stat, hostname string) obj {
+			return obj{"name": "envoy.filters.network.tcp_proxy", "typed_config": typed(
+				"type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy", obj{
+					"stat_prefix": stat,
+					"cluster":     "transparent-connect",
+					"tunneling_config": obj{
+						"hostname": hostname,
+						"headers_to_add": arr{
+							obj{"header": obj{"key": hdrClient, "value": "%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_DIRECT_LOCAL_ADDRESS%"}},
+							obj{"header": obj{"key": hdrConnect, "value": hostname}},
+							obj{"header": obj{"key": hdrOrigDst, "value": "%DOWNSTREAM_LOCAL_ADDRESS%"}},
+							obj{"header": obj{"key": hdrSNI, "value": "%REQUESTED_SERVER_NAME%"}},
+						},
+					},
+				})}
+		}
+		input := func(name, typ string) obj {
+			return obj{"name": "envoy.matching.inputs." + name, "typed_config": typed(
+				"type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3."+typ, obj{})}
+		}
+		exact := func(in obj, v string) obj {
+			return obj{"single_predicate": obj{"input": in, "value_match": obj{"exact": v}}}
+		}
+		regex := func(in obj, re string) obj {
+			return obj{"single_predicate": obj{"input": in, "value_match": obj{"safe_regex": obj{"google_re2": obj{}, "regex": re}}}}
+		}
+		chain := func(name string) obj {
+			return obj{"action": obj{"name": name, "typed_config": typed("type.googleapis.com/google.protobuf.StringValue", obj{"value": name})}}
+		}
+		tls := exact(input("transport_protocol", "TransportProtocolInput"), "tls")
+		port := fmt.Sprint(c.TransparentPort)
+		listeners = append(listeners, obj{
+			"name":                 "transparent",
+			"address":              obj{"socket_address": obj{"address": "127.0.0.1", "port_value": c.TransparentPort}},
+			"additional_addresses": arr{obj{"address": obj{"socket_address": obj{"address": "::1", "port_value": c.TransparentPort}}}},
+			"listener_filters": arr{
+				obj{"name": "envoy.filters.listener.original_dst", "typed_config": typed(
+					"type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst", obj{})},
+				obj{"name": "envoy.filters.listener.tls_inspector", "typed_config": typed(
+					"type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector", obj{})},
+				obj{"name": "envoy.filters.listener.http_inspector", "typed_config": typed(
+					"type.googleapis.com/envoy.extensions.filters.listener.http_inspector.v3.HttpInspector", obj{})},
+			},
+			// Server-speaks-first protocols (SSH, SMTP) give the
+			// inspectors nothing to read: after a second, treat them as
+			// plain TCP instead of closing them (3.0 spike).
+			"listener_filters_timeout":             "1s",
+			"continue_on_listener_filters_timeout": true,
+			"filter_chain_matcher": obj{
+				"matcher_list": obj{"matchers": arr{
+					// No original destination: a run connected to this
+					// port itself. Tunnelling it would make Envoy connect
+					// to itself, over and over (3.0 spike).
+					obj{"predicate": exact(input("destination_port", "DestinationPortInput"), port), "on_match": chain("self")},
+					// TLS with a server name: CONNECT to the name, so the
+					// proxy resolves the name the client asked for rather
+					// than trusting the address it picked.
+					obj{"predicate": obj{"and_matcher": obj{"predicate": arr{tls, regex(input("server_name", "ServerNameInput"), ".+")}}}, "on_match": chain("tls-sni")},
+					obj{"predicate": tls, "on_match": chain("tls-ip")},
+					// The input is a quoted list, e.g. 'http/1.1', and
+					// the regex must match all of it.
+					obj{"predicate": regex(input("application_protocol", "ApplicationProtocolInput"), ".*('http/1\\.[01]'|'h2c').*"), "on_match": chain("http")},
+				}},
+				"on_no_match": chain("tcp"),
+			},
+			"filter_chains": arr{
+				obj{"name": "self", "filters": arr{
+					obj{"name": "envoy.filters.network.rbac", "typed_config": typed(
+						"type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC", obj{
+							"stat_prefix": "transparent_self",
+							"rules": obj{"action": "DENY", "policies": obj{"all": obj{
+								"permissions": arr{obj{"any": true}}, "principals": arr{obj{"any": true}}}}},
+						})},
+					// Never reached; a chain must end in a terminal filter.
+					obj{"name": "envoy.filters.network.tcp_proxy", "typed_config": typed(
+						"type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+						obj{"stat_prefix": "transparent_self", "cluster": "transparent-connect"})},
+				}},
+				obj{"name": "tls-sni", "filters": arr{tunnel("transparent_tls", "%REQUESTED_SERVER_NAME%:%DOWNSTREAM_LOCAL_PORT%")}},
+				obj{"name": "tls-ip", "filters": arr{tunnel("transparent_tls_ip", "%DOWNSTREAM_LOCAL_ADDRESS%")}},
+				obj{"name": "http", "filters": arr{obj{"name": "envoy.filters.network.http_connection_manager", "typed_config": thttp}}},
+				obj{"name": "tcp", "filters": arr{tunnel("transparent_tcp", "%DOWNSTREAM_LOCAL_ADDRESS%")}},
+			},
+		}, obj{
+			"name":              "transparent-connect",
+			"internal_listener": obj{},
+			"filter_chains": arr{obj{"filters": arr{obj{
+				"name": "envoy.filters.network.http_connection_manager", "typed_config": tconnect}}}},
+		})
+		clusters = append(clusters, internalCluster("transparent-connect", "transparent-connect"))
+	}
 	if len(c.Terminate) > 0 {
 		if c.UpstreamCA == "" {
 			return nil, fmt.Errorf("termination needs an upstream CA bundle to verify origins")
 		}
 		// Inner hop: write the crossed filter state into headers, before
 		// ext_proc, overwriting anything the client sent (spike B).
-		setHeaders := obj{"name": "envoy.filters.http.header_mutation", "typed_config": typed(
-			"type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
-			obj{"mutations": obj{"request_mutations": arr{
-				obj{"append": obj{"header": obj{"key": hdrClient, "value": "%FILTER_STATE(clovisor.client:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
-				obj{"append": obj{"header": obj{"key": hdrConnect, "value": "%FILTER_STATE(clovisor.connect:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
-				obj{"append": obj{"header": obj{"key": hdrCred, "value": "%FILTER_STATE(clovisor.cred:PLAIN)%"}, "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}},
-			}}})}
+		setHeaders := headerMutation(append(remove(hdrOrigDst, hdrSNI, "x-clovisor-run"),
+			overwrite(hdrClient, "%FILTER_STATE(clovisor.client:PLAIN)%"),
+			overwrite(hdrConnect, "%FILTER_STATE(clovisor.connect:PLAIN)%"),
+			overwrite(hdrCred, "%FILTER_STATE(clovisor.cred:PLAIN)%")))
 		for i, th := range c.Terminate {
 			name := fmt.Sprintf("mitm-%d", i)
 			inner := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{
@@ -188,7 +346,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 				"route_config": obj{
 					// The inner-hop annotations are for ext_proc only: the
 					// router drops them before the origin sees them.
-					"request_headers_to_remove": arr{hdrClient, hdrConnect, hdrCred, "proxy-authorization"},
+					"request_headers_to_remove": routerStrip,
 					"virtual_hosts": arr{obj{
 						"name": "all", "domains": arr{"*"},
 						"routes": arr{obj{"match": obj{"prefix": "/"}, "route": obj{"cluster": "dfp_tls"}}},
@@ -210,15 +368,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 					"filters": arr{obj{"name": "envoy.filters.network.http_connection_manager", "typed_config": inner}},
 				}},
 			})
-			clusters = append(clusters, obj{
-				"name": fmt.Sprintf("terminate-%d", i),
-				"load_assignment": obj{"cluster_name": fmt.Sprintf("terminate-%d", i), "endpoints": arr{obj{"lb_endpoints": arr{obj{
-					"endpoint": obj{"address": obj{"envoy_internal_address": obj{"server_listener_name": name}}}}}}}},
-				"transport_socket": obj{"name": "envoy.transport_sockets.internal_upstream", "typed_config": typed(
-					"type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport",
-					obj{"transport_socket": obj{"name": "envoy.transport_sockets.raw_buffer", "typed_config": typed(
-						"type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer", obj{})}})},
-			})
+			clusters = append(clusters, internalCluster(fmt.Sprintf("terminate-%d", i), name))
 		}
 		clusters = append(clusters, obj{
 			"name":      "dfp_tls",
@@ -268,9 +418,30 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		"admin":            obj{"address": obj{"pipe": obj{"path": c.AdminSocket, "mode": 0o600}}},
 		"static_resources": obj{"listeners": listeners, "clusters": clusters},
 	}
-	if len(c.Terminate) > 0 {
+	if internal {
 		boot["bootstrap_extensions"] = arr{obj{"name": "envoy.bootstrap.internal_listener", "typed_config": typed(
 			"type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener", obj{})}}
 	}
 	return json.MarshalIndent(boot, "", "  ")
+}
+
+// internalCluster sends to the internal listener named listener.
+func internalCluster(name, listener string) obj {
+	return obj{
+		"name": name,
+		"load_assignment": obj{"cluster_name": name, "endpoints": arr{obj{"lb_endpoints": arr{obj{
+			"endpoint": obj{"address": obj{"envoy_internal_address": obj{"server_listener_name": listener}}}}}}}},
+		"transport_socket": obj{"name": "envoy.transport_sockets.internal_upstream", "typed_config": typed(
+			"type.googleapis.com/envoy.extensions.transport_sockets.internal_upstream.v3.InternalUpstreamTransport",
+			obj{"transport_socket": obj{"name": "envoy.transport_sockets.raw_buffer", "typed_config": typed(
+				"type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer", obj{})}})},
+	}
+}
+
+func strSlice(ss []string) arr {
+	a := make(arr, len(ss))
+	for i, s := range ss {
+		a[i] = s
+	}
+	return a
 }

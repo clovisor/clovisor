@@ -42,7 +42,12 @@ type DeploymentMode string
 
 const (
 	ExplicitProxy DeploymentMode = "explicit-proxy"
-	Transparent   DeploymentMode = "transparent"
+	// Transparent redirects every TCP connect from a run to the proxy, or
+	// refuses it (design §6.5 rule 1). Linux only.
+	Transparent DeploymentMode = "transparent"
+	// TransparentAudit records what Transparent would redirect or refuse
+	// and lets it go direct: routing is still advisory.
+	TransparentAudit DeploymentMode = "transparent-audit"
 )
 
 // Options describe the deployment the profiles are compiled for. The
@@ -156,7 +161,6 @@ var notYet = map[string]string{
 	"limits":            "stateful limits (Phase 5)",
 	"exec hash":         "IMA hash verification (Phase 4)",
 	"sampling ask":      "the approval UI (Phase 5)",
-	"transparent":       "transparent mode (Phase 3)",
 }
 
 type compiler struct {
@@ -183,9 +187,17 @@ func Compile(opts Options, profiles ...*AgentProfile) (*Compiled, []Diagnostic) 
 		opts.Mode = ExplicitProxy
 		out.Options.Mode = ExplicitProxy
 	}
-	if opts.Mode == Transparent {
+	switch opts.Mode {
+	case ExplicitProxy:
+	case Transparent, TransparentAudit:
+		if !opts.Linux {
+			c.prof = "(deployment)"
+			c.errf("", "transparent mode needs Linux")
+			return nil, c.diags
+		}
+	default:
 		c.prof = "(deployment)"
-		c.unsupported("", "transparent")
+		c.errf("", "unknown deployment mode %q", opts.Mode)
 		return nil, c.diags
 	}
 

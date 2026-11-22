@@ -10,6 +10,7 @@
 package clovisor
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -56,5 +57,35 @@ func TestPidfdPid(t *testing.T) {
 	defer f.Close()
 	if _, err := pidfdPid(int(f.Fd())); err == nil {
 		t.Fatal("a regular file was accepted as a pidfd")
+	}
+}
+
+func TestInetSockets(t *testing.T) {
+	before, err := inetSockets(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	u, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+	// A Unix socket is not a network socket.
+	us, err := net.Listen("unix", t.TempDir()+"/s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer us.Close()
+	after, err := inetSockets(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after-before != 2 {
+		t.Fatalf("network sockets: %d before, %d after opening two", before, after)
 	}
 }

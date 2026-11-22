@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -46,7 +48,19 @@ const (
 type bpfAuditConfig struct {
 	AgentsCgroupID uint64
 	AgentsLevel    uint32
+	Mode           uint32
+	StaleNs        uint64
+	TproxyPort     uint16
+	_              uint16
 	_              uint32
+	Exc            [maxTransparentExceptions]bpfException
+}
+
+type bpfException struct {
+	IP   [16]byte // network order; IPv4 as ::ffff:a.b.c.d; zero: any loopback
+	Port uint16   // host order; 0 ends the list
+	_    uint16
+	_    uint32
 }
 
 type bpfEventHdr struct {
@@ -86,6 +100,8 @@ type bpfConnectEvent struct {
 	DPort    uint16
 	Protocol uint32
 	DAddr    [16]byte
+	Verdict  uint32
+	_        uint32
 }
 
 type bpfObjects struct {
@@ -95,12 +111,24 @@ type bpfObjects struct {
 	IngressProg  *ebpf.Program `ebpf:"on_ingress"`
 	Connect4Prog *ebpf.Program `ebpf:"on_connect4"`
 	Connect6Prog *ebpf.Program `ebpf:"on_connect6"`
+	Bind4Prog    *ebpf.Program `ebpf:"on_bind4"`
+	Bind6Prog    *ebpf.Program `ebpf:"on_bind6"`
+	Peer4Prog    *ebpf.Program `ebpf:"on_getpeername4"`
+	Peer6Prog    *ebpf.Program `ebpf:"on_getpeername6"`
+	SockopsProg  *ebpf.Program `ebpf:"on_sockops"`
+	SockoptProg  *ebpf.Program `ebpf:"on_getsockopt"`
 	Config       *ebpf.Map     `ebpf:"config"`
+	Heartbeat    *ebpf.Map     `ebpf:"heartbeat"`
 	Events       *ebpf.Map     `ebpf:"events"`
+	OrigBySk     *ebpf.Map     `ebpf:"orig_by_sk"`
+	RunBySk      *ebpf.Map     `ebpf:"run_by_sk"`
+	OrigByTuple  *ebpf.Map     `ebpf:"orig_by_tuple"`
 }
 
 func (o *bpfObjects) Close() {
-	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg, o.Connect4Prog, o.Connect6Prog, o.Config, o.Events} {
+	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
+		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg,
+		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple} {
 		if c != nil {
 			c.Close()
 		}
@@ -120,31 +148,52 @@ type EBPFReader struct {
 
 	// Offset that converts CLOCK_BOOTTIME nanoseconds to wall time.
 	bootOffset time.Duration
+
+	transparent TransparentOptions
+	beatDone    chan struct{}
 }
 
 // NewEBPFReader loads the BPF object at bpfObjPath, configures it to
 // report only tasks under agentsDir (cgroup id agentsCgroupID, at depth
 // agentsLevel below the cgroup v2 root), and attaches the programs: the
-// exec tracepoint system-wide, the connect hooks to agentsDir.
-func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32) (*EBPFReader, error) {
+// exec tracepoint system-wide, the connect hooks to agentsDir. t sets
+// the transparent mode (milestone 3.1); the zero value is off.
+func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32, t TransparentOptions) (*EBPFReader, error) {
+	if err := t.normalize(); err != nil {
+		return nil, err
+	}
 	spec, err := ebpf.LoadCollectionSpec(bpfObjPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load BPF spec: %w", err)
 	}
 
 	r := &EBPFReader{
-		eventsCh: make(chan AuditEvent, 1000),
-		done:     make(chan struct{}),
+		eventsCh:    make(chan AuditEvent, 1000),
+		done:        make(chan struct{}),
+		transparent: t,
 	}
 
 	if err := spec.LoadAndAssign(&r.objs, nil); err != nil {
 		return nil, fmt.Errorf("failed to load BPF objects: %w", err)
 	}
 
-	cfg := bpfAuditConfig{AgentsCgroupID: agentsCgroupID, AgentsLevel: agentsLevel}
+	cfg := bpfAuditConfig{AgentsCgroupID: agentsCgroupID, AgentsLevel: agentsLevel,
+		Mode:    map[string]uint32{TransparentOff: 0, TransparentAudit: 1, TransparentEnforce: 2}[t.Mode],
+		StaleNs: uint64(t.Stale.Nanoseconds()), TproxyPort: t.Port}
+	for i, x := range t.Exceptions {
+		if a := x.Addr(); !a.IsUnspecified() {
+			cfg.Exc[i].IP = a.As16() // IPv4 comes out as ::ffff:a.b.c.d
+		}
+		cfg.Exc[i].Port = x.Port()
+	}
 	if err := r.objs.Config.Put(uint32(0), cfg); err != nil {
 		r.Close()
 		return nil, fmt.Errorf("failed to write BPF config: %w", err)
+	}
+	// A heartbeat before any hook can see a connect.
+	if err := r.beat(); err != nil {
+		r.Close()
+		return nil, err
 	}
 
 	for _, t := range []struct {
@@ -163,21 +212,45 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		r.links = append(r.links, l)
 	}
 
+	l, err := link.AttachCgroup(link.CgroupOptions{Path: agentsDir, Attach: ebpf.AttachCGroupInetIngress, Program: r.objs.IngressProg})
+	if err != nil {
+		r.Close()
+		return nil, fmt.Errorf("failed to attach ingress to %s: %w", agentsDir, err)
+	}
+	r.links = append(r.links, l)
+
+	// The connect hooks, and in audit or enforce mode the rest of the
+	// transparent set. Enforce pins them, so connects keep failing closed
+	// once this process is gone; other modes remove pins a previous
+	// enforce left behind.
+	on := t.Mode != TransparentOff
+	pin := t.Mode == TransparentEnforce
 	for _, c := range []struct {
 		name string
+		cg   string
 		typ  ebpf.AttachType
 		prog *ebpf.Program
+		want bool
 	}{
-		{"connect4", ebpf.AttachCGroupInet4Connect, r.objs.Connect4Prog},
-		{"connect6", ebpf.AttachCGroupInet6Connect, r.objs.Connect6Prog},
-		{"ingress", ebpf.AttachCGroupInetIngress, r.objs.IngressProg},
+		{"connect4", agentsDir, ebpf.AttachCGroupInet4Connect, r.objs.Connect4Prog, true},
+		{"connect6", agentsDir, ebpf.AttachCGroupInet6Connect, r.objs.Connect6Prog, true},
+		{"bind4", agentsDir, ebpf.AttachCGroupInet4Bind, r.objs.Bind4Prog, on},
+		{"bind6", agentsDir, ebpf.AttachCGroupInet6Bind, r.objs.Bind6Prog, on},
+		{"getpeername4", agentsDir, ebpf.AttachCgroupInet4GetPeername, r.objs.Peer4Prog, on},
+		{"getpeername6", agentsDir, ebpf.AttachCgroupInet6GetPeername, r.objs.Peer6Prog, on},
+		{"sockops", agentsDir, ebpf.AttachCGroupSockOps, r.objs.SockopsProg, on},
+		// On the root: the proxy runs outside agents/, wherever its
+		// operator put it. The program answers only tasks outside runs.
+		{"getsockopt", CgroupV2Root, ebpf.AttachCGroupGetsockopt, r.objs.SockoptProg, on},
 	} {
-		l, err := link.AttachCgroup(link.CgroupOptions{Path: agentsDir, Attach: c.typ, Program: c.prog})
-		if err != nil {
+		if err := r.cgroupLink(c.name, c.cg, c.typ, c.prog, c.want, pin); err != nil {
 			r.Close()
-			return nil, fmt.Errorf("failed to attach %s to %s: %w", c.name, agentsDir, err)
+			return nil, err
 		}
-		r.links = append(r.links, l)
+	}
+	if t.Mode != TransparentOff {
+		r.beatDone = make(chan struct{})
+		go r.heartbeatLoop()
 	}
 
 	r.rd, err = ringbuf.NewReader(r.objs.Events)
@@ -303,7 +376,7 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			return AuditEvent{}, fmt.Errorf("unexpected address family %d", e.Family)
 		}
 		ev.Type = EventConnect
-		ev.Data = ConnectData{DstIP: ip.String(), DstPort: e.DPort, Protocol: protoName(e.Protocol)}
+		ev.Data = ConnectData{DstIP: ip.String(), DstPort: e.DPort, Protocol: protoName(e.Protocol), Verdict: connectVerdicts[e.Verdict]}
 
 	default:
 		return AuditEvent{}, fmt.Errorf("unknown event type %d", hdr.Type)
@@ -324,11 +397,100 @@ func (r *EBPFReader) Events() <-chan AuditEvent {
 	return r.eventsCh
 }
 
+// pinPath is where the link name is pinned.
+func (r *EBPFReader) pinPath(name string) string {
+	return filepath.Join(r.transparent.PinDir, "transparent-"+name)
+}
+
+// cgroupLink attaches prog to cgroup cg, or, if a previous node agent
+// pinned a link for name, swaps prog into it atomically, so there is no
+// moment with no program, or with two. With want false the link is not
+// needed: a pinned one is removed. With pin true it is pinned.
+func (r *EBPFReader) cgroupLink(name, cg string, typ ebpf.AttachType, prog *ebpf.Program, want, pin bool) error {
+	path := r.pinPath(name)
+	if old, err := link.LoadPinnedLink(path, nil); err == nil {
+		if want {
+			if err := old.Update(prog); err == nil {
+				if !pin {
+					old.Unpin()
+					log.Printf("bpf: %s: removed the pin left by transparent enforce", name)
+				}
+				r.links = append(r.links, old)
+				return nil
+			}
+		}
+		// Not wanted, or from an incompatible build: replace it.
+		old.Unpin()
+		old.Close()
+		if !want {
+			log.Printf("bpf: %s: removed the pin left by transparent enforce", name)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("pinned %s: %w", path, err)
+	}
+	if !want {
+		return nil
+	}
+	l, err := link.AttachCgroup(link.CgroupOptions{Path: cg, Attach: typ, Program: prog})
+	if err != nil {
+		return fmt.Errorf("failed to attach %s to %s: %w", name, cg, err)
+	}
+	if pin {
+		if err := os.MkdirAll(r.transparent.PinDir, 0o700); err != nil {
+			l.Close()
+			return err
+		}
+		if err := l.Pin(path); err != nil {
+			l.Close()
+			return fmt.Errorf("pin %s: %w", name, err)
+		}
+	}
+	r.links = append(r.links, l)
+	return nil
+}
+
+// beat records that the node agent is alive (CLOCK_MONOTONIC, which is
+// what bpf_ktime_get_ns reads).
+func (r *EBPFReader) beat() error {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return err
+	}
+	if err := r.objs.Heartbeat.Put(uint32(0), uint64(ts.Nano())); err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	return nil
+}
+
+func (r *EBPFReader) heartbeatLoop() {
+	defer close(r.beatDone)
+	tick := time.NewTicker(r.transparent.Stale / 3)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.done:
+			return
+		case <-tick.C:
+			if err := r.beat(); err != nil {
+				log.Printf("bpf: %v", err)
+			}
+		}
+	}
+}
+
 // Close releases all resources. Closing the ring buffer reader unblocks
-// Read, so the read loop exits promptly.
+// Read, so the read loop exits promptly. In enforce mode the pinned
+// connect hooks stay attached and, with the heartbeat cleared, refuse
+// every connect from a run until a node agent starts again.
 func (r *EBPFReader) Close() {
 	r.once.Do(func() {
 		close(r.done)
+		if r.beatDone != nil {
+			<-r.beatDone
+		}
+		if r.objs.Heartbeat != nil {
+			r.objs.Heartbeat.Put(uint32(0), uint64(0))
+		}
 		for _, l := range r.links {
 			l.Close()
 		}

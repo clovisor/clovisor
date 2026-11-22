@@ -1,7 +1,8 @@
 # Clovisor II — An Agent Egress Control & Audit Engine
 
-**Status:** Phase 1 (audit) and Phase 2 (explicit proxy and MCP) implemented ·
-**Date:** 2026-11-14, revised 2026-11-21 · **Repo:** `clovisor` ·
+**Status:** Phase 1 (audit) and Phase 2 (explicit proxy and MCP) implemented;
+Phase 3 (transparent mode) in progress ·
+**Date:** 2026-11-14, revised 2026-11-22 · **Repo:** `clovisor` ·
 **Operating it:** [operator guide](operator-guide.md)
 
 > A design study on repointing Clovisor's architecture from Istio service-mesh
@@ -61,6 +62,14 @@ place:
 |---|---|
 | Learn mode drafts exact method and path rules for hosts seen in full, and `mcp` server rules from the calls let through. `check` replays paths and MCP calls. Tool pins get a review and approve command. | [2.6 status](#26-status-learn-and-audit-2026-11-21) |
 | Credential identity implemented: the portable mode runs on macOS and unprivileged, with a per-run secret in the proxy URL. Docker integration tests and an operator guide. Phase 2 complete. | [2.7 status](#27-status-portability-and-tests-2026-11-21), [operator guide](operator-guide.md) |
+
+### 2026-11-22 — Phase 3 plan
+
+| Change | Where |
+|---|---|
+| Phase 3 broken into milestones. Redirected connections become a `CONNECT` into the Phase 2 pipeline, routed by SNI; identity reuses socket diagnostics; same-run loopback allowed; fail closed by heartbeat. | [Phase 3 plan](#phase-3-plan-2026-11-22) |
+| 3.0 spikes: original-destination recovery, the Envoy transparent listener, forced DNS with ECH stripping, UDP deny and fail closed all work. Sockets made before joining a run bypass the hooks; a direct connect to the transparent port loops. | [3.0 spike results](#30-spike-results-2026-11-22) |
+| Redirect-or-deny and the transparent data plane implemented (`-transparent audit\|enforce`): pinned hooks that fail closed, same-run loopback, SNI routing into the CONNECT pipeline, clean-start check at attach. | [3.1 and 3.2 status](#31-and-32-status-2026-11-22) |
 
 ---
 
@@ -2134,6 +2143,220 @@ Done. Phase 2 is complete.
 Implementation note: BPF programs attached to `syscalls/sys_enter_*` tracepoints
 through perf events fired only on the CPU the perf event was opened on, on the
 development kernel. Use `tp_btf` or cgroup hooks instead.
+
+### Phase 3 plan (2026-11-22)
+
+Goal, from the table above: on Linux, every TCP and UDP packet a run sends
+reaches the proxy or the node's resolver, or is refused. Phase 3 changes only
+how traffic reaches the proxy. The policy engine, termination, MCP inspection,
+timelines and receipt are Phase 2's, unchanged. Each milestone must be useful if
+the later ones never ship.
+
+#### Findings that shape the plan
+
+1. **Identity handoff is already solved.** [§6.4](#64-identity-handoff-to-envoy)
+   planned a BPF map from client source port to run. Phase 2's socket-diagnostics
+   lookup does that job. It works unchanged on redirected connections, because
+   the client socket stays in the run's cgroup.
+2. **One decision engine.** `ext_proc` sees only HTTP. Redirected connections
+   are therefore turned into a `CONNECT` into the existing proxy pipeline,
+   rather than judged by a second engine for raw TLS and TCP. Host rules,
+   termination, path rules and MCP all then apply as they are.
+3. **Route by name, not by address.** A redirected TLS connection is tunnelled
+   as `CONNECT <SNI>:<port>`. The proxy resolves the name, so a client that
+   pairs an allowed SNI with a different IP reaches the name's address, not its
+   own. Connections with no SNI, and non-HTTP TCP, are tunnelled by original
+   IP, which only `cidr` rules match. SNI and IP mismatches are recorded.
+4. **Original-destination recovery needs care.** `connect4` runs before the
+   kernel picks the source port, and Envoy calls `getsockopt` on its own
+   accepted socket, outside any run cgroup. The candidate
+   ([§6.2](#62-transparent-redirect-and-original-destination-recovery)): stash
+   the original destination by socket cookie at `connect4`, re-key it by the
+   client's address and port from a `sockops` established callback, and answer
+   `SO_ORIGINAL_DST` from a `cgroup/getsockopt` program on Envoy's cgroup. The
+   3.0 spike settles it.
+5. **Loopback inside a run is real work.** Coding agents start local dev servers
+   and connect to them. Loopback to the same run is allowed. Loopback to a
+   listener outside the run (a host Redis, the Docker TCP socket) is redirected
+   or refused like any other destination.
+6. **Fail closed means a heartbeat.** A health flag would go stale. The node
+   agent writes a timestamp to a BPF map, and `connect4` compares it with the
+   kernel clock. If the node agent or Envoy dies, connects get `EPERM` within a
+   few seconds.
+7. **Out of reach in Phase 3:** a host daemon egressing on a run's behalf (the
+   Docker daemon pulling an image), raw sockets and `AF_UNIX` (Phase 4). ICMP
+   datagram sockets do not reach the UDP hooks; the packet-level backstop
+   catches them.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **3.0** | Spikes | Original-destination recovery (finding 4). An Envoy transparent listener (original destination, TLS and HTTP inspection) tunnelling into a `CONNECT` with identity intact. Same-run loopback detection. A UDP 53 redirect whose replies appear to come from the original resolver. The `getpeername` rewrite. IPv6 and IPv4-mapped addresses. `io_uring` connects. Kernel-version floor. | Settles the kernel and Envoy questions before product code depends on them. |
+| **3.1** | Redirect-or-deny, audit first | Node agent flag `-transparent off\|audit\|enforce`. Audit records each connect as "would redirect" or "would deny" and lets it go direct. Enforce redirects every run TCP connect, or refuses it with `EPERM` when the proxy is unhealthy. Exceptions compiled from policy: the explicit proxy port, the MCP gateway, same-run loopback. The receipt reports routing as enforced. | An operator sees what transparent mode would break before turning it on. |
+| **3.2** | Transparent data plane | Envoy transparent listener. TLS goes by SNI into the `CONNECT` pipeline. Plain HTTP goes to the HTTP connection manager with path rules. Other TCP goes by original IP and port. `getpeername` returns the original peer. Timeline events marked transparent; SNI and IP mismatches recorded. Termination as in Phase 2. | Tools that ignore `HTTPS_PROXY` are governed: Node `fetch`, `curl --noproxy`, a Go binary with its own dialer. |
+| **3.3** | UDP and QUIC | `sendmsg4/6` and UDP `connect` deny everything except DNS to the local resolver. QUIC refused at once, so clients fall back to TCP. A `cgroup_skb` egress backstop: a run's packets go only to the proxy, the resolver or compiled exceptions. UDP denials become timeline events. | UDP exfiltration and QUIC bypass are closed. |
+| **3.4** | Forced local DNS | A resolver in the node agent. All port-53 traffic from runs, UDP and TCP, goes to it. The run is identified by socket diagnostics, UDP included. It answers only names some rule in the run's profile could allow, `NXDOMAIN` otherwise; audit mode answers everything and records would-deny. `ech` is stripped from HTTPS and SVCB answers. The resolver produces the DNS timeline events. | Closes DNS tunnelling and Encrypted Client Hello, and Phase 1's DNS-outside-UDP/53 gap. |
+| **3.5** | Fail closed and operations | Heartbeat health covering the node agent and Envoy (admin readiness). Start-up order: hooks attached before runs are accepted, as now. Restart: runs keep their cgroup, egress refused while down. A BPF lost-event counter (Phase 1 carry-over). The proxy's own connects gated so it cannot reach node-local services on a run's behalf (the 2.3 rebind residual). Overhead measured on large downloads (pip, npm, git). | Safe to leave on. |
+| **3.6** | Learn, check and receipt | Learn drafts from transparent events: SNI hosts, mismatch notes, UDP attempts. `check` replays them. The receipt states routing is enforced for TCP and UDP and lists what remains: raw sockets, Unix sockets, host daemons. | Profiles stay authorable once enforcement covers everything. |
+| **3.7** | Tests and docs | Integration tests in a privileged container with BPF: `curl --noproxy`, a raw-IP connect, a UDP send, `curl --http3`, a DNS tunnelling attempt (random subdomains), same-run loopback versus a host service, killing the node agent (must fail closed). Operator guide: transparent mode, kernel requirements, rollout (off, audit, enforce). | Phase 3 ships. |
+
+Order: 3.0, then 3.1 and 3.2 together (redirecting is useless with nowhere to
+send it), 3.4, 3.3, 3.5, 3.6, 3.7. DNS comes before the UDP lockdown because
+3.3 must exempt a resolver that already exists.
+
+#### 3.0 spike results (2026-11-22)
+
+Kernel 7.0 (aarch64), Envoy 1.34.14 in Docker on the host network, and a
+hand-made run cgroup (the node agent was not involved). Code and configs in
+`spikes/phase3/`.
+
+| Question | Result |
+|---|---|
+| Original-destination recovery | Works as planned in finding 4. `connect4` stores the original destination in socket storage; the `sockops` established callback re-keys it by the client's local address and port; `cgroup/getsockopt` on the proxy's cgroup answers `SO_ORIGINAL_DST` for `SOL_IP` and `SOL_IPV6`. No conntrack or iptables. Correct for IPv4, IPv4-mapped (dual-stack socket) and native IPv6. |
+| Envoy transparent listener | Works. `original_dst`, `tls_inspector` and `http_inspector`, then: TLS as `CONNECT <SNI>:<original port>` through `tcp_proxy` tunnelling into an internal listener; TLS without SNI and other TCP as `CONNECT <ip>:<port>`; plain HTTP to an HTTP connection manager by `Host`. `curl --noproxy`, `git ls-remote` with no proxy variables, and a raw SSH banner all went through. |
+| Route by name | Works. `curl --resolve example.com:443:1.1.1.1` was tunnelled as `CONNECT example.com:443` and reached example.com's real address; the original IP is still recorded. |
+| Identity | Unchanged from Phase 2. Socket diagnostics on the redirected client socket return the run's cgroup. The transparent hop passes the client address, original destination and SNI as headers into the internal listener, which only Envoy can reach. |
+| `getpeername` | Returns the original peer (IPv4, IPv4-mapped, IPv6). |
+| Same-run loopback | Works. `bind4/6` tags the socket with its run; `connect4` finds the listener with `bpf_sk_lookup_tcp` and reads the tag. A dev server in the run is reached directly. A listener in another run, or a host service, is redirected. |
+| UDP and DNS | Every non-DNS UDP `sendto` and UDP `connect`, IPv4 and IPv6, gets `EPERM`. Port 53 goes to the local resolver over UDP and TCP. `recvmsg4` makes the reply come from the server the client asked, so `dig @1.1.1.1` (which checks the reply's source) and unconnected senders work. |
+| Forced resolver | glibc, `dig` and Python resolve allowed names. Others, including a tunnelling-shaped query, get NXDOMAIN. The run behind each query is identified by socket diagnostics, UDP included. `ech` was stripped from `crypto.cloudflare.com`'s HTTPS record, other parameters kept. |
+| Fail closed | Works. Within the stale interval (3 s) of the heartbeat stopping, TCP connects get `EPERM`; redirects resume when it restarts. |
+| `io_uring` | `IORING_OP_CONNECT` passes `connect4`: redirected when healthy, `EPERM` when not. |
+| Kernel floor | Every hook and helper loaded on 7.0. By the kernel versions in which they appeared, the floor is about 5.8 (`getpeername` hooks; socket diagnostics' cgroup id and `bpf_get_current_ancestor_cgroup_id` need 5.7). Not tested on an older kernel. |
+
+Findings for later milestones:
+
+- **A socket created before its process joined the run bypasses every hook.**
+  The kernel picks cgroup socket programs by the socket's cgroup at creation.
+  A socket made outside the run, then connected from inside, went direct. The
+  run API's attach path must make sure the process enters the run holding no
+  inet sockets: the shim closes or refuses them (3.1). Phase 4's LSM hooks see
+  the task, not the socket, and close this for good.
+- **A run connecting to the transparent port directly made Envoy connect to
+  itself in a loop**: one connection became about 900. With no stash, the
+  original destination is the listener itself. A first filter chain matching
+  the listener's own port now refuses it. The production generator must
+  include it (3.2).
+- **Server-speaks-first protocols** (SSH, SMTP) send nothing for the
+  inspectors to read. Envoy closes them when the listener filter timeout
+  expires, by default. `continue_on_listener_filters_timeout` with a 1 s
+  timeout sends them to the TCP chain, at the cost of that second (3.2).
+- **Loopback with no listener is left alone.** Redirecting it made the proxy
+  answer for a port nobody listens on, and broke clients that try `::1` before
+  `127.0.0.1`. It now fails with `ECONNREFUSED` as it would without Clovisor.
+- **Unconnected ICMP `sendto` gets out.** Datagram ping sockets hit
+  `connect4` when connected, but not `sendmsg4`. The packet backstop is needed
+  (3.3).
+- **Envoy has no "no SNI" match.** The spike tells them apart with
+  `server_names` wildcards per TLD. The 3.2 generator should use the unified
+  filter chain matcher instead.
+- **The compiler can turn reads of two neighbouring fields of a `bpf_sock` or
+  `bpf_sock_ops` into pointer arithmetic**, which the verifier refuses. The
+  spike reads them with inline assembly; the production program will need the
+  same.
+- Not covered: the Phase 1 program attached alongside on the same cgroup,
+  QUIC with a real HTTP/3 client (this curl has none; UDP 443 got `EPERM`),
+  and an older kernel.
+
+#### 3.1 and 3.2 status (2026-11-22)
+
+Implemented, as `-transparent off|audit|enforce` on the node agent:
+
+- **One connect program for every mode.** The Phase 1 `connect4/6` programs
+  now decide: off allows (as before), audit records what enforce would do,
+  enforce redirects to the transparent listener (`127.0.0.1` and `::1`, port
+  15001) or refuses with `EPERM`. Every connect is still reported, now with
+  its verdict, so audit events always see the original destination.
+  - Exceptions: the explicit proxy and the MCP gateway; a loopback listener
+    bound by the same run (tagged at `bind`); loopback with nothing listening.
+    A host service on loopback is redirected, and the proxy's node-local guard
+    refuses it with narration.
+  - `bind4/6`, `sockops` and `getpeername4/6` on `agents/`, and
+    `cgroup/getsockopt` on the cgroup root, answering `SO_ORIGINAL_DST` only
+    for tasks outside runs.
+  - UDP is untouched until 3.3.
+- **Fail closed.** A heartbeat map, written every second. In enforce mode the
+  hook links are pinned in `/sys/fs/bpf/clovisor`. A stopped or crashed node
+  agent leaves them refusing every connect from a run; a clean stop clears
+  the heartbeat at once. A restarted node agent swaps its programs into the
+  pinned links (`BPF_LINK_UPDATE`), so there is no moment with no program, or
+  with two. Starting in off or audit removes the pins.
+- **Runs start clean** (3.0 finding). After moving the first process into the
+  run, the run API counts its network sockets; in enforce a process holding
+  any is killed and the run refused, and in audit it is logged.
+- **Envoy.** The generated bootstrap adds the transparent listener:
+  - `original_dst`, TLS and HTTP inspectors, and the 1 s continue-on-timeout
+    for server-first protocols;
+  - a `filter_chain_matcher` choosing among five chains:
+    - `self`: refused, closing the self-connect loop;
+    - TLS with a server name: `CONNECT <SNI>:<port>`;
+    - TLS without one: `CONNECT <ip>:<port>`;
+    - plain HTTP: an HTTP connection manager routed by `Host`;
+    - other TCP: `CONNECT <ip>:<port>`.
+
+  Tunnels go to an internal listener running the same CONNECT pipeline as the
+  explicit listener, termination routes included. The client's socket address
+  (`%DOWNSTREAM_DIRECT_LOCAL_ADDRESS%`, since the original destination
+  replaces the local address), the original destination and the SNI travel
+  as headers that only Envoy sets. Every route strips them before the origin.
+- **`ext_proc`** trusts those headers on internal hops and on the transparent
+  HTTP route only. Events are marked `transparent` with the original
+  destination and SNI; a connect to an address the name does not resolve to
+  is recorded as `addr_mismatch`.
+- **Timelines.** Redirected and refused connects are counted (`redirected`,
+  `refused`) and listed with their verdict, but are not destinations: what a
+  redirected connect was for arrives as `http` events. Learn mode therefore
+  sees the same picture as with the explicit proxy.
+- **Receipt.** Deployment `transparent` states routing enforced for TCP and
+  lists what is not covered; `transparent-audit` states it is advisory.
+
+Verified live on kernel 7.0 with Envoy 1.34.14 and the `dev` test profile:
+
+- `curl --noproxy` over HTTPS, terminated and decided by path, with the
+  narrated 403;
+- plain HTTP by path; git with no proxy variables;
+- an SNI/IP mismatch reaching the name's address;
+- TLS without SNI matched by `cidr`;
+- a forged `x-clovisor-client` overwritten;
+- a host service on loopback refused; a same-run dev server reached;
+- a direct connect to the transparent port closed;
+- an inherited TCP socket refused at attach;
+- `EPERM` with the node agent stopped, and recovery on restart without
+  duplicate links;
+- audit recording `would redirect` and removing the pins;
+- the Phase 2 integration suite unchanged.
+
+Findings:
+
+- **Non-TLS TCP to a hostname is denied unless a `cidr` rule allows it.**
+  SSH to `github.com` arrives as `CONNECT <ip>:22`, and the `fqdn` rule does
+  not match. Matching it through DNS answers would bring back the
+  DNS-learned allowlist the design dropped
+  ([§7.5](#75-one-rule-one-enforcement-point-no-bypass)). The forced resolver
+  (3.4) sees which name a run resolved before connecting, which makes a
+  narrower version possible: a name rule for a non-TLS port, matched only
+  when the run itself resolved that name to that address.
+- **Refused TLS and TCP connections are resets**, with no narration; the
+  reason is in the timeline. Clients cannot be told more without
+  terminating.
+- **`filter_chain_matcher` is a work-in-progress API in Envoy 1.34**, and
+  Envoy warns that it is outside its threat model. The classic
+  `filter_chain_match` cannot say "has a server name". The configuration is
+  static, so the exposure is to Envoy bugs in that matcher, not to input.
+  Revisit when Envoy marks it stable.
+- `agentctl explain` offline still compiles for explicit-proxy mode; the
+  node agent's receipt reflects the node's mode.
+
+#### Decisions
+
+- **Node-wide, not per-profile.** Transparent mode is a node setting applied to
+  every run's cgroup; a profile cannot opt out. Exempting a user belongs in the
+  ceiling (`transparent: false`), which is trusted.
+- **Credential identity is unchanged.** It stays the portable explicit-proxy
+  mode. Phase 3 is Linux with cgroup identity only.
+- **The explicit proxy stays.** Harnesses that honour `HTTPS_PROXY` keep
+  connecting to it directly, as an exception, and skip the transparent hop.
 
 ---
 

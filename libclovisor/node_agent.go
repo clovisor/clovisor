@@ -38,6 +38,7 @@ type NodeAgent struct {
 	mcp        *MCPGateway
 	httpEvents chan AuditEvent
 	policyDir  string
+	deployment policy.DeploymentMode
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
 	running    bool
@@ -78,6 +79,12 @@ type NodeAgentOptions struct {
 	// EnvoyUpstreamCA is the system trust store as Envoy sees it, used to
 	// verify origins behind termination.
 	EnvoyUpstreamCA string
+
+	// Transparent configures redirect-or-deny (milestone 3.1): every TCP
+	// connect from a run goes to Envoy's transparent listener, or is
+	// refused. Needs cgroup identity and the proxy. Its exceptions are
+	// filled in from ProxyListen and MCPListen.
+	Transparent TransparentOptions
 
 	// MCPListen enables the local MCP gateway on a loopback address.
 	MCPListen netip.AddrPort
@@ -145,9 +152,28 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if opts.PolicyDir == "" {
 		opts.PolicyDir = DefaultPolicyDir
 	}
+	t := &opts.Transparent
+	if err := t.normalize(); err != nil {
+		return nil, err
+	}
+	if t.Mode != TransparentOff {
+		if credential {
+			return nil, fmt.Errorf("transparent mode needs cgroup identity")
+		}
+		if !opts.ProxyListen.IsValid() {
+			return nil, fmt.Errorf("transparent mode needs the proxy (-proxy-listen)")
+		}
+		// Runs reach the explicit proxy and the MCP gateway directly.
+		t.Exceptions = nil
+		for _, a := range []netip.AddrPort{opts.ProxyListen, opts.MCPListen} {
+			if a.IsValid() {
+				t.Exceptions = append(t.Exceptions, a)
+			}
+		}
+	}
 	// Load policy before touching the kernel or the socket: a policy that
 	// does not load is fatal, and failing here leaves nothing behind.
-	set, err := loadNodePolicy(opts.PolicyDir, !credential)
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode())
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +213,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if recorder, err = NewRunRecorder(agentsDir, opts.OutDir, registry); err != nil {
 			return nil, err
 		}
-		if audit, err = NewAgentAuditWithBPF(opts.BPFObjPath, agentsDir, agentsID, level); err != nil {
+		if audit, err = NewAgentAuditWithBPF(opts.BPFObjPath, agentsDir, agentsID, level, opts.Transparent); err != nil {
 			return nil, fmt.Errorf("failed to create agent audit: %w", err)
 		}
 	}
@@ -206,6 +232,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if credential {
 		api.Events = httpEvents
 	}
+	api.Transparent = opts.Transparent.Mode
 	if set != nil {
 		api.SetPolicy(set)
 	}
@@ -271,6 +298,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		api.ProxyURL = "http://" + opts.ProxyListen.String()
 		recorder.ProxyAddrs = map[string]bool{opts.ProxyListen.String(): true}
 		fmt.Printf("proxy: ext_proc on %s; Envoy bootstrap %s (proxy %s)\n", opts.ExtProcSocket, opts.EnvoyConfig, opts.ProxyListen)
+		if t.Mode != TransparentOff {
+			fmt.Printf("transparent: %s; listener 127.0.0.1:%d and [::1]:%d; exceptions %v\n", t.Mode, t.Port, t.Port, t.Exceptions)
+		}
 	}
 
 	var gw *MCPGateway
@@ -301,6 +331,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		extproc:    xp,
 		httpEvents: httpEvents,
 		policyDir:  opts.PolicyDir,
+		deployment: t.DeploymentMode(),
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -316,7 +347,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment)
 	if err != nil {
 		return err
 	}
@@ -419,8 +450,12 @@ func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]str
 		}
 		hosts = append(hosts, th)
 	}
-	boot, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket,
-		AdminSocket: opts.EnvoyAdmin, Terminate: hosts, UpstreamCA: opts.EnvoyUpstreamCA})
+	ec := EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket,
+		AdminSocket: opts.EnvoyAdmin, Terminate: hosts, UpstreamCA: opts.EnvoyUpstreamCA}
+	if opts.Transparent.Mode != "" && opts.Transparent.Mode != TransparentOff {
+		ec.TransparentPort = opts.Transparent.Port
+	}
+	boot, err := EnvoyBootstrap(ec)
 	if err != nil {
 		return nil, err
 	}
@@ -437,12 +472,12 @@ func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]str
 // loadNodePolicy loads the policy directory. A root node agent requires
 // it to be root-owned. kernelIdentity says runs are known by cgroup,
 // which the receipt reports as enforcement-grade identity.
-func loadNodePolicy(dir string, kernelIdentity bool) (*policy.Set, error) {
+func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: policy.ExplicitProxy, Linux: kernelIdentity}, os.Geteuid() == 0)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -602,9 +637,13 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			ts, event.RunCgroupID, event.CgroupID, event.PID, d.PPID, d.BinaryPath, d.Args)
 	case EventConnect:
 		d := event.Data.(ConnectData)
-		fmt.Printf("%s [CONNECT] run=%d cgroup=%d pid=%d proto=%s dst=%s\n",
+		v := ""
+		if d.Verdict != "" {
+			v = " verdict=" + strconv.Quote(d.Verdict)
+		}
+		fmt.Printf("%s [CONNECT] run=%d cgroup=%d pid=%d proto=%s dst=%s%s\n",
 			ts, event.RunCgroupID, event.CgroupID, event.PID, d.Protocol,
-			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))))
+			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))), v)
 	case EventDNS:
 		d := event.Data.(DNSData)
 		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v\n",
@@ -637,6 +676,15 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		}
 		if d.Reason != "" {
 			extra += " reason=" + strconv.Quote(d.Reason)
+		}
+		if d.Transparent {
+			extra += " transparent orig=" + d.OrigDst
+			if d.SNI != "" {
+				extra += " sni=" + d.SNI
+			}
+			if d.AddrMismatch {
+				extra += " addr-mismatch"
+			}
 		}
 		fmt.Printf("%s [HTTP] run=%d %s decision=%s%s\n", ts, event.RunCgroupID, what, d.Decision, extra)
 	case EventRunStart:

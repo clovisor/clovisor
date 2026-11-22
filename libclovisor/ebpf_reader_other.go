@@ -15,7 +15,7 @@ import "errors"
 // credential identity and no kernel audit (design §4.3).
 type EBPFReader struct{}
 
-func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32) (*EBPFReader, error) {
+func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32, t TransparentOptions) (*EBPFReader, error) {
 	return nil, errors.New("kernel audit (BPF) needs Linux")
 }
 

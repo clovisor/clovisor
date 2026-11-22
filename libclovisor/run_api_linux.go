@@ -173,6 +173,65 @@ func (ac *apiConn) attach(pidfd int) RunAPIResponse {
 		log.Printf("run api: run %s: process %d exited during attach; the pid may have been reused", ac.runID, pid)
 		return fail("process exited during attach")
 	}
+	// Checked after the move: a socket the process creates from now on
+	// is in the run, so none can slip in between check and move.
+	if ac.s.Transparent == TransparentEnforce || ac.s.Transparent == TransparentAudit {
+		n, err := inetSockets(pid)
+		switch {
+		case err != nil && ac.s.Transparent == TransparentEnforce:
+			unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+			return fail("cannot check pid %d for network sockets: %v", pid, err)
+		case n > 0 && ac.s.Transparent == TransparentEnforce:
+			unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+			return fail("pid %d holds %d network sockets created outside the run; they would bypass transparent mode. "+
+				"Start the run from a process without open network sockets", pid, n)
+		case n > 0:
+			log.Printf("run api: run %s: pid %d holds %d network sockets created outside the run (would be refused in enforce)", ac.runID, pid, n)
+		}
+	}
 	ac.attached = true
 	return RunAPIResponse{OK: true, RunID: ac.runID}
+}
+
+// inetSockets counts the TCP, UDP and raw sockets among pid's open files:
+// socket inodes of its fd table that appear in its network namespace's
+// /proc/net tables.
+func inetSockets(pid int) (int, error) {
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	ents, err := os.ReadDir(fdDir)
+	if err != nil {
+		return 0, err
+	}
+	socks := map[string]bool{}
+	for _, e := range ents {
+		t, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+		if err != nil {
+			continue // closed meanwhile
+		}
+		if ino, ok := strings.CutPrefix(t, "socket:["); ok {
+			socks[strings.TrimSuffix(ino, "]")] = true
+		}
+	}
+	if len(socks) == 0 {
+		return 0, nil
+	}
+	n := 0
+	for _, tbl := range []string{"tcp", "tcp6", "udp", "udp6", "raw", "raw6", "udplite", "udplite6"} {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", pid, tbl))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // e.g. no IPv6
+			}
+			return 0, err
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, l := range lines[1:] {
+			f := strings.Fields(l)
+			// sl local remote st tx:rx tr:when retrnsmt uid timeout inode
+			if len(f) > 9 && socks[f[9]] {
+				n++
+			}
+		}
+	}
+	return n, nil
 }

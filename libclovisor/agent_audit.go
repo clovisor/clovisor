@@ -58,6 +58,9 @@ type ConnectData struct {
 	DstIP    string
 	DstPort  uint16
 	Protocol string
+	// Verdict is what transparent mode did with the connect (milestone
+	// 3.1); empty when it is off.
+	Verdict string
 }
 
 // AgentAudit manages audit event collection
@@ -81,8 +84,8 @@ func NewAgentAudit() (*AgentAudit, error) {
 
 // NewAgentAuditWithBPF creates a new agent audit instance with BPF reader
 // that reports tasks under the given agents cgroup.
-func NewAgentAuditWithBPF(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32) (*AgentAudit, error) {
-	reader, err := NewEBPFReader(bpfObjPath, agentsDir, agentsCgroupID, agentsLevel)
+func NewAgentAuditWithBPF(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLevel uint32, t TransparentOptions) (*AgentAudit, error) {
+	reader, err := NewEBPFReader(bpfObjPath, agentsDir, agentsCgroupID, agentsLevel, t)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BPF reader: %w", err)
 	}

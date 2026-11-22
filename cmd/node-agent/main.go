@@ -36,6 +36,10 @@ var (
 	mcpAddr  = flag.String("mcp-listen", "", "Enable the local MCP gateway on this loopback address, e.g. 127.0.0.1:18100")
 	caDir    = flag.String("ca-dir", "", "Node CA for TLS termination, key readable only by the node agent (default <state-dir>/ca)")
 	upCA     = flag.String("envoy-upstream-ca", "", "System trust store as Envoy sees it, to verify origins behind termination (default: the host's)")
+	transp   = flag.String("transparent", "off", "Transparent mode (needs -proxy-listen and cgroup identity): off; audit (record what enforce would do); "+
+		"enforce (every TCP connect from a run goes to Envoy's transparent listener or is refused, also while the node agent is down)")
+	tPort  = flag.Uint("transparent-port", clovisor.DefaultTransparentPort, "Transparent listener port, on 127.0.0.1 and ::1")
+	tStale = flag.Duration("transparent-stale", clovisor.DefaultHeartbeatStale, "How long after the node agent stops connects are refused")
 )
 
 // defaultEnvoyUIDs is the uid of the official Envoy image's user when the
@@ -106,6 +110,7 @@ func main() {
 		MCPListen:       addrFlag("-mcp-listen", *mcpAddr),
 		CADir:           *caDir,
 		EnvoyUpstreamCA: *upCA,
+		Transparent:     clovisor.TransparentOptions{Mode: *transp, Port: uint16(*tPort), Stale: *tStale},
 	})
 	// A policy that does not load is fatal at start: running without it
 	// would silently leave runs unprofiled.

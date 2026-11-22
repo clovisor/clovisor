@@ -16,11 +16,12 @@ guide covers deploying and operating it. The design and its reasoning are in
 - [8. From observation to enforcement](#8-from-observation-to-enforcement)
 - [9. MCP](#9-mcp)
 - [10. TLS termination](#10-tls-termination)
-- [11. Incident response](#11-incident-response)
-- [12. Audit data](#12-audit-data)
-- [13. Security notes and limits](#13-security-notes-and-limits)
-- [14. Troubleshooting](#14-troubleshooting)
-- [15. Testing a deployment](#15-testing-a-deployment)
+- [11. Transparent mode (Linux)](#11-transparent-mode-linux)
+- [12. Incident response](#12-incident-response)
+- [13. Audit data](#13-audit-data)
+- [14. Security notes and limits](#14-security-notes-and-limits)
+- [15. Troubleshooting](#15-troubleshooting)
+- [16. Testing a deployment](#16-testing-a-deployment)
 
 ## 1. What you are deploying
 
@@ -116,6 +117,9 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-envoy-uids 101` | Uids admitted to the `ext_proc` socket besides root and the node agent's own. Whoever can talk to `ext_proc` can write into any run's timeline. |
 | `-envoy-upstream-ca file` | The trust store Envoy verifies origins with, behind termination, as Envoy sees it (a path inside its container). |
 | `-proxy-non-run` | Let processes outside any run use the proxy (decided as unprofiled). Off by default. |
+| `-transparent off\|audit\|enforce` | Transparent mode (§11). Needs `-proxy-listen` and cgroup identity. |
+| `-transparent-port 15001` | The transparent listener's port, on `127.0.0.1` and `::1`. |
+| `-transparent-stale 3s` | How long after the node agent stops its heartbeat connects are refused. |
 
 Signals: `SIGHUP` reloads the policy directory (a bad edit is rejected and the
 policy in force stays); `SIGINT`/`SIGTERM` stop the agent, leaving live runs
@@ -129,7 +133,7 @@ partial, so restart between runs.
 The node agent writes `<runtime-dir>/envoy.json` and, for terminated hosts,
 leaf certificates in `<runtime-dir>/envoy/tls`. The integration tests pin
 **Envoy 1.34.14**; use that release or check a newer one with
-`make integration ENVOY_IMAGE=…` (see §15) before upgrading.
+`make integration ENVOY_IMAGE=…` (see §16) before upgrading.
 
 ```sh
 # as root, Envoy as uid 101 (the image's user)
@@ -338,7 +342,71 @@ Everything else is tunnelled untouched, with the origin's own certificate.
 Terminating TLS makes the proxy a holder of plaintext. Terminate only the
 hosts whose rules need it, and treat the node as sensitive accordingly.
 
-## 11. Incident response
+## 11. Transparent mode (Linux)
+
+With the explicit proxy alone, routing is advisory: a tool that ignores the
+proxy variables (Node `fetch`, `curl --noproxy`, a Go binary with its own
+dialer) goes direct. Transparent mode makes routing binding for TCP. Every
+TCP connect from a run is either redirected to Envoy's transparent listener
+or refused (design §6.5). The policy, termination, MCP inspection and
+timelines are the explicit proxy's, unchanged.
+
+**Requirements.** Linux with cgroup v2, root, cgroup identity,
+`-proxy-listen`, bpffs at `/sys/fs/bpf`, and Envoy on the host network
+(`--network host`), since the transparent listener is on loopback. Kernel 5.8
+or later, going by when the hooks and helpers appeared; only 7.0 has been
+tested.
+
+**Roll it out in three steps:**
+
+1. `-transparent audit`. Nothing changes for runs. Each connect is recorded
+   with what enforce would have done (`verdict` in the timeline: `would
+   redirect`, `would refuse`). Replay the timelines against the profile with
+   `agentctl check --runs` to see what enforce would then deny.
+2. `-transparent enforce` on a test host, with real agent work.
+3. `-transparent enforce` everywhere. Restart Envoy after the node agent
+   starts, so it loads the bootstrap with the transparent listener.
+
+**What happens to a connect from a run in enforce mode:**
+
+| Destination | Outcome |
+|---|---|
+| The explicit proxy, the MCP gateway | Direct (exceptions). |
+| Loopback, listener bound by the same run (a dev server) | Direct. |
+| Loopback, nothing listening | Direct: fails with `ECONNREFUSED`, as it would anyway. |
+| Loopback, a listener outside the run (a host Redis) | Redirected; the proxy refuses node-local destinations. |
+| TLS with a server name | `CONNECT <name>:<port>` into the proxy. The proxy resolves the name, so a client that pairs an allowed name with another address reaches the name's address. The timeline notes the mismatch. |
+| TLS without a server name; other TCP (SSH, databases) | `CONNECT <ip>:<port>`. Only `cidr` rules match it: a hostname rule does not allow `ssh github.com`. |
+| Plain HTTP | Routed by `Host`, with method and path rules. |
+| Anything, while the node agent is down | Refused with `EPERM`. |
+
+**Fail closed.** In enforce mode the connect hooks are pinned in
+`/sys/fs/bpf/clovisor`, so they outlive the node agent. If it stops or
+crashes, its heartbeat lapses, and within `-transparent-stale` every connect
+from a run is refused until a node agent starts again. A restarted node agent
+swaps its programs into the pinned links with no gap. If Envoy is down,
+redirected connects are refused by the kernel (`ECONNREFUSED`).
+
+**Turning it off.** Starting the node agent with `-transparent off` (or
+`audit`) removes the pins, and runs reach the network directly again.
+Stopping the node agent does not: that is the fail-closed case. To remove
+the hooks without a node agent, delete the pins:
+`sudo rm /sys/fs/bpf/clovisor/transparent-*`.
+
+**Runs must start clean.** The kernel applies a socket's hooks by the cgroup
+it was created in, so a socket opened before the process joined the run would
+bypass them. In enforce mode the run API refuses to start a run whose first
+process holds network sockets (for example, a TCP socket as standard input).
+Audit mode logs it instead.
+
+**Denials.** Plain HTTP and terminated hosts get the narrated 403 body. A
+refused TLS or TCP connection is closed (clients report a reset); the reason
+is in the timeline and the node agent's log.
+
+**Not covered yet:** UDP, including DNS and QUIC (milestones 3.3 and 3.4);
+raw and Unix sockets; a host daemon connecting on a run's behalf (Phase 4).
+
+## 12. Incident response
 
 ```sh
 agentctl clamp <run-id> <profile>   # layer a narrower profile onto a live run
@@ -349,7 +417,7 @@ Both only remove permissions, so the run's owner may use them as well as root.
 They take effect on the next request, without restarting the run. The
 timeline records who clamped and when.
 
-## 12. Audit data
+## 13. Audit data
 
 ```sh
 agentctl events                 # list runs
@@ -370,7 +438,7 @@ agentctl events --json <run-id>
 - **Event cap.** Events past the per-run cap are counted but not listed;
   summaries stay complete.
 
-## 13. Security notes and limits
+## 14. Security notes and limits
 
 - **Who can reach `ext_proc`.** The `ext_proc` socket admits only root, the
   node agent's uid and `-envoy-uids`. Anything that can reach it can forge
@@ -382,13 +450,14 @@ agentctl events --json <run-id>
   (loopback, link-local, metadata endpoints, the node's own addresses), and
   hostnames that resolve to them.
 - **What the proxy cannot see.** UDP (including QUIC and DNS) never reaches
-  an explicit proxy. Neither does anything that ignores the proxy variables.
+  an explicit proxy. Neither does anything that ignores the proxy variables,
+  unless transparent mode (§11) is on.
   With credential identity, nothing below the proxy is observed at all. See
   design §6.8 and §11.
 - **Allowed destinations.** Exfiltration through allowed destinations is a
   stated limit (design §11). Path rules narrow it; they do not close it.
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
@@ -402,8 +471,11 @@ agentctl events --json <run-id>
 | TLS errors on a terminated host | The tool does not read the trust variables. Point it at `<runtime-dir>/ca-bundle.pem`, or mark the rule `no_terminate` (losing its path rules). |
 | A narrated 403 body is missing | On CONNECT, clients drop the body: read the `x-clovisor-denial` response header, or the timeline. |
 | MCP tools disappeared after a server update | Pin drift: `sudo agentctl pins`, review, approve. |
+| A run's connects fail with `EPERM` (transparent enforce) | The node agent is down or wedged, so its heartbeat is stale. Start it; to drop enforcement, start it with `-transparent off`. |
+| `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
+| A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination reached by address needs a `cidr` rule. |
 
-## 15. Testing a deployment
+## 16. Testing a deployment
 
 ```sh
 make check                               # unit tests and the macOS cross-build

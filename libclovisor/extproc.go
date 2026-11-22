@@ -53,6 +53,16 @@ type HTTPData struct {
 	// Terminated marks a CONNECT that Envoy terminates: its requests are
 	// decided, and recorded, one by one.
 	Terminated bool
+	// Transparent marks traffic the connect hooks redirected (milestone
+	// 3.2) rather than traffic the run sent to the proxy. OrigDst is the
+	// address it was sent to, SNI its TLS server name.
+	Transparent bool
+	OrigDst     string
+	SNI         string
+	// AddrMismatch: the run connected to an address the destination's
+	// name does not resolve to. It was routed by name, so it reached the
+	// name's address, not the one it chose.
+	AddrMismatch bool
 }
 
 // ExtProcServer decides proxied requests for runs (milestone 2.3). It
@@ -322,6 +332,23 @@ func (s *ExtProcServer) guard(ctx context.Context, host string, ip netip.Addr) s
 	return ""
 }
 
+// resolvesTo reports whether host, as the guard last resolved it, has
+// address a. Unknown counts as yes: a mismatch is a note, never a denial.
+func (s *ExtProcServer) resolvesTo(host string, a netip.Addr) bool {
+	s.cacheMu.Lock()
+	r, ok := s.cache[policy.NormalizeHost(host)]
+	s.cacheMu.Unlock()
+	if !ok || len(r.addrs) == 0 {
+		return true
+	}
+	for _, x := range r.addrs {
+		if x.Unmap() == a.Unmap() {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *remoteMCP) {
 	resp, decided := s.decideHeaders(ctx, req, h)
 	m := decided.mcp
@@ -372,10 +399,24 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	// which Envoy wrote, overwriting any client value. Attributes cannot be
 	// set by clients, so the header is trusted only there.
 	inner := strings.HasPrefix(attribute(req, "source.address"), "envoy://")
+	// Plain HTTP on the transparent listener arrives from the client
+	// itself, but Envoy wrote the client's socket address into a header,
+	// overwriting any client value, since the local address is the
+	// original destination's. Trusted on that route only.
+	transparentHTTP := !inner && attribute(req, "xds.route_name") == TransparentHTTPRoute
+	if inner || transparentHTTP {
+		if o := headerValue(hm, hdrOrigDst); o != "" {
+			d.Transparent, d.OrigDst, d.SNI = true, o, headerValue(hm, hdrSNI)
+		}
+	}
 	runID, eff, isRun, cg, runCg := "", (*policy.Effective)(nil), false, uint64(0), uint64(0)
 	var src, dst netip.AddrPort
 	var err1, err2 error
-	if inner {
+	if transparentHTTP {
+		client, proxy, _ := strings.Cut(headerValue(hm, hdrClient), ",")
+		src, err1 = netip.ParseAddrPort(client)
+		dst, err2 = netip.ParseAddrPort(proxy)
+	} else if inner {
 		client, proxy, _ := strings.Cut(headerValue(hm, hdrClient), ",")
 		src, err1 = netip.ParseAddrPort(client)
 		dst, err2 = netip.ParseAddrPort(proxy)
@@ -440,7 +481,13 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		return s.deny(d, ""), headerOutcome{}
 	}
 
-	if reason := s.guard(ctx, host, ip); reason != "" {
+	reason := s.guard(ctx, host, ip)
+	if d.Transparent && !ip.IsValid() && reason == "" {
+		if o, err := netip.ParseAddrPort(d.OrigDst); err == nil {
+			d.AddrMismatch = !s.resolvesTo(host, o.Addr())
+		}
+	}
+	if reason != "" {
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "guard: "+reason
 		d.Message = "Egress to " + net.JoinHostPort(host, strconv.Itoa(int(port))) + " is refused: " + reason + "."
 		s.record(runCg, runID, d)
