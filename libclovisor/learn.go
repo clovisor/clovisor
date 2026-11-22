@@ -83,6 +83,13 @@ type Draft struct {
 	mcpSeen    []*mcpSeen
 	mcpRules   []*mcpSeen // parallel to Profile.Spec.MCP.Servers
 	mcpNotes   []string
+
+	// Transparent mode (milestone 3.6):
+	udpRefused map[destKey]*learnedIP // UDP the node refused
+	udpNames   map[destKey][]string
+	dnsBlocked map[string]bool // names the node's resolver refused
+	mismatch   map[string]int  // host -> connections to an address it does not resolve to
+	byAddress  []string        // refused tunnels to an address the run had looked up by name
 }
 
 // LearnProfile drafts an AgentProfile that would allow exactly the
@@ -100,6 +107,10 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		badNames:   map[string]int{},
 		httpGroups: map[string]*httpGroup{},
 		opaque:     map[string]bool{},
+		udpRefused: map[destKey]*learnedIP{},
+		udpNames:   map[destKey][]string{},
+		dnsBlocked: map[string]bool{},
+		mismatch:   map[string]int{},
 	}
 	d.Profile.Kind = "AgentProfile"
 	d.Profile.Metadata.Name = name
@@ -121,6 +132,41 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		}
 		for _, n := range tl.Summary.DNSNames {
 			looked[n] = true
+		}
+		for _, n := range tl.Summary.DNSBlocked {
+			d.dnsBlocked[n] = true
+		}
+		ipName := map[string]string{}
+		for _, e := range tl.Events {
+			if e.Type == "dns" {
+				for _, a := range e.Answers {
+					if a.Type == "A" || a.Type == "AAAA" {
+						ipName[a.Value] = e.Query
+					}
+				}
+			}
+		}
+		for _, p := range tl.Summary.Proxied {
+			if p.AddrMismatches > 0 {
+				d.mismatch[p.Host] += p.AddrMismatches
+			}
+			// Refused by address, though the run had resolved a name to
+			// it: non-TLS TCP in transparent mode, which an fqdn rule
+			// cannot allow.
+			if n := ipName[p.Host]; n != "" && p.Denied > 0 {
+				d.byAddress = append(d.byAddress, fmt.Sprintf("%s:%d (%s) %s", p.Host, p.Port, n, plural(p.Denied, "time")))
+			}
+		}
+		for _, u := range tl.Summary.UDPRefusedTo {
+			k := destKey{u.Proto, u.IP, u.Port}
+			li := d.udpRefused[k]
+			if li == nil {
+				li = &learnedIP{proto: u.Proto, ip: u.IP, port: u.Port, runs: map[string]bool{}}
+				d.udpRefused[k] = li
+			}
+			li.conns += u.Count
+			li.runs[tl.RunID] = true
+			d.udpNames[k] = append(d.udpNames[k], u.Names...)
 		}
 		for _, dst := range append(append([]Destination{}, tl.Summary.Destinations...), proxiedDestinations(tl, true)...) {
 			if dst.Port == 53 && dst.Proto == "UDP" {
@@ -357,6 +403,32 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			p("      # unseen. To learn them, run under an audit profile whose rule for this")
 			p("      # host has http: { paths: [\"*\"] }.")
 		}
+		if n := d.mismatch[h.name]; n > 0 {
+			p("      # %s sent to an address %s does not resolve to; transparent mode", plural(n, "connection"), commentSafe(h.name))
+			p("      # routed them by name instead.")
+		}
+		var raw []string
+		for _, port := range r.To.Ports {
+			if !httpish[port] {
+				raw = append(raw, strconv.Itoa(int(port)))
+			}
+		}
+		if len(raw) > 0 {
+			var ips []string
+			for ip := range h.ips {
+				if ip != "via proxy" {
+					ips = append(ips, q(hostCIDR(ip)))
+				}
+			}
+			sort.Strings(ips)
+			p("      # Port %s: unless that traffic is TLS or HTTP, transparent mode sees only the", strings.Join(raw, ", "))
+			p("      # address, and this fqdn rule does not match it. If so, it needs a cidr rule,")
+			if len(ips) > 0 {
+				p("      # e.g. to: { cidr: [%s], ports: [%s] } for the addresses seen.", strings.Join(ips, ", "), strings.Join(raw, ", "))
+			} else {
+				p("      # for the addresses the host uses.")
+			}
+		}
 		p("      - name: %s", q(r.Name))
 		p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
 		p("        action: %s", r.Action)
@@ -384,13 +456,36 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	sort.Strings(udpNamed)
 	if len(udpNamed) > 0 || len(d.otherUDP) > 0 {
 		p("")
-		p("      # UDP seen and not allowed. QUIC is denied by default and clients fall back")
-		p("      # to TCP (design §6.8).")
+		p("      # UDP seen and not allowed. Transparent mode refuses UDP other than DNS and")
+		p("      # the node's -udp-allow; QUIC (UDP 443) falls back to TCP (design §6.8).")
 		for _, s := range udpNamed {
 			p("      #   %s", commentSafe(s))
 		}
 		for _, li := range d.otherUDP {
 			p("      #   %s (%s)", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), plural(li.conns, "connection"))
+		}
+	}
+	if len(d.udpRefused) > 0 {
+		var ks []destKey
+		for k := range d.udpRefused {
+			ks = append(ks, k)
+		}
+		sort.Slice(ks, func(i, j int) bool {
+			if ks[i].ip != ks[j].ip {
+				return ks[i].ip < ks[j].ip
+			}
+			return ks[i].port < ks[j].port
+		})
+		p("")
+		p("      # UDP the node refused. Profiles cannot allow UDP; if the agent needs one of")
+		p("      # these, the operator adds it to the node's -udp-allow:")
+		for _, k := range ks {
+			li := d.udpRefused[k]
+			names := ""
+			if ns := sortedSet(setOf(d.udpNames[k])); len(ns) > 0 {
+				names = " " + commentSafe(strings.Join(ns, ", "))
+			}
+			p("      #   %s%s (%s)%s", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), names, plural(li.conns, "attempt"), runsNote(li.runs, total))
 		}
 	}
 	if len(d.local) > 0 {
@@ -407,13 +502,33 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		}
 		sort.Strings(servers)
 		p("")
-		p("      # DNS went to %s. With forced local DNS (design §6.8) the", strings.Join(servers, ", "))
-		p("      # node resolver answers instead; no rule is needed.")
+		p("      # DNS went to %s. In transparent mode the node's resolver answers", strings.Join(servers, ", "))
+		p("      # instead, only for names a rule allows; no DNS rule is needed (design §6.8).")
 	}
 	if len(d.lookedUp) > 0 {
 		p("")
 		p("      # Looked up but never connected to (not allowed):")
 		for _, n := range d.lookedUp {
+			p("      #   %s", commentSafe(n))
+		}
+	}
+
+	if len(d.byAddress) > 0 {
+		sort.Strings(d.byAddress)
+		p("")
+		p("      # Refused TCP to addresses the run had looked up by name. Transparent mode")
+		p("      # knows traffic that is neither TLS nor HTTP (SSH, databases) by address only,")
+		p("      # so an fqdn rule cannot allow it: it needs a cidr rule for the name's")
+		p("      # addresses, which may change.")
+		for _, s := range d.byAddress {
+			p("      #   %s", commentSafe(s))
+		}
+	}
+
+	if len(d.dnsBlocked) > 0 {
+		p("")
+		p("      # Looked up but refused by the node's resolver, under the profile in force:")
+		for _, n := range sortedSet(d.dnsBlocked) {
 			p("      #   %s", commentSafe(n))
 		}
 	}
@@ -522,4 +637,12 @@ func hostCIDR(ip string) string {
 		return ip + "/128"
 	}
 	return ip + "/32"
+}
+
+func setOf(ss []string) map[string]bool {
+	m := map[string]bool{}
+	for _, s := range ss {
+		m[s] = true
+	}
+	return m
 }

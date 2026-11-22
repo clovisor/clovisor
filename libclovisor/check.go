@@ -22,7 +22,7 @@ import (
 // CheckFinding is one destination or binary seen in the runs, with what
 // the profile would do about it.
 type CheckFinding struct {
-	Kind     string // egress, http, mcp, exec, unverifiable, not-governed
+	Kind     string // egress, http, mcp, exec, dns, udp, unverifiable, not-governed
 	What     string // "TCP api.github.com:443 (140.82.112.6)", "/usr/bin/curl"
 	Decision string // allow, deny, tag-and-log, deferred, or a reason
 	Rule     string
@@ -42,16 +42,48 @@ type CheckReport struct {
 	// Unverifiable: allowed at host level, but the deciding rule needs
 	// method or path, which audit data does not record.
 	Unverifiable []CheckFinding
-	// NotGoverned: traffic an explicit proxy never sees (loopback, DNS,
-	// other UDP, raw IP connects by non-proxy-aware clients).
+	// NotGoverned: traffic the deployment does not decide (with an
+	// explicit proxy: loopback, DNS, other UDP, raw IP connects by
+	// non-proxy-aware clients; with transparent mode, same-run loopback).
 	NotGoverned []CheckFinding
+	// Transparent: replayed as transparent enforce would decide.
+	Transparent bool
 }
+
+// CheckOptions describe the deployment to replay against.
+type CheckOptions struct {
+	// Transparent replays as transparent enforce mode decides (milestone
+	// 3.6): DNS names against the resolver's rule, UDP refused unless in
+	// UDPAllow, and TCP that is likely neither TLS nor HTTP matched by
+	// address only.
+	Transparent bool
+	UDPAllow    []netip.AddrPort
+}
+
+// httpish are ports whose traffic is assumed TLS or HTTP, so that
+// transparent mode routes it by name. Others reach the proxy as a raw
+// TCP tunnel, known by address alone.
+var httpish = map[uint16]bool{80: true, 443: true, 8080: true, 8443: true}
 
 type findingKey struct{ kind, what string }
 
-// CheckRuns replays the runs' destinations and execs against cp.
+// CheckRuns replays the runs' destinations and execs against cp, for an
+// explicit-proxy deployment.
 func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
-	rep := &CheckReport{Profile: cp.Name, Version: cp.Profile.ShortVersion()}
+	return CheckRunsWith(cp, runs, CheckOptions{})
+}
+
+// CheckRunsWith is CheckRuns for the deployment o describes.
+func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptions) *CheckReport {
+	rep := &CheckReport{Profile: cp.Name, Version: cp.Profile.ShortVersion(), Transparent: o.Transparent}
+	udpAllowed := func(ip netip.Addr, port uint16) bool {
+		for _, a := range o.UDPAllow {
+			if a.Port() == port && (a.Addr().Unmap() == ip.Unmap() || (a.Addr().IsUnspecified() && ip.IsLoopback())) {
+				return true
+			}
+		}
+		return false
+	}
 	found := map[findingKey]*CheckFinding{}
 	var order []findingKey
 	add := func(kind, what string, f CheckFinding, runID string, n int) {
@@ -75,22 +107,79 @@ func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
 	for _, tl := range runs {
 		rep.Runs = append(rep.Runs, tl.RunID)
 		l7 := checkL7(cp, tl, add)
-		for _, d := range append(append([]Destination{}, tl.Summary.Destinations...), l7...) {
+		if o.Transparent {
+			// The node's resolver answers a name only if some rule could
+			// allow a connection to it.
+			for _, n := range append(append([]string{}, tl.Summary.DNSNames...), tl.Summary.DNSBlocked...) {
+				dec := cp.DecideName(n)
+				f := CheckFinding{Decision: dec.Action, Rule: dec.Rule, Message: dec.Message}
+				if dec.Allowed() {
+					add("dns-allow", n, f, tl.RunID, 1)
+				} else {
+					f.Message = "NXDOMAIN: " + dec.Message
+					add("dns-deny", n, f, tl.RunID, 1)
+				}
+			}
+		}
+		dests := append(append([]Destination{}, tl.Summary.Destinations...), l7...)
+		if o.Transparent {
+			// UDP refused under enforce: it never reached anywhere, and
+			// would be refused again.
+			dests = append(dests, tl.Summary.UDPRefusedTo...)
+		}
+		for _, d := range dests {
 			addr := net.JoinHostPort(d.IP, strconv.Itoa(int(d.Port)))
 			if d.IP == "via proxy" {
 				addr = "via proxy"
 			}
 			ip, _ := netip.ParseAddr(d.IP)
 			switch {
+			case d.Port == 53 && o.Transparent:
+				continue // decided above, by name
 			case d.Proto == "UDP" && d.Port == 53:
-				add("not-governed", d.Proto+" "+addr, CheckFinding{Decision: "DNS: answered locally; Phase 3 forces it"}, tl.RunID, d.Count)
+				add("not-governed", d.Proto+" "+addr, CheckFinding{Decision: "DNS: answered locally; transparent mode forces it"}, tl.RunID, d.Count)
+				continue
+			case ip.IsLoopback() && o.Transparent:
+				add("not-governed", d.Proto+" "+addr, CheckFinding{Decision: "loopback: direct if the run itself listens there; otherwise refused as node-local"}, tl.RunID, d.Count)
 				continue
 			case ip.IsLoopback():
 				add("not-governed", d.Proto+" "+addr, CheckFinding{Decision: "loopback"}, tl.RunID, d.Count)
 				continue
+			case d.Proto == "UDP" && o.Transparent:
+				what := d.Proto + " " + addr + namesSuffix(d.Names)
+				if udpAllowed(ip, d.Port) {
+					add("udp-allow", what, CheckFinding{Decision: policy.ActionAllow, Rule: "node -udp-allow"}, tl.RunID, d.Count)
+				} else {
+					msg := "UDP is refused except DNS and the node's -udp-allow"
+					if d.Port == 443 {
+						msg += "; QUIC: clients fall back to TCP"
+					}
+					add("udp-deny", what, CheckFinding{Decision: policy.ActionDeny, Message: msg}, tl.RunID, d.Count)
+				}
+				continue
 			case d.Proto == "UDP":
 				add("not-governed", d.Proto+" "+addr+namesSuffix(d.Names), CheckFinding{Decision: "UDP never reaches an explicit proxy"}, tl.RunID, d.Count)
 				continue
+			}
+			if o.Transparent && len(d.Names) > 0 && !httpish[d.Port] && ip.IsValid() {
+				// Likely neither TLS nor HTTP: the proxy sees only the
+				// address. A rule that allows the name does not allow it.
+				byName := false
+				for _, n := range d.Names {
+					if cp.Decide(policy.Request{Host: n, Port: d.Port}).Allowed() {
+						byName = true
+					}
+				}
+				byAddr := cp.Decide(policy.Request{IP: ip, Port: d.Port})
+				if byName && !byAddr.Allowed() {
+					add("by-address", fmt.Sprintf("%s %s:%d (%s)", d.Proto, d.Names[0], d.Port, d.IP), CheckFinding{
+						Decision: "allowed by name, denied by address",
+						Rule:     byAddr.Rule,
+						Message: fmt.Sprintf("unless this is TLS or HTTP, transparent mode sees only %s, which no cidr rule allows",
+							addr),
+					}, tl.RunID, d.Count)
+					continue
+				}
 			}
 			reqs := []policy.Request{}
 			labels := []string{}
@@ -149,10 +238,12 @@ func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
 		f := *found[k]
 		sort.Strings(f.Runs)
 		switch k.kind {
-		case "egress-deny", "http-deny", "mcp-deny", "exec-deny":
+		case "egress-deny", "http-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny":
 			f.Kind = strings.TrimSuffix(k.kind, "-deny")
 			rep.Violations = append(rep.Violations, f)
-		case "egress-allow", "http-allow", "mcp-allow", "exec-allow":
+		case "by-address":
+			rep.Unverifiable = append(rep.Unverifiable, f)
+		case "egress-allow", "http-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow":
 			f.Kind = strings.TrimSuffix(k.kind, "-allow")
 			rep.Allowed = append(rep.Allowed, f)
 		case "unverifiable":
@@ -183,7 +274,11 @@ func namesSuffix(names []string) string {
 func (rep *CheckReport) WriteText(w io.Writer) error {
 	var b strings.Builder
 	p := func(format string, a ...interface{}) { fmt.Fprintf(&b, format+"\n", a...) }
-	p("Profile %s@%s against %d run(s)", rep.Profile, rep.Version, len(rep.Runs))
+	mode := "an explicit proxy"
+	if rep.Transparent {
+		mode = "transparent enforce"
+	}
+	p("Profile %s@%s against %d run(s), as %s would decide", rep.Profile, rep.Version, len(rep.Runs), mode)
 	section := func(title string, fs []CheckFinding, detail func(CheckFinding) string) {
 		p("")
 		p("%s (%d)", title, len(fs))
@@ -211,12 +306,19 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 		return "rule " + f.Rule + runs(f)
 	})
 	if len(rep.Unverifiable) > 0 {
-		section("Depends on method or path, which audit data lacks", rep.Unverifiable, func(f CheckFinding) string {
+		section("Depends on what audit data lacks (method, path, or whether it was TLS)", rep.Unverifiable, func(f CheckFinding) string {
+			if f.Kind == "by-address" {
+				return f.Message + runs(f)
+			}
 			return "first matching rule " + f.Rule + runs(f)
 		})
 	}
 	if len(rep.NotGoverned) > 0 {
-		section("Not seen by an explicit proxy", rep.NotGoverned, func(f CheckFinding) string { return f.Decision + runs(f) })
+		title := "Not seen by an explicit proxy"
+		if rep.Transparent {
+			title = "Not decided by policy"
+		}
+		section(title, rep.NotGoverned, func(f CheckFinding) string { return f.Decision + runs(f) })
 	}
 	_, err := io.WriteString(w, b.String())
 	return err

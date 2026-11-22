@@ -365,8 +365,21 @@ tested.
 
 1. `-transparent audit`. Nothing changes for runs. Each connect is recorded
    with what enforce would have done (`verdict` in the timeline: `would
-   redirect`, `would refuse`). Replay the timelines against the profile with
-   `agentctl check --runs` to see what enforce would then deny.
+   redirect`, `would refuse`). Replay the timelines as enforce would decide:
+
+   ```sh
+   agentctl check --transparent --udp-allow <the node's list> --profile p.yaml --all
+   ```
+
+   Besides egress rules, this decides every looked-up name as the resolver
+   would (NXDOMAIN shows as a `dns` violation) and every UDP send (a `udp`
+   violation unless `--udp-allow` covers it). It flags TCP to a name on a
+   port that is usually neither TLS nor HTTP, where only a hostname rule
+   allows it (`by-address`): enforce will see only the address there.
+   `agentctl explain --transparent enforce p.yaml` shows the receipt for
+   the transparent node, with the same warning on each affected rule.
+   `agentctl learn` drafts from these timelines with notes for each of the
+   above, including a cidr line for the addresses seen.
 2. `-transparent enforce` on a test host, with real agent work.
 3. `-transparent enforce` everywhere. Restart Envoy after the node agent
    starts, so it loads the bootstrap with the transparent listener.

@@ -417,7 +417,26 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 	if r.Action == ActionTagAndLog {
 		pl.Notes = append(pl.Notes, "allowed and tagged in the audit log")
 	}
+	if (c.opts.Mode == Transparent || c.opts.Mode == TransparentAudit) && len(r.To.FQDN) > 0 && r.Action != ActionDeny && mayCarryRawTCP(r.To.Ports) {
+		pl.Notes = append(pl.Notes, "transparent: traffic that is neither TLS nor HTTP (SSH, databases) is known by address only, so this name does not match it")
+	}
 	return pl
+}
+
+// mayCarryRawTCP: the ports include one not usually TLS or HTTP (none
+// listed means every port).
+func mayCarryRawTCP(ports []uint16) bool {
+	if len(ports) == 0 {
+		return true
+	}
+	for _, p := range ports {
+		switch p {
+		case 80, 443, 8080, 8443:
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {

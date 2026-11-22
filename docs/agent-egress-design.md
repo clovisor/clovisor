@@ -73,6 +73,7 @@ place:
 | Forced local DNS: every run query to the node's resolver, which answers only names the profile could allow (NXDOMAIN with an EDE reason otherwise) and strips ECH. | [3.4 status](#34-status-2026-11-22) |
 | UDP refused except DNS, node-wide exceptions and same-run loopback, QUIC included; a packet backstop drops what gets past the socket hooks. | [3.3 status](#33-status-2026-11-22) |
 | Heartbeat tied to Envoy's health; the proxy's own connects gated in the kernel (closing DNS rebinding); lost kernel events counted per run; `agentctl status`; overhead measured. | [3.5 status](#35-status-2026-11-22) |
+| Learn, check and receipt for transparent deployments: `check --transparent` replays DNS, UDP and by-address TCP as enforce decides; learn notes for each; `explain --transparent`. | [3.6 status](#36-status-2026-11-22) |
 
 ---
 
@@ -2549,6 +2550,63 @@ are never charged, so every timeline still closes. Verified live:
 
 The first setting (a 128 KiB burst) suppressed 62 events of a 300-exec shell
 loop, so budgets are sized for build-like exec bursts.
+
+#### 3.6 status (2026-11-22)
+
+Implemented:
+
+- **`agentctl check --transparent [--udp-allow …]`** replays timelines as
+  transparent enforce decides:
+  - every name looked up, or refused, goes through `DecideName`; a name
+    enforce would answer NXDOMAIN is a `dns` violation;
+  - non-DNS UDP, including what enforce already refused (the new
+    `udp_refused_to` summary), is a `udp` violation unless the node's
+    `-udp-allow` covers it; QUIC is named as such;
+  - TCP to a name on a port not usually TLS or HTTP (other than 80, 443,
+    8080, 8443) is flagged `by-address` when a hostname rule allows it and no
+    `cidr` rule allows the address. Audit data cannot tell whether it was
+    TLS, so this is listed as unverifiable, not as a violation;
+  - loopback is explained as direct for the run's own listeners and refused
+    as node-local otherwise.
+- **Learn** drafts as before (SNI hosts arrive as proxied requests) and adds
+  notes:
+  - the `by-address` warning on affected host rules, with a cidr line for the
+    addresses seen;
+  - address mismatches, which were routed by name;
+  - UDP the node refused, for the operator's `-udp-allow`;
+  - names the resolver refused;
+  - refused tunnels to addresses the run had resolved, with the name.
+- **Receipt.** `agentctl explain --transparent off|audit|enforce` compiles
+  for that deployment. Under transparent modes, host rules on ports that may
+  carry raw TCP get the note that such traffic is known by address only. The
+  routing and DNS lines came with 3.1 to 3.4.
+
+Verified live, as a round trip on kernel 7.0:
+
+1. **Audit.** An unprofiled run under transparent audit did HTTPS to
+   example.com, SSH to github.com, a UDP send to 8.8.8.8:443, and a lookup of
+   pypi.org.
+2. **Draft.** `agentctl learn` allowed example.com:443 and github.com:22,
+   with the by-address note and cidr line on the SSH rule.
+3. **Check.** `agentctl check --transparent` on the draft predicted: pypi.org
+   NXDOMAIN, the UDP send refused, HTTPS allowed, SSH at risk by address.
+4. **Enforce.** With the draft enforced, the same workload got exactly that:
+   HTTPS 200, SSH refused, UDP `EPERM`, pypi.org unresolved.
+5. **Learn again.** Learning from the enforced run reported the refused UDP,
+   the refused name, and the refused SSH tunnel as `20.172.24.160:22
+   (github.com)`.
+
+Findings:
+
+- **The by-address case needs cidr rules that go stale.** github.com
+  answered with a different address in the enforced run than in the audit
+  run (172.182.252.133, then 20.172.24.160), so the drafted cidr line would
+  not have matched. This is the strongest argument for the narrower name
+  rule considered in the 3.1/3.2 findings: match a hostname rule for raw TCP
+  when the run's own resolver answer mapped that name to that address. The
+  forced resolver now has exactly that record. It needs a decision.
+- An enforce-mode draft must set `exec.audit_only: true` until Phase 4; learn
+  drafts audit-mode profiles, so this only bites when promoting one by hand.
 
 #### Decisions
 

@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -43,8 +44,9 @@ func printUsage() {
 	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
 	fmt.Println("  agentctl learn [-o file] [--name n] (--all | run-id...)")
 	fmt.Println("                                    Draft a profile from recorded runs")
-	fmt.Println("  agentctl explain profile.yaml...  Compile profiles and print the enforcement receipt")
-	fmt.Println("  agentctl check --profile p.yaml (--all | run-id...)")
+	fmt.Println("  agentctl explain [--transparent off|audit|enforce] profile.yaml...")
+	fmt.Println("                                    Compile profiles and print the enforcement receipt")
+	fmt.Println("  agentctl check --profile p.yaml [--transparent [--udp-allow ip:port,...]] (--all | run-id...)")
 	fmt.Println("                                    Replay recorded runs against a profile; exit 1 on violations")
 	fmt.Println("  agentctl pins [--all]             List MCP tools whose definitions changed since pinned")
 	fmt.Println("  agentctl pins show <server> <tool>")
@@ -883,6 +885,10 @@ func loadRuns(dir string, all bool, ids []string) ([]*clovisor.RunTimeline, erro
 // compileFiles parses and compiles profile files for this deployment,
 // printing every diagnostic.
 func compileFiles(paths []string, linux bool) (*policy.Compiled, error) {
+	return compileFilesFor(paths, policy.Options{Mode: policy.ExplicitProxy, Linux: linux})
+}
+
+func compileFilesFor(paths []string, opts policy.Options) (*policy.Compiled, error) {
 	var ps []*policy.AgentProfile
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
@@ -898,7 +904,7 @@ func compileFiles(paths []string, linux bool) (*policy.Compiled, error) {
 		}
 		ps = append(ps, p)
 	}
-	c, diags := policy.Compile(policy.Options{Mode: policy.ExplicitProxy, Linux: linux}, ps...)
+	c, diags := policy.Compile(opts, ps...)
 	if len(diags) > 0 {
 		for _, d := range diags {
 			fmt.Fprintf(os.Stderr, "error: %v\n", d)
@@ -920,13 +926,19 @@ func platformFlag(fs *flag.FlagSet) *string {
 func explainProfiles(argv []string) error {
 	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
 	platform := platformFlag(fs)
+	transparent := fs.String("transparent", "off", "the node's transparent mode: off, audit or enforce (Linux)")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
 		return fmt.Errorf("give one or more profile files; pass every profile active on a node to see node-wide TLS posture")
 	}
-	c, err := compileFiles(fs.Args(), *platform == "linux")
+	t := clovisor.TransparentOptions{Mode: *transparent}
+	mode := t.DeploymentMode()
+	if *transparent != clovisor.TransparentOff && mode == policy.ExplicitProxy {
+		return fmt.Errorf("--transparent must be off, audit or enforce")
+	}
+	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux"})
 	if err != nil {
 		return err
 	}
@@ -943,12 +955,25 @@ func checkProfile(argv []string) error {
 	dir := fs.String("dir", runsDir(), "directory of run timeline files")
 	profile := fs.String("profile", "", "profile file to check against (required)")
 	all := fs.Bool("all", false, "check every finished run in -dir")
+	transparent := fs.Bool("transparent", false, "replay as transparent enforce mode decides: DNS by name, UDP refused, non-TLS TCP by address")
+	udpAllow := fs.String("udp-allow", "", "with --transparent: the node's -udp-allow list (comma-separated ip:port)")
 	platform := platformFlag(fs)
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if *profile == "" {
 		return fmt.Errorf("--profile is required")
+	}
+	opts := clovisor.CheckOptions{Transparent: *transparent}
+	for _, f := range strings.Split(*udpAllow, ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		a, err := netip.ParseAddrPort(f)
+		if err != nil {
+			return fmt.Errorf("--udp-allow: %w", err)
+		}
+		opts.UDPAllow = append(opts.UDPAllow, a)
 	}
 	c, err := compileFiles([]string{*profile}, *platform == "linux")
 	if err != nil {
@@ -958,7 +983,7 @@ func checkProfile(argv []string) error {
 	if err != nil {
 		return err
 	}
-	rep := clovisor.CheckRuns(c.Profiles[0], runs)
+	rep := clovisor.CheckRunsWith(c.Profiles[0], runs, opts)
 	if err := rep.WriteText(os.Stdout); err != nil {
 		return err
 	}

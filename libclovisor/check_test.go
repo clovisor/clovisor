@@ -88,7 +88,7 @@ spec:
 		"default: No rule in profile tight allows files.pythonhosted.org:443.",
 		"exec   /usr/bin/python3",
 		"not in exec.allow",
-		"Depends on method or path, which audit data lacks",
+		"Depends on what audit data lacks",
 		"TCP api.github.com:443 (140.82.112.6)",
 		"first matching rule gh-read",
 		"egress TCP api.github.com:80 (140.82.112.5)", // port 80 not allowed

@@ -421,3 +421,34 @@ spec:
 		t.Errorf("enforced deny: %+v", d)
 	}
 }
+
+func TestTransparentPlacementNote(t *testing.T) {
+	p, err := Parse([]byte(`kind: AgentProfile
+metadata: { name: n }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: web, to: { fqdn: ["a.example"], ports: [443] }, action: allow }
+      - { name: ssh, to: { fqdn: ["git.example"], ports: [22, 443] }, action: allow }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := func(mode DeploymentMode, rule string) bool {
+		c, diags := Compile(Options{Mode: mode, Linux: true}, p)
+		if len(diags) > 0 {
+			t.Fatal(diags)
+		}
+		for _, pl := range c.Profiles[0].Placements {
+			if pl.Rule == rule {
+				return strings.Contains(strings.Join(pl.Notes, ";"), "known by address only")
+			}
+		}
+		return false
+	}
+	if !note(Transparent, "ssh") || note(Transparent, "web") || note(ExplicitProxy, "ssh") {
+		t.Error("transparent by-address note misplaced")
+	}
+}

@@ -82,6 +82,9 @@ type RunSummary struct {
 	// backstop dropped.
 	UDPRefused int `json:"udp_refused,omitempty"`
 	Dropped    int `json:"dropped,omitempty"`
+	// UDPRefusedTo is where refused UDP was sent, by destination: what a
+	// reviewer weighs against the node's -udp-allow (milestone 3.6).
+	UDPRefusedTo []Destination `json:"udp_refused_to,omitempty"`
 	// MCP is what the run did through the local MCP gateway.
 	MCP []MCPUse `json:"mcp,omitempty"`
 }
@@ -244,6 +247,7 @@ type runState struct {
 	gap      bool
 	binaries map[string]struct{}
 	dests    map[destKey]*destState
+	udpDeny  map[destKey]*destState // refused UDP
 	names    map[string]struct{}
 	blocked  map[string]struct{} // names the resolver refused
 	// ipName maps an address to the name whose lookup most recently
@@ -376,6 +380,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		},
 		binaries: make(map[string]struct{}),
 		dests:    make(map[destKey]*destState),
+		udpDeny:  make(map[destKey]*destState),
 		names:    make(map[string]struct{}),
 		blocked:  make(map[string]struct{}),
 		ipName:   make(map[string]string),
@@ -410,6 +415,13 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			}
 			for _, n := range prev.Summary.DNSBlocked {
 				st.blocked[n] = struct{}{}
+			}
+			for _, d := range prev.Summary.UDPRefusedTo {
+				ds := &destState{count: d.Count, names: make(map[string]struct{})}
+				for _, n := range d.Names {
+					ds.names[n] = struct{}{}
+				}
+				st.udpDeny[destKey{d.Proto, d.IP, d.Port}] = ds
 			}
 			for _, d := range prev.Summary.Destinations {
 				ds := &destState{count: d.Count, names: make(map[string]struct{})}
@@ -505,6 +517,16 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 				st.tl.Summary.Redirected++
 			case VerdictUDP:
 				st.tl.Summary.UDPRefused++
+				k := destKey{d.Protocol, d.DstIP, d.DstPort}
+				ds := st.udpDeny[k]
+				if ds == nil {
+					ds = &destState{names: make(map[string]struct{})}
+					st.udpDeny[k] = ds
+				}
+				ds.count++
+				if n := st.ipName[d.DstIP]; n != "" {
+					ds.names[n] = struct{}{}
+				}
 			default:
 				st.tl.Summary.Refused++
 			}
@@ -745,25 +767,10 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 		return a.Port < b.Port
 	})
 
-	tl.Summary.Destinations = make([]Destination, 0, len(st.dests))
-	for k, ds := range st.dests {
-		tl.Summary.Destinations = append(tl.Summary.Destinations, Destination{
-			Proto: k.proto, IP: k.ip, Port: k.port, Count: ds.count,
-		})
-		if len(ds.names) > 0 {
-			tl.Summary.Destinations[len(tl.Summary.Destinations)-1].Names = sortedKeys(ds.names)
-		}
+	tl.Summary.Destinations = destinationList(st.dests)
+	if len(st.udpDeny) > 0 {
+		tl.Summary.UDPRefusedTo = destinationList(st.udpDeny)
 	}
-	sort.Slice(tl.Summary.Destinations, func(i, j int) bool {
-		a, b := tl.Summary.Destinations[i], tl.Summary.Destinations[j]
-		if a.IP != b.IP {
-			return a.IP < b.IP
-		}
-		if a.Port != b.Port {
-			return a.Port < b.Port
-		}
-		return a.Proto < b.Proto
-	})
 
 	data, err := json.MarshalIndent(tl, "", "  ")
 	if err != nil {
@@ -814,4 +821,27 @@ func echNote(n int) string {
 		return ""
 	}
 	return fmt.Sprintf("ech removed from %d records", n)
+}
+
+// destinationList flattens aggregated destinations, sorted.
+func destinationList(m map[destKey]*destState) []Destination {
+	out := make([]Destination, 0, len(m))
+	for k, ds := range m {
+		d := Destination{Proto: k.proto, IP: k.ip, Port: k.port, Count: ds.count}
+		if len(ds.names) > 0 {
+			d.Names = sortedKeys(ds.names)
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.IP != b.IP {
+			return a.IP < b.IP
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		return a.Proto < b.Proto
+	})
+	return out
 }
