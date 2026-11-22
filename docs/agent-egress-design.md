@@ -72,6 +72,7 @@ place:
 | Redirect-or-deny and the transparent data plane implemented (`-transparent audit\|enforce`): pinned hooks that fail closed, same-run loopback, SNI routing into the CONNECT pipeline, clean-start check at attach. | [3.1 and 3.2 status](#31-and-32-status-2026-11-22) |
 | Forced local DNS: every run query to the node's resolver, which answers only names the profile could allow (NXDOMAIN with an EDE reason otherwise) and strips ECH. | [3.4 status](#34-status-2026-11-22) |
 | UDP refused except DNS, node-wide exceptions and same-run loopback, QUIC included; a packet backstop drops what gets past the socket hooks. | [3.3 status](#33-status-2026-11-22) |
+| Heartbeat tied to Envoy's health; the proxy's own connects gated in the kernel (closing DNS rebinding); lost kernel events counted per run; `agentctl status`; overhead measured. | [3.5 status](#35-status-2026-11-22) |
 
 ---
 
@@ -1787,7 +1788,7 @@ it writes (`make envoy`).
     This stops a run using the proxy, which sits on the host, to reach node
     services. Residual: a name that rebinds between the check and Envoy's own
     resolution. Closing it needs the proxy's own connects gated in the kernel,
-    which Phase 3's hooks can do.
+    which Phase 3's hooks can do. *Closed in [3.5](#35-status-2026-11-22).*
   - **Clients outside any run are refused** (`-proxy-non-run` to allow), with a
     message saying to use `agentctl run`.
   - Client-supplied `x-clovisor-*` headers are stripped.
@@ -2462,6 +2463,77 @@ Findings:
   destinations. Deferred until someone needs it.
 - Not tested with a real QUIC client: this curl has no HTTP/3. UDP 443 gets
   `EPERM`, which is what browsers fall back on.
+
+#### 3.5 status (2026-11-22)
+
+Implemented:
+
+- **Heartbeat health.** The node agent probes Envoy's admin socket every
+  second: `/ready`, and, in transparent mode, `/listeners` for the
+  transparent listener. The heartbeat is written only while both pass. In
+  enforce, a dead Envoy, or one still running a bootstrap from before
+  transparent mode, now gets the same clear `EPERM` (DNS included) as a dead
+  node agent, instead of resets from a missing listener. Transitions are
+  logged.
+- **Proxy connect gate** (the 2.3 rebinding residual). `cgroup/connect4/6`
+  programs on Envoy's cgroup refuse loopback, link-local, unspecified and
+  multicast destinations, except port 53. The cgroup is found from the admin
+  socket's peer credentials. The gate attaches only if every process in it
+  is `envoy`, so it never catches anything else; it follows Envoy across
+  restarts, and it applies with the explicit proxy too, wherever cgroup
+  identity is on. Refusals are counted.
+- **Lost events** (Phase 1 carry-over). Every failed ring-buffer reservation
+  is counted, per run and in total. The recorder adds a run's count to its
+  timeline as `lost_events` and marks it not complete.
+- **`agentctl status`** (run API op `status`): mode, health and why not,
+  Envoy's pid and cgroup, the gate, refusals, lost events, the resolver,
+  active runs.
+- Start-up order and restart behaviour were already right: hooks attach
+  before the run API listens, pinned links are swapped in place, and runs
+  keep their cgroups across a node agent restart.
+
+Verified live on kernel 7.0 with Envoy 1.34.14:
+
+- **Envoy not running.** Status reported unhealthy with the reason; a run's
+  curl failed at DNS.
+- **Envoy started.** Healthy within a second; its container cgroup was gated
+  automatically.
+- **Inside Envoy's container**, connects to `127.0.0.1:18000` and
+  `169.254.169.254` got `EPERM`; public addresses and DNS worked.
+- **DNS rebinding** through a public rebinding name that answers 127.0.0.1
+  or a public address at random, with a rule allowing it:
+  - all 30 requests passed ext_proc's guard, whose cached answer was public;
+  - 20 times Envoy's own resolution gave 127.0.0.1, so it was about to reach
+    the node's explicit proxy port. The gate refused each connect (503).
+- **Ring buffer flood.** A run made 489,615 refused UDP connects in two
+  seconds. 488,765 were recorded and 850 lost, matching exactly. The
+  timeline carries `lost_events: 850, complete: false`.
+
+**Overhead** (8-core aarch64 host):
+
+| Path | 100 MB from the internet, tunnelled | Same, terminated | 1 GB plain HTTP from a local container | Small HTTPS request (median of 20) |
+|---|---|---|---|---|
+| Direct, outside a run | 14.0 MB/s | 13.8 MB/s | 6.4 GB/s | 107 ms |
+| Explicit proxy | 13.9 MB/s | 14.3 MB/s | 7.0 GB/s | 33 ms |
+| Transparent | 13.7 MB/s | 14.3 MB/s | 6.9 GB/s | 28 ms |
+
+The internet downloads are bound by the link; the local one by the
+client and server. No throughput cost of the proxy is visible at either.
+Small requests are faster through the proxy, because Envoy reuses upstream
+connections that curl, run once per request, cannot.
+
+Findings:
+
+- **One run can exhaust the shared ring buffer**, and other runs lose events
+  in the same window. Refused UDP connects are reported each time; capping
+  reports per run (as `sendmsg` already does per socket), or a ring buffer
+  per run, would contain it. Now at least the loss is counted and visible.
+- **The gate needs Envoy in its own cgroup.** An Envoy started by hand in a
+  login session shares the session's cgroup and stays ungated, as
+  `agentctl status` reports. The operator guide says to run it in a
+  container or unit.
+- **Health is node-wide.** One Envoy serves every run, so when it is down no
+  run is served. That is the intended reading of fail closed.
 
 #### Decisions
 

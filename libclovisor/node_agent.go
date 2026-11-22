@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/clovisor/clovisor/libclovisor/policy"
@@ -37,6 +38,9 @@ type NodeAgent struct {
 	terminated []string // patterns in the bootstrap last written
 	mcp        *MCPGateway
 	resolver   *Resolver
+	envoy      atomic.Value // EnvoyState
+	gateWhy    atomic.Value // string: why the proxy is not gated
+	identity   string
 	httpEvents chan AuditEvent
 	policyDir  string
 	deployment policy.DeploymentMode
@@ -343,6 +347,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	na := &NodeAgent{
 		mcp:        gw,
 		resolver:   resolver,
+		identity:   opts.Identity,
 		ca:         proxyCA,
 		terminated: proxyTerminated,
 		cmgr:       cmgr,
@@ -359,6 +364,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if xp != nil {
 		o := opts
 		na.proxyOpts = &o
+	}
+	api.Status = na.Status
+	if r := audit.reader; r != nil && recorder != nil {
+		recorder.LostFor = r.LostFor
 	}
 
 	return na, nil
@@ -604,6 +613,10 @@ func (na *NodeAgent) Run() error {
 	if na.resolver != nil {
 		go na.resolver.Serve()
 	}
+	if na.proxyOpts != nil && na.audit.reader != nil {
+		na.audit.reader.SetHealth(na.health)
+		go na.watchEnvoy()
+	}
 	if na.mcp != nil {
 		go func() {
 			if err := na.mcp.Serve(); err != nil {
@@ -750,4 +763,90 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			ts, tl.RunID, tl.Summary.Execs, tl.Summary.Connects, tl.Summary.DNSReplies, tl.Complete,
 			TimelinePath(na.recorder.OutDir, tl.RunID))
 	}
+}
+
+// watchEnvoy probes Envoy every second (milestone 3.5). The heartbeat
+// depends on the result in transparent mode, and the proxy's connect gate
+// follows Envoy's cgroup across restarts.
+func (na *NodeAgent) watchEnvoy() {
+	transparent := na.proxyOpts.Transparent.Mode != "" && na.proxyOpts.Transparent.Mode != TransparentOff
+	lastWhy := ""
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		st := probeEnvoy(na.proxyOpts.EnvoyAdmin, transparent)
+		na.envoy.Store(st)
+		why := ""
+		switch {
+		case !st.Ready:
+			why = "Envoy is not ready"
+		case !st.Dedicated:
+			why = fmt.Sprintf("Envoy's cgroup %s holds other processes; run Envoy in its own (a container or a systemd unit)", st.Cgroup)
+		}
+		r := na.audit.reader
+		if why == "" {
+			if err := r.GateProxy(st.Cgroup); err != nil {
+				why = err.Error()
+			}
+		}
+		// Envoy gone: keep the gate where it was; a new Envoy is gated
+		// once it is seen.
+		na.gateWhy.Store(why)
+		if why != lastWhy {
+			if why == "" {
+				fmt.Printf("proxy: Envoy (pid %d) gated: its connects to node-local addresses are refused in the kernel (cgroup %s)\n", st.PID, st.Cgroup)
+			} else if st.Ready {
+				fmt.Printf("proxy: Envoy's own connects are not gated: %s\n", why)
+			}
+			lastWhy = why
+		}
+		select {
+		case <-tick.C:
+		case <-na.stopChan:
+			return
+		}
+	}
+}
+
+// health is the heartbeat's condition: Envoy ready, and serving the
+// transparent listener.
+func (na *NodeAgent) health() error {
+	st, ok := na.envoy.Load().(EnvoyState)
+	if !ok {
+		return fmt.Errorf("Envoy not probed yet")
+	}
+	return st.Err
+}
+
+// Status reports the node's enforcement state.
+func (na *NodeAgent) Status() NodeStatus {
+	s := NodeStatus{Identity: na.identity, Transparent: TransparentOff}
+	if na.proxyOpts != nil {
+		s.Transparent = na.proxyOpts.Transparent.Mode
+	}
+	if st, ok := na.envoy.Load().(EnvoyState); ok {
+		s.EnvoyReady, s.EnvoyPID, s.EnvoyCgroup = st.Ready, st.PID, st.Cgroup
+		if st.Err != nil {
+			s.HealthError = st.Err.Error()
+		}
+	}
+	if r := na.audit.reader; r != nil {
+		s.Healthy = r.Healthy() && s.HealthError == ""
+		s.ProxyGated = r.GatedProxy() != ""
+		s.ProxyRefused = r.ProxyRefused()
+		s.LostEvents = r.LostTotal()
+	}
+	if why, _ := na.gateWhy.Load().(string); !s.ProxyGated {
+		s.ProxyGateWhy = why
+		if why == "" {
+			s.ProxyGateWhy = "no proxy, or cgroup identity is off"
+		}
+	}
+	if na.resolver != nil {
+		s.Resolver = strings.Join(na.resolver.upstreams, ", ")
+	}
+	if na.api != nil {
+		s.ActiveRuns = na.api.ActiveRuns()
+	}
+	return s
 }

@@ -36,6 +36,7 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--mcp-config file] [--] <command> [args...]")
 	fmt.Println("                                    Run a command as a governed run")
+	fmt.Println("  agentctl status                   Show the node's enforcement state")
 	fmt.Println("  agentctl profiles                 Show which profiles you may request")
 	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
 	fmt.Println("  agentctl revoke <run-id>          Deny all further egress for a live run")
@@ -460,6 +461,55 @@ func listProfiles() error {
 	if r.Clamp != "" {
 		fmt.Printf("Clamp     %s (intersected into every grant)\n", r.Clamp)
 	}
+	return nil
+}
+
+// showStatus prints the node's enforcement state.
+func showStatus() error {
+	api, err := clovisor.DialRunAPI(socketPath())
+	if err != nil {
+		return err
+	}
+	defer api.Close()
+	s, err := api.Status()
+	if err != nil {
+		return err
+	}
+	yes := func(b bool) string {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	fmt.Printf("Identity      %s\n", s.Identity)
+	fmt.Printf("Transparent   %s\n", s.Transparent)
+	if s.Transparent != clovisor.TransparentOff {
+		h := yes(s.Healthy)
+		if !s.Healthy {
+			h = "no: " + s.HealthError
+			if s.Transparent == clovisor.TransparentEnforce {
+				h += " (connects from runs are refused)"
+			}
+		}
+		fmt.Printf("Healthy       %s\n", h)
+	}
+	envoy := yes(s.EnvoyReady)
+	if s.EnvoyPID > 0 {
+		envoy += fmt.Sprintf(" (pid %d, cgroup %s)", s.EnvoyPID, s.EnvoyCgroup)
+	}
+	fmt.Printf("Envoy ready   %s\n", envoy)
+	gate := yes(s.ProxyGated)
+	if s.ProxyGated {
+		gate += fmt.Sprintf(" (%d node-local connects refused)", s.ProxyRefused)
+	} else if s.ProxyGateWhy != "" {
+		gate += ": " + s.ProxyGateWhy
+	}
+	fmt.Printf("Proxy gated   %s\n", gate)
+	if s.Resolver != "" {
+		fmt.Printf("Resolver      forwarding to %s\n", s.Resolver)
+	}
+	fmt.Printf("Active runs   %d\n", s.ActiveRuns)
+	fmt.Printf("Lost events   %d\n", s.LostEvents)
 	return nil
 }
 
@@ -984,6 +1034,11 @@ func main() {
 			os.Exit(1)
 		}
 		os.Exit(code)
+	case "status":
+		if err := showStatus(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	case "profiles":
 		if err := listProfiles(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

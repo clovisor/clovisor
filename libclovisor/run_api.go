@@ -57,7 +57,7 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke, mcp_register, pins, pin_approve
+	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
@@ -103,6 +103,8 @@ type RunAPIResponse struct {
 	// pins, pin_approve:
 	Pins     []PinEntry `json:"pins,omitempty"`
 	Approved []string   `json:"approved,omitempty"`
+	// status:
+	Status *NodeStatus `json:"status,omitempty"`
 }
 
 // RunRegistry holds metadata for runs created through the API until the
@@ -163,6 +165,8 @@ type RunAPIServer struct {
 	// socket's cgroup hooks by the cgroup it was created in, so those
 	// sockets would bypass redirect-or-deny (3.0 spike).
 	Transparent string
+	// Status reports the node's enforcement state (agentctl status).
+	Status func() NodeStatus
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.
@@ -515,6 +519,12 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		return ac.mcpRegister(req)
 	case "pins", "pin_approve":
 		return ac.pins(req)
+	case "status":
+		if ac.s.Status == nil {
+			return fail("status unavailable")
+		}
+		st := ac.s.Status()
+		return RunAPIResponse{OK: true, Status: &st}
 	default:
 		return fail("unknown op %q", req.Op)
 	}
@@ -917,6 +927,18 @@ func (rc *RunAPIClient) Profiles() (RunAPIResponse, error) {
 	return rc.call(RunAPIRequest{Op: "profiles"})
 }
 
+// Status returns the node's enforcement state.
+func (rc *RunAPIClient) Status() (*NodeStatus, error) {
+	r, err := rc.call(RunAPIRequest{Op: "status"})
+	if err != nil {
+		return nil, err
+	}
+	if r.Status == nil {
+		return nil, fmt.Errorf("node agent sent no status")
+	}
+	return r.Status, nil
+}
+
 // Clamp layers a profile onto a live run.
 func (rc *RunAPIClient) Clamp(runID, profile string) (RunAPIResponse, error) {
 	return rc.call(RunAPIRequest{Op: "clamp", RunID: runID, ClampProfile: profile})
@@ -956,4 +978,11 @@ func (rc *RunAPIClient) Attach(pidfd int) error {
 func (rc *RunAPIClient) End(exitCode *int) error {
 	_, err := rc.call(RunAPIRequest{Op: "end", ExitCode: exitCode})
 	return err
+}
+
+// ActiveRuns counts runs whose agentctl connection is open.
+func (s *RunAPIServer) ActiveRuns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.active)
 }

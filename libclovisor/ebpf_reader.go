@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -133,6 +134,10 @@ type bpfObjects struct {
 	Recv4Prog    *ebpf.Program `ebpf:"on_recvmsg4"`
 	Recv6Prog    *ebpf.Program `ebpf:"on_recvmsg6"`
 	EgressProg   *ebpf.Program `ebpf:"on_egress"`
+	ProxyConn4   *ebpf.Program `ebpf:"on_proxy_connect4"`
+	ProxyConn6   *ebpf.Program `ebpf:"on_proxy_connect6"`
+	Lost         *ebpf.Map     `ebpf:"lost"`
+	ProxyRefused *ebpf.Map     `ebpf:"proxy_refused"`
 	UDPReported  *ebpf.Map     `ebpf:"udp_reported"`
 	DropRate     *ebpf.Map     `ebpf:"drop_rate"`
 	SockoptProg  *ebpf.Program `ebpf:"on_getsockopt"`
@@ -146,7 +151,7 @@ type bpfObjects struct {
 
 func (o *bpfObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
-		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate,
+		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate, o.ProxyConn4, o.ProxyConn6, o.Lost, o.ProxyRefused,
 		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple} {
 		if c != nil {
 			c.Close()
@@ -170,6 +175,14 @@ type EBPFReader struct {
 
 	transparent TransparentOptions
 	beatDone    chan struct{}
+	// health, if set, must return nil for the heartbeat to be written:
+	// the node agent's view of whether the proxy can serve runs.
+	health    atomic.Value // func() error
+	unhealthy atomic.Bool
+
+	gateMu    sync.Mutex
+	gateCg    string
+	gateLinks []link.Link
 }
 
 // NewEBPFReader loads the BPF object at bpfObjPath, configures it to
@@ -505,6 +518,12 @@ func (r *EBPFReader) beat() error {
 	return nil
 }
 
+// SetHealth installs the check the heartbeat depends on. While it
+// fails, no heartbeat is written, and in enforce mode connects from runs
+// are refused within the stale interval: a clear EPERM rather than
+// connections reset by a proxy that is not there.
+func (r *EBPFReader) SetHealth(f func() error) { r.health.Store(f) }
+
 func (r *EBPFReader) heartbeatLoop() {
 	defer close(r.beatDone)
 	tick := time.NewTicker(r.transparent.Stale / 3)
@@ -514,11 +533,103 @@ func (r *EBPFReader) heartbeatLoop() {
 		case <-r.done:
 			return
 		case <-tick.C:
+			if f, _ := r.health.Load().(func() error); f != nil {
+				if err := f(); err != nil {
+					if !r.unhealthy.Swap(true) {
+						log.Printf("transparent: unhealthy, heartbeat stopped (connects from runs will be refused): %v", err)
+					}
+					continue
+				}
+				if r.unhealthy.Swap(false) {
+					log.Printf("transparent: healthy again, heartbeat resumed")
+				}
+			}
 			if err := r.beat(); err != nil {
 				log.Printf("bpf: %v", err)
 			}
 		}
 	}
+}
+
+// Healthy reports whether the last health check passed.
+func (r *EBPFReader) Healthy() bool { return !r.unhealthy.Load() }
+
+// LostFor returns and clears the events lost for a run: ring buffer
+// reservations that failed while it ran.
+func (r *EBPFReader) LostFor(runCg uint64) uint64 {
+	var n uint64
+	if r.objs.Lost == nil || runCg == 0 {
+		return 0
+	}
+	if err := r.objs.Lost.Lookup(runCg, &n); err != nil {
+		return 0
+	}
+	r.objs.Lost.Delete(runCg)
+	return n
+}
+
+// LostTotal is every event lost since the program was loaded.
+func (r *EBPFReader) LostTotal() uint64 {
+	var n uint64
+	if r.objs.Lost != nil {
+		r.objs.Lost.Lookup(uint64(0), &n)
+	}
+	return n
+}
+
+// ProxyRefused counts the proxy's connects the gate refused.
+func (r *EBPFReader) ProxyRefused() uint64 {
+	var n uint64
+	if r.objs.ProxyRefused != nil {
+		r.objs.ProxyRefused.Lookup(uint32(0), &n)
+	}
+	return n
+}
+
+// GateProxy attaches the proxy's connect gate to cgroup path (relative to
+// the cgroup root), replacing any earlier one. An empty path detaches it.
+// The caller must make sure the cgroup holds only the proxy: the gate
+// applies to everything in it.
+func (r *EBPFReader) GateProxy(path string) error {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	if path == r.gateCg {
+		return nil
+	}
+	for _, l := range r.gateLinks {
+		l.Close()
+	}
+	r.gateLinks, r.gateCg = nil, ""
+	if path == "" {
+		return nil
+	}
+	full := filepath.Join(CgroupV2Root, path)
+	for _, c := range []struct {
+		typ  ebpf.AttachType
+		prog *ebpf.Program
+	}{
+		{ebpf.AttachCGroupInet4Connect, r.objs.ProxyConn4},
+		{ebpf.AttachCGroupInet6Connect, r.objs.ProxyConn6},
+	} {
+		l, err := link.AttachCgroup(link.CgroupOptions{Path: full, Attach: c.typ, Program: c.prog})
+		if err != nil {
+			for _, l := range r.gateLinks {
+				l.Close()
+			}
+			r.gateLinks = nil
+			return fmt.Errorf("gate proxy cgroup %s: %w", path, err)
+		}
+		r.gateLinks = append(r.gateLinks, l)
+	}
+	r.gateCg = path
+	return nil
+}
+
+// GatedProxy is the cgroup the proxy gate is attached to, if any.
+func (r *EBPFReader) GatedProxy() string {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	return r.gateCg
 }
 
 // Close releases all resources. Closing the ring buffer reader unblocks
@@ -534,6 +645,7 @@ func (r *EBPFReader) Close() {
 		if r.objs.Heartbeat != nil {
 			r.objs.Heartbeat.Put(uint32(0), uint64(0))
 		}
+		r.GateProxy("")
 		for _, l := range r.links {
 			l.Close()
 		}

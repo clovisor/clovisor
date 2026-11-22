@@ -23,3 +23,10 @@ func (r *EBPFReader) Start() error              { return nil }
 func (r *EBPFReader) Stop() error               { return nil }
 func (r *EBPFReader) Events() <-chan AuditEvent { return nil }
 func (r *EBPFReader) Close()                    {}
+func (r *EBPFReader) SetHealth(func() error)    {}
+func (r *EBPFReader) Healthy() bool             { return false }
+func (r *EBPFReader) LostFor(uint64) uint64     { return 0 }
+func (r *EBPFReader) LostTotal() uint64         { return 0 }
+func (r *EBPFReader) ProxyRefused() uint64      { return 0 }
+func (r *EBPFReader) GateProxy(string) error    { return errors.New("needs Linux") }
+func (r *EBPFReader) GatedProxy() string        { return "" }

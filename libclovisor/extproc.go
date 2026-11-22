@@ -293,8 +293,8 @@ const resolveCacheTTL = 30 * time.Second
 
 // guard returns a reason to refuse a destination that is, or resolves to,
 // a node-local address. A name that rebinds after this check can still
-// reach one: closing that needs the proxy's own connects gated in the
-// kernel (Phase 3).
+// resolve to one for Envoy; the node agent's connect gate on Envoy's
+// cgroup refuses that connect in the kernel (milestone 3.5).
 func (s *ExtProcServer) guard(ctx context.Context, host string, ip netip.Addr) string {
 	if ip.IsValid() {
 		if guardClass(ip) {

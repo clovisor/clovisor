@@ -390,11 +390,38 @@ tested.
 | Anything, while the node agent is down | Refused with `EPERM`. |
 
 **Fail closed.** In enforce mode the connect hooks are pinned in
-`/sys/fs/bpf/clovisor`, so they outlive the node agent. If it stops or
-crashes, its heartbeat lapses, and within `-transparent-stale` every connect
-from a run is refused until a node agent starts again. A restarted node agent
-swaps its programs into the pinned links with no gap. If Envoy is down,
-redirected connects are refused by the kernel (`ECONNREFUSED`).
+`/sys/fs/bpf/clovisor`, so they outlive the node agent. The node agent
+writes a heartbeat only while it runs and Envoy is ready and serving the
+transparent listener; it checks Envoy every second over the admin socket.
+If either is down, or Envoy still runs a bootstrap from before transparent
+mode, then within `-transparent-stale` every connect and DNS query from a run
+is refused until both are back. A restarted node agent swaps its programs
+into the pinned links with no gap.
+
+**Check it:** `agentctl status` shows the mode, whether the node is healthy
+and why not, Envoy's process and cgroup, whether the proxy is gated, and
+events lost in the kernel.
+
+```
+Identity      cgroup
+Transparent   enforce
+Healthy       yes
+Envoy ready   yes (pid 443951, cgroup /system.slice/docker-34b4….scope)
+Proxy gated   yes (0 node-local connects refused)
+Resolver      forwarding to 127.0.0.53:53
+Active runs   0
+Lost events   0
+```
+
+**The proxy's own connects are gated** whenever the proxy is on with cgroup
+identity, in any transparent mode. A kernel hook on Envoy's cgroup refuses
+its connects to loopback, link-local (cloud metadata) and multicast
+addresses, except DNS. `ext_proc` already refuses such destinations, but it
+checks a name by resolving it itself: a name that resolves differently for
+Envoy a moment later (DNS rebinding) would otherwise reach the node. The
+hook attaches only if Envoy's cgroup holds nothing but Envoy, as in a
+container or a systemd unit of its own; otherwise `agentctl status` says why
+it is not gated. It follows Envoy across restarts.
 
 **Turning it off.** Starting the node agent with `-transparent off` (or
 `audit`) removes the pins, and runs reach the network directly again.
@@ -472,6 +499,9 @@ agentctl events --json <run-id>
   would-deny counts.
 - **Event cap.** Events past the per-run cap are counted but not listed;
   summaries stay complete.
+- **Lost events.** Events the kernel could not queue (its buffer full) are
+  counted per run as `lost_events`, and such a timeline is marked not
+  complete.
 
 ## 14. Security notes and limits
 
@@ -506,7 +536,9 @@ agentctl events --json <run-id>
 | TLS errors on a terminated host | The tool does not read the trust variables. Point it at `<runtime-dir>/ca-bundle.pem`, or mark the rule `no_terminate` (losing its path rules). |
 | A narrated 403 body is missing | On CONNECT, clients drop the body: read the `x-clovisor-denial` response header, or the timeline. |
 | MCP tools disappeared after a server update | Pin drift: `sudo agentctl pins`, review, approve. |
-| A run's connects fail with `EPERM` (transparent enforce) | The node agent is down or wedged, so its heartbeat is stale. Start it; to drop enforcement, start it with `-transparent off`. |
+| A run's connects fail with `EPERM` (transparent enforce) | The node is unhealthy: `agentctl status` says why. The node agent is down, Envoy is down, or Envoy runs an old bootstrap (restart it). To drop enforcement, start the node agent with `-transparent off`. |
+| `Proxy gated   no: … holds other processes` | Envoy shares its cgroup, so the rebinding guard cannot be enforced in the kernel. Run Envoy in a container or its own systemd unit. |
+| A timeline has `lost_events` and `complete: false` | The kernel's event buffer was full, often because one run produced events very fast. Its counts are lower bounds. |
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination reached by address needs a `cidr` rule. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS and `-udp-allow`. Check `udp_refused` and the connect events in the timeline. |

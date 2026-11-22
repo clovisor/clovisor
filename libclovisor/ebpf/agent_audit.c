@@ -252,6 +252,40 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+/*
+ * Events lost to a full ring buffer (milestone 3.5): per run, so the
+ * timeline can say it is incomplete, and in total at key 0. Run ids are
+ * cgroup ids, never 0.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, __u64);
+} lost SEC(".maps");
+
+static __always_inline void count_lost(__u64 key)
+{
+    __u64 *n = bpf_map_lookup_elem(&lost, &key);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+        return;
+    }
+    __u64 one = 1;
+    if (bpf_map_update_elem(&lost, &key, &one, BPF_NOEXIST) != 0) {
+        n = bpf_map_lookup_elem(&lost, &key);
+        if (n)
+            __sync_fetch_and_add(n, 1);
+    }
+}
+
+static __always_inline void note_lost(__u64 run)
+{
+    count_lost(0);
+    if (run)
+        count_lost(run);
+}
+
 /* CLOCK_MONOTONIC ns of the node agent's last heartbeat. Its own map, so a
  * heartbeat never rewrites the config another CPU is reading. */
 struct {
@@ -355,8 +389,10 @@ int on_exec(__u64 *ctx)
     struct linux_binprm *bprm = (struct linux_binprm *)ctx[2];
 
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        note_lost(hdr.run_cgroup_id);
         return 0;
+    }
 
     e->hdr = hdr;
     const char *fname = BPF_CORE_READ(bprm, filename);
@@ -391,8 +427,10 @@ static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family
         return;
 
     struct connect_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        note_lost(hdr.run_cgroup_id);
         return;
+    }
 
     e->hdr = hdr;
     e->family = family;
@@ -418,11 +456,13 @@ static __always_inline void emit_cgroup(struct cgroup *cgrp, const char *path, _
     if (BPF_CORE_READ(cgrp, level) != cfg->agents_level + 1)
         return; /* the node agent checks the path is under agents/ */
 
-    struct cgroup_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
-        return;
-
     __u64 id = BPF_CORE_READ(cgrp, kn, id);
+    struct cgroup_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        note_lost(id);
+        return;
+    }
+
     e->hdr.type = type;
     e->hdr.pid = bpf_get_current_pid_tgid() >> 32;
     e->hdr.timestamp_ns = bpf_ktime_get_boot_ns();
@@ -510,8 +550,10 @@ int on_ingress(struct __sk_buff *skb)
     dnslen -= 8;
 
     struct dns_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        note_lost(run);
         return 1;
+    }
 
     e->hdr.type = EVENT_DNS;
     e->hdr.pid = 0;
@@ -1093,8 +1135,10 @@ int on_egress(struct __sk_buff *skb)
     __u32 count = __sync_lock_test_and_set(&ds->count, 0);
 
     struct drop_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        note_lost(run);
         return !enforce;
+    }
     e->hdr.type = EVENT_DROP;
     e->hdr.pid = 0;
     e->hdr.timestamp_ns = bpf_ktime_get_boot_ns();
@@ -1112,6 +1156,65 @@ int on_egress(struct __sk_buff *skb)
     e->enforced = enforce;
     bpf_ringbuf_submit(e, 0);
     return !enforce;
+}
+
+/*
+ * The proxy's own connects (milestone 3.5), attached to Envoy's cgroup
+ * when it holds nothing else. ext_proc refuses node-local destinations,
+ * but checks a name by resolving it itself: a name that resolves
+ * differently for Envoy a moment later (DNS rebinding) would still reach
+ * the node. Here the kernel refuses the connect itself. DNS (port 53) is
+ * let through: Envoy's resolver may be on loopback.
+ */
+static __always_inline int node_local(struct addr *ip)
+{
+    if (is_v4mapped(ip)) {
+        __u32 a = bpf_ntohl(ip->a[3]);
+        return (a >> 24) == 127 || (a >> 16) == 0xa9fe /* 169.254/16 */ ||
+               a == 0 || (a >> 28) == 0xe /* multicast */;
+    }
+    __u32 w0 = bpf_ntohl(ip->a[0]);
+    if (ip->a[0] == 0 && ip->a[1] == 0 && ip->a[2] == 0 && (ip->a[3] == 0 || ip->a[3] == bpf_htonl(1)))
+        return 1; /* :: and ::1 */
+    return (w0 >> 22) == (0xfe80 >> 6) /* fe80::/10 */ || (w0 >> 24) == 0xff /* multicast */;
+}
+
+/* Connects the gate refused, for the node agent to report. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} proxy_refused SEC(".maps");
+
+static __always_inline int proxy_gate(struct addr *ip, __u16 port)
+{
+    if (bpf_ntohs(port) == 53 || !node_local(ip))
+        return 1;
+    __u32 zero = 0;
+    __u64 *n = bpf_map_lookup_elem(&proxy_refused, &zero);
+    if (n)
+        __sync_fetch_and_add(n, 1);
+    return 0;
+}
+
+SEC("cgroup/connect4")
+int on_proxy_connect4(struct bpf_sock_addr *ctx)
+{
+    struct addr ip;
+    v4mapped(&ip, ctx->user_ip4);
+    return proxy_gate(&ip, (__u16)ctx->user_port);
+}
+
+SEC("cgroup/connect6")
+int on_proxy_connect6(struct bpf_sock_addr *ctx)
+{
+    struct addr ip;
+    ip.a[0] = ctx->user_ip6[0];
+    ip.a[1] = ctx->user_ip6[1];
+    ip.a[2] = ctx->user_ip6[2];
+    ip.a[3] = ctx->user_ip6[3];
+    return proxy_gate(&ip, (__u16)ctx->user_port);
 }
 
 char LICENSE[] SEC("license") = "GPL";

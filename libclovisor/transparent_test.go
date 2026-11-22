@@ -225,3 +225,17 @@ func TestRunRecorderUDPAndDrops(t *testing.T) {
 		t.Fatalf("%d drop events", drops)
 	}
 }
+
+func TestRunRecorderLostEvents(t *testing.T) {
+	r := newTestRecorder(t)
+	r.LostFor = func(cg uint64) uint64 {
+		if cg == testRunCg {
+			return 7
+		}
+		return 0
+	}
+	tl := feed(t, r, runEv(EventRunStart, 0, "/agents/run-abc"), runEv(EventRunEnd, 1, "/agents/run-abc"))
+	if tl.LostEvents != 7 || tl.Complete {
+		t.Fatalf("lost %d, complete %v", tl.LostEvents, tl.Complete)
+	}
+}
