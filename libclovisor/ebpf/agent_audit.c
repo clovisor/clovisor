@@ -249,7 +249,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 4 << 20); /* each run may use a quarter: RUN_BURST */
 } events SEC(".maps");
 
 /*
@@ -284,6 +284,81 @@ static __always_inline void note_lost(__u64 run)
     count_lost(0);
     if (run)
         count_lost(run);
+}
+
+/*
+ * Per-run event budget (after milestone 3.5): one run cannot fill the ring
+ * buffer every run shares. A token bucket in bytes, so exec and connect
+ * events are charged by size: RUN_BURST at once, RUN_RATE a second after
+ * that. Events over budget are not reported, and are counted per run (and
+ * in total at key 0) so the timeline can say so; enforcement does not
+ * depend on reporting. Run start and end are never charged. Updates race
+ * between CPUs, which makes the budget approximate, not unsafe.
+ */
+#define RUN_RATE  (4 << 20) /* bytes per second: about 5000 execs or 70000 connects */
+#define RUN_BURST (1 << 20) /* bytes, a quarter of the ring buffer: about 1300 execs */
+
+struct budget {
+    __u64 tokens;
+    __u64 last_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct budget);
+} run_budget SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, __u64);
+} suppressed SEC(".maps");
+
+static __always_inline void count_suppressed(__u64 key)
+{
+    __u64 *n = bpf_map_lookup_elem(&suppressed, &key);
+    if (n) {
+        __sync_fetch_and_add(n, 1);
+        return;
+    }
+    __u64 one = 1;
+    if (bpf_map_update_elem(&suppressed, &key, &one, BPF_NOEXIST) != 0) {
+        n = bpf_map_lookup_elem(&suppressed, &key);
+        if (n)
+            __sync_fetch_and_add(n, 1);
+    }
+}
+
+/* Charge size bytes to run's budget; 0 means do not report the event. */
+static __always_inline int within_budget(__u64 run, __u32 size)
+{
+    if (run == 0)
+        return 1;
+    __u64 now = bpf_ktime_get_ns();
+    struct budget *b = bpf_map_lookup_elem(&run_budget, &run);
+    if (!b) {
+        struct budget fresh = {.tokens = RUN_BURST - size, .last_ns = now};
+        bpf_map_update_elem(&run_budget, &run, &fresh, BPF_NOEXIST);
+        return 1;
+    }
+    __u64 elapsed = now - b->last_ns;
+    if (elapsed > 1000000000ULL)
+        elapsed = 1000000000ULL;
+    __u64 tokens = b->tokens + elapsed * RUN_RATE / 1000000000ULL;
+    if (tokens > RUN_BURST)
+        tokens = RUN_BURST;
+    b->last_ns = now;
+    if (tokens < size) {
+        b->tokens = tokens;
+        count_suppressed(0);
+        count_suppressed(run);
+        return 0;
+    }
+    b->tokens = tokens - size;
+    return 1;
 }
 
 /* CLOCK_MONOTONIC ns of the node agent's last heartbeat. Its own map, so a
@@ -388,6 +463,8 @@ int on_exec(__u64 *ctx)
 
     struct linux_binprm *bprm = (struct linux_binprm *)ctx[2];
 
+    if (!within_budget(hdr.run_cgroup_id, sizeof(struct exec_event)))
+        return 0;
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         note_lost(hdr.run_cgroup_id);
@@ -426,6 +503,8 @@ static __always_inline void emit_connect(struct bpf_sock_addr *ctx, __u16 family
     if (!fill_hdr(&hdr, EVENT_CONNECT))
         return;
 
+    if (!within_budget(hdr.run_cgroup_id, sizeof(struct connect_event)))
+        return;
     struct connect_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         note_lost(hdr.run_cgroup_id);
@@ -549,6 +628,8 @@ int on_ingress(struct __sk_buff *skb)
         return 1;
     dnslen -= 8;
 
+    if (!within_budget(run, sizeof(struct dns_event)))
+        return 1;
     struct dns_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         note_lost(run);

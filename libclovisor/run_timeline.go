@@ -45,6 +45,11 @@ type RunTimeline struct {
 	// LostEvents were lost in the kernel, the ring buffer being full
 	// (milestone 3.5). A run that lost any is not complete.
 	LostEvents uint64 `json:"lost_events,omitempty"`
+	// SuppressedEvents were not reported because the run produced events
+	// faster than its budget allows (so that it cannot crowd other runs out
+	// of the ring buffer). Enforcement was unaffected; the timeline is not
+	// complete.
+	SuppressedEvents uint64 `json:"suppressed_events,omitempty"`
 
 	Summary RunSummary      `json:"summary"`
 	Events  []TimelineEvent `json:"events"`
@@ -268,8 +273,9 @@ type RunRecorder struct {
 	MaxEvents int
 	// Meta supplies what the run API knows about runs; may be nil.
 	Meta *RunRegistry
-	// LostFor returns, and clears, the kernel events a run lost.
-	LostFor func(runCg uint64) uint64
+	// LostFor returns, and clears, the kernel events a run lost and those
+	// suppressed by its event budget.
+	LostFor func(runCg uint64) (lost, suppressed uint64)
 	// ProxyAddrs are the node proxy's listen addresses ("ip:port").
 	ProxyAddrs map[string]bool
 
@@ -661,9 +667,11 @@ func (r *RunRecorder) Flush() []error {
 // finish writes a finished run and releases its metadata.
 func (r *RunRecorder) finish(st *runState) (*RunTimeline, error) {
 	if r.LostFor != nil {
-		st.tl.LostEvents += r.LostFor(st.tl.CgroupID)
+		lost, suppressed := r.LostFor(st.tl.CgroupID)
+		st.tl.LostEvents += lost
+		st.tl.SuppressedEvents += suppressed
 	}
-	st.tl.Complete = st.sawStart && !st.gap && st.tl.LostEvents == 0
+	st.tl.Complete = st.sawStart && !st.gap && st.tl.LostEvents == 0 && st.tl.SuppressedEvents == 0
 	tl, err := r.write(st)
 	if r.Meta != nil {
 		r.Meta.Done(st.tl.RunID)

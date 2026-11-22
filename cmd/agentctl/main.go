@@ -509,7 +509,7 @@ func showStatus() error {
 		fmt.Printf("Resolver      forwarding to %s\n", s.Resolver)
 	}
 	fmt.Printf("Active runs   %d\n", s.ActiveRuns)
-	fmt.Printf("Lost events   %d\n", s.LostEvents)
+	fmt.Printf("Lost events   %d (ring buffer full), %d suppressed (a run over its event budget)\n", s.LostEvents, s.SuppressedEvents)
 	return nil
 }
 

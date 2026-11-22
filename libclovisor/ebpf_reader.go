@@ -137,6 +137,8 @@ type bpfObjects struct {
 	ProxyConn4   *ebpf.Program `ebpf:"on_proxy_connect4"`
 	ProxyConn6   *ebpf.Program `ebpf:"on_proxy_connect6"`
 	Lost         *ebpf.Map     `ebpf:"lost"`
+	Suppressed   *ebpf.Map     `ebpf:"suppressed"`
+	RunBudget    *ebpf.Map     `ebpf:"run_budget"`
 	ProxyRefused *ebpf.Map     `ebpf:"proxy_refused"`
 	UDPReported  *ebpf.Map     `ebpf:"udp_reported"`
 	DropRate     *ebpf.Map     `ebpf:"drop_rate"`
@@ -151,7 +153,7 @@ type bpfObjects struct {
 
 func (o *bpfObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
-		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate, o.ProxyConn4, o.ProxyConn6, o.Lost, o.ProxyRefused,
+		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate, o.ProxyConn4, o.ProxyConn6, o.Lost, o.Suppressed, o.RunBudget, o.ProxyRefused,
 		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple} {
 		if c != nil {
 			c.Close()
@@ -554,27 +556,37 @@ func (r *EBPFReader) heartbeatLoop() {
 // Healthy reports whether the last health check passed.
 func (r *EBPFReader) Healthy() bool { return !r.unhealthy.Load() }
 
-// LostFor returns and clears the events lost for a run: ring buffer
-// reservations that failed while it ran.
-func (r *EBPFReader) LostFor(runCg uint64) uint64 {
-	var n uint64
-	if r.objs.Lost == nil || runCg == 0 {
-		return 0
+// LostFor returns and clears a run's missing events: those lost to a full
+// ring buffer, and those suppressed because the run spent its event
+// budget. It also forgets the run's budget.
+func (r *EBPFReader) LostFor(runCg uint64) (lost, suppressed uint64) {
+	if runCg == 0 {
+		return 0, 0
 	}
-	if err := r.objs.Lost.Lookup(runCg, &n); err != nil {
-		return 0
+	take := func(m *ebpf.Map) uint64 {
+		var n uint64
+		if m == nil || m.Lookup(runCg, &n) != nil {
+			return 0
+		}
+		m.Delete(runCg)
+		return n
 	}
-	r.objs.Lost.Delete(runCg)
-	return n
+	if r.objs.RunBudget != nil {
+		r.objs.RunBudget.Delete(runCg)
+	}
+	return take(r.objs.Lost), take(r.objs.Suppressed)
 }
 
-// LostTotal is every event lost since the program was loaded.
-func (r *EBPFReader) LostTotal() uint64 {
-	var n uint64
+// LostTotal is every event lost, and every event suppressed, since the
+// program was loaded.
+func (r *EBPFReader) LostTotal() (lost, suppressed uint64) {
 	if r.objs.Lost != nil {
-		r.objs.Lost.Lookup(uint64(0), &n)
+		r.objs.Lost.Lookup(uint64(0), &lost)
 	}
-	return n
+	if r.objs.Suppressed != nil {
+		r.objs.Suppressed.Lookup(uint64(0), &suppressed)
+	}
+	return lost, suppressed
 }
 
 // ProxyRefused counts the proxy's connects the gate refused.

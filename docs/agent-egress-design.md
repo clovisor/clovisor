@@ -2524,16 +2524,31 @@ connections that curl, run once per request, cannot.
 
 Findings:
 
-- **One run can exhaust the shared ring buffer**, and other runs lose events
-  in the same window. Refused UDP connects are reported each time; capping
-  reports per run (as `sendmsg` already does per socket), or a ring buffer
-  per run, would contain it. Now at least the loss is counted and visible.
+- **One run could exhaust the shared ring buffer**, and other runs would lose
+  events in the same window. *Fixed by the per-run event budget, below.*
 - **The gate needs Envoy in its own cgroup.** An Envoy started by hand in a
   login session shares the session's cgroup and stays ungated, as
   `agentctl status` reports. The operator guide says to run it in a
   container or unit.
 - **Health is node-wide.** One Envoy serves every run, so when it is down no
   run is served. That is the intended reading of fail closed.
+
+**Per-run event budget** (added after the first 3.5 commit). Each run's exec,
+connect and DNS-capture events are charged by size to a token bucket in the
+kernel: a 1 MiB burst (about 1,300 execs, a quarter of the ring buffer, now
+4 MiB), refilled at 4 MiB/s. Events over budget are not reported, and are
+counted per run as `suppressed_events`, which marks the timeline not
+complete. Enforcement does not depend on reporting, and run start and end
+are never charged, so every timeline still closes. Verified live:
+
+- run A made 938,649 refused UDP connects in three seconds, while run B ran
+  1,000 execs;
+- A had 732,925 events suppressed and counted;
+- B recorded all 1,002 execs, complete;
+- nothing was lost from the ring buffer.
+
+The first setting (a 128 KiB burst) suppressed 62 events of a 300-exec shell
+loop, so budgets are sized for build-like exec bursts.
 
 #### Decisions
 

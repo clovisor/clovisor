@@ -834,7 +834,7 @@ func (na *NodeAgent) Status() NodeStatus {
 		s.Healthy = r.Healthy() && s.HealthError == ""
 		s.ProxyGated = r.GatedProxy() != ""
 		s.ProxyRefused = r.ProxyRefused()
-		s.LostEvents = r.LostTotal()
+		s.LostEvents, s.SuppressedEvents = r.LostTotal()
 	}
 	if why, _ := na.gateWhy.Load().(string); !s.ProxyGated {
 		s.ProxyGateWhy = why

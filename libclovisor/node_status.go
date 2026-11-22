@@ -35,6 +35,8 @@ type NodeStatus struct {
 	ProxyGateWhy string `json:"proxy_gate_why,omitempty"`
 	ProxyRefused uint64 `json:"proxy_refused"`
 	LostEvents   uint64 `json:"lost_events"`
-	Resolver     string `json:"resolver,omitempty"`
-	ActiveRuns   int    `json:"active_runs"`
+	// SuppressedEvents exceeded a run's event budget and were not reported.
+	SuppressedEvents uint64 `json:"suppressed_events"`
+	Resolver         string `json:"resolver,omitempty"`
+	ActiveRuns       int    `json:"active_runs"`
 }
