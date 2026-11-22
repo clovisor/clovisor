@@ -36,6 +36,7 @@ type NodeAgent struct {
 	ca         *NodeCA
 	terminated []string // patterns in the bootstrap last written
 	mcp        *MCPGateway
+	resolver   *Resolver
 	httpEvents chan AuditEvent
 	policyDir  string
 	deployment policy.DeploymentMode
@@ -85,6 +86,9 @@ type NodeAgentOptions struct {
 	// refused. Needs cgroup identity and the proxy. Its exceptions are
 	// filled in from ProxyListen and MCPListen.
 	Transparent TransparentOptions
+	// DNSUpstreams are where the local resolver forwards allowed queries
+	// ("ip:port"); the host's /etc/resolv.conf nameservers if empty.
+	DNSUpstreams []string
 
 	// MCPListen enables the local MCP gateway on a loopback address.
 	MCPListen netip.AddrPort
@@ -186,6 +190,14 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 
 	registry := NewRunRegistry()
 	httpEvents := make(chan AuditEvent, 1000)
+	// The resolver's sockets exist before the hooks send DNS to them, so
+	// queries arriving during start-up wait instead of being refused.
+	var resolver *Resolver
+	if t.Mode != TransparentOff {
+		if resolver, err = NewResolver(nil, "", t.DNSPort, opts.DNSUpstreams, t.Mode == TransparentEnforce, httpEvents); err != nil {
+			return nil, fmt.Errorf("resolver: %w", err)
+		}
+	}
 	var cmgr *CgroupManager
 	var audit *AgentAudit
 	var recorder *RunRecorder
@@ -221,6 +233,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if audit.reader != nil {
 			audit.reader.Close()
 		}
+		if resolver != nil {
+			resolver.Close()
+		}
 	}
 
 	// Listen only once BPF is attached, so no run can start unobserved.
@@ -233,6 +248,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		api.Events = httpEvents
 	}
 	api.Transparent = opts.Transparent.Mode
+	if resolver != nil {
+		resolver.api, resolver.agentsDir = api, agentsDir
+		fmt.Printf("dns: resolver on 127.0.0.1:%d and [::1]:%d, forwarding to %s\n", t.DNSPort, t.DNSPort, strings.Join(resolver.upstreams, ", "))
+	}
 	if set != nil {
 		api.SetPolicy(set)
 	}
@@ -299,7 +318,8 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		recorder.ProxyAddrs = map[string]bool{opts.ProxyListen.String(): true}
 		fmt.Printf("proxy: ext_proc on %s; Envoy bootstrap %s (proxy %s)\n", opts.ExtProcSocket, opts.EnvoyConfig, opts.ProxyListen)
 		if t.Mode != TransparentOff {
-			fmt.Printf("transparent: %s; listener 127.0.0.1:%d and [::1]:%d; exceptions %v\n", t.Mode, t.Port, t.Port, t.Exceptions)
+			fmt.Printf("transparent: %s; listener 127.0.0.1:%d and [::1]:%d; exceptions %v; UDP allowed to %v\n",
+				t.Mode, t.Port, t.Port, t.Exceptions, t.UDPExceptions)
 		}
 	}
 
@@ -322,6 +342,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 
 	na := &NodeAgent{
 		mcp:        gw,
+		resolver:   resolver,
 		ca:         proxyCA,
 		terminated: proxyTerminated,
 		cmgr:       cmgr,
@@ -533,6 +554,9 @@ func (na *NodeAgent) Stop() error {
 	if na.mcp != nil {
 		na.mcp.Close()
 	}
+	if na.resolver != nil {
+		na.resolver.Close()
+	}
 	if na.api != nil {
 		na.api.Close()
 	}
@@ -576,6 +600,9 @@ func (na *NodeAgent) Run() error {
 				fmt.Fprintf(os.Stderr, "ext_proc: %v\n", err)
 			}
 		}()
+	}
+	if na.resolver != nil {
+		go na.resolver.Serve()
 	}
 	if na.mcp != nil {
 		go func() {
@@ -646,8 +673,25 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))), v)
 	case EventDNS:
 		d := event.Data.(DNSData)
-		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v\n",
-			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs())
+		extra := ""
+		if d.Decision != "" {
+			extra = " decision=" + d.Decision
+			if d.Enforced {
+				extra += " (NXDOMAIN)"
+			}
+			if len(d.WouldDeny) > 0 {
+				extra += " would-deny=" + strings.Join(d.WouldDeny, ",")
+			}
+			if d.ECHStripped > 0 {
+				extra += fmt.Sprintf(" ech-stripped=%d", d.ECHStripped)
+			}
+		}
+		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v%s\n",
+			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs(), extra)
+	case EventDrop:
+		d := event.Data.(DropData)
+		fmt.Printf("%s [DROP] run=%d proto=%s dst=%s count=%d\n", ts, event.RunCgroupID, d.Protocol,
+			net.JoinHostPort(d.DstIP, strconv.Itoa(int(d.DstPort))), d.Count)
 	case EventMCP:
 		d := event.Data.(MCPData)
 		extra := ""

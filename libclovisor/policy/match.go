@@ -251,3 +251,43 @@ func (cp *CompiledProfile) DecideExec(path string) ExecDecision {
 	}
 	return ExecDecision{Allowed: cp.exec.Default == ActionAllow, Default: true}
 }
+
+// DecideName answers whether a DNS name may be resolved (milestone 3.4):
+// allowed if some request to it, on some port, could be allowed at
+// connect phase. That is exact under first-match rules: every port a rule
+// names is tried, plus one no rule names. A cidr rule does not make a
+// name resolvable, since the name is decided before anything is resolved:
+// forwarding an unknown name is what DNS tunnelling needs.
+func (cp *CompiledProfile) DecideName(name string) Decision {
+	ports := map[uint16]bool{}
+	for _, r := range cp.Rules {
+		for p := range r.ports {
+			ports[p] = true
+		}
+	}
+	other := uint16(1)
+	for ports[other] {
+		other++
+	}
+	ports[other] = true
+	var first Decision
+	for p := range ports {
+		d := cp.Decide(Request{Host: name, Port: p, Phase: PhaseConnect})
+		if d.Allowed() {
+			// The port is not part of a name decision.
+			return Decision{Action: d.Action, Rule: d.Rule}
+		}
+		if first.Action == "" || (first.Rule == "" && d.Rule != "") {
+			first = d
+		}
+	}
+	first.Message = fmt.Sprintf("No rule in profile %s allows any connection to %s, so the name is not resolved.", cp.Name, NormalizeHost(name))
+	if first.Rule != "" {
+		for _, r := range cp.Rules {
+			if r.Name == first.Rule && r.Message != "" {
+				first.Message = r.Message
+			}
+		}
+	}
+	return first
+}

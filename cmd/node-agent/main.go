@@ -39,6 +39,9 @@ var (
 	transp   = flag.String("transparent", "off", "Transparent mode (needs -proxy-listen and cgroup identity): off; audit (record what enforce would do); "+
 		"enforce (every TCP connect from a run goes to Envoy's transparent listener or is refused, also while the node agent is down)")
 	tPort  = flag.Uint("transparent-port", clovisor.DefaultTransparentPort, "Transparent listener port, on 127.0.0.1 and ::1")
+	tDNS   = flag.Uint("transparent-dns-port", clovisor.DefaultResolverPort, "Local resolver port, on 127.0.0.1 and ::1, where transparent mode sends runs' DNS")
+	udpOK  = flag.String("udp-allow", "", "Comma-separated ip:port UDP destinations runs may reach in transparent mode (0.0.0.0:port: any loopback address); other UDP but DNS is refused")
+	dnsUp  = flag.String("dns-upstream", "", "Comma-separated ip:port resolvers the local resolver forwards to (default: the nameservers in /etc/resolv.conf)")
 	tStale = flag.Duration("transparent-stale", clovisor.DefaultHeartbeatStale, "How long after the node agent stops connects are refused")
 )
 
@@ -73,6 +76,24 @@ func addrFlag(name, v string) netip.AddrPort {
 		log.Fatalf("%s: %v", name, err)
 	}
 	return ap
+}
+
+func addrList(name, s string) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, f := range splitList(s) {
+		out = append(out, addrFlag(name, f))
+	}
+	return out
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func uids(s string) []uint32 {
@@ -110,7 +131,9 @@ func main() {
 		MCPListen:       addrFlag("-mcp-listen", *mcpAddr),
 		CADir:           *caDir,
 		EnvoyUpstreamCA: *upCA,
-		Transparent:     clovisor.TransparentOptions{Mode: *transp, Port: uint16(*tPort), Stale: *tStale},
+		Transparent: clovisor.TransparentOptions{Mode: *transp, Port: uint16(*tPort), DNSPort: uint16(*tDNS), Stale: *tStale,
+			UDPExceptions: addrList("-udp-allow", *udpOK)},
+		DNSUpstreams: splitList(*dnsUp),
 	})
 	// A policy that does not load is fatal at start: running without it
 	// would silently leave runs unprofiled.

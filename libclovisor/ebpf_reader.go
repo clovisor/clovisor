@@ -39,6 +39,7 @@ const (
 	bpfEventRunStart = 2
 	bpfEventRunEnd   = 3
 	bpfEventDNS      = 4
+	bpfEventDrop     = 5
 
 	afInet  = 2
 	afInet6 = 10
@@ -51,9 +52,10 @@ type bpfAuditConfig struct {
 	Mode           uint32
 	StaleNs        uint64
 	TproxyPort     uint16
-	_              uint16
+	DNSPort        uint16
 	_              uint32
 	Exc            [maxTransparentExceptions]bpfException
+	UDPExc         [maxTransparentExceptions]bpfException
 }
 
 type bpfException struct {
@@ -89,6 +91,16 @@ type bpfDNSEvent struct {
 	Payload [maxDNSLen]byte
 }
 
+type bpfDropEvent struct {
+	Hdr      bpfEventHdr
+	Family   uint16
+	DPort    uint16
+	Protocol uint32
+	DAddr    [16]byte
+	Count    uint32
+	Enforced uint32
+}
+
 type bpfCgroupEvent struct {
 	Hdr  bpfEventHdr
 	Path [maxCgPathLen]byte
@@ -116,6 +128,13 @@ type bpfObjects struct {
 	Peer4Prog    *ebpf.Program `ebpf:"on_getpeername4"`
 	Peer6Prog    *ebpf.Program `ebpf:"on_getpeername6"`
 	SockopsProg  *ebpf.Program `ebpf:"on_sockops"`
+	Send4Prog    *ebpf.Program `ebpf:"on_sendmsg4"`
+	Send6Prog    *ebpf.Program `ebpf:"on_sendmsg6"`
+	Recv4Prog    *ebpf.Program `ebpf:"on_recvmsg4"`
+	Recv6Prog    *ebpf.Program `ebpf:"on_recvmsg6"`
+	EgressProg   *ebpf.Program `ebpf:"on_egress"`
+	UDPReported  *ebpf.Map     `ebpf:"udp_reported"`
+	DropRate     *ebpf.Map     `ebpf:"drop_rate"`
 	SockoptProg  *ebpf.Program `ebpf:"on_getsockopt"`
 	Config       *ebpf.Map     `ebpf:"config"`
 	Heartbeat    *ebpf.Map     `ebpf:"heartbeat"`
@@ -127,7 +146,7 @@ type bpfObjects struct {
 
 func (o *bpfObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
-		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg,
+		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate,
 		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple} {
 		if c != nil {
 			c.Close()
@@ -179,12 +198,18 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 
 	cfg := bpfAuditConfig{AgentsCgroupID: agentsCgroupID, AgentsLevel: agentsLevel,
 		Mode:    map[string]uint32{TransparentOff: 0, TransparentAudit: 1, TransparentEnforce: 2}[t.Mode],
-		StaleNs: uint64(t.Stale.Nanoseconds()), TproxyPort: t.Port}
+		StaleNs: uint64(t.Stale.Nanoseconds()), TproxyPort: t.Port, DNSPort: t.DNSPort}
 	for i, x := range t.Exceptions {
 		if a := x.Addr(); !a.IsUnspecified() {
 			cfg.Exc[i].IP = a.As16() // IPv4 comes out as ::ffff:a.b.c.d
 		}
 		cfg.Exc[i].Port = x.Port()
+	}
+	for i, x := range t.UDPExceptions {
+		if a := x.Addr(); !a.IsUnspecified() {
+			cfg.UDPExc[i].IP = a.As16()
+		}
+		cfg.UDPExc[i].Port = x.Port()
 	}
 	if err := r.objs.Config.Put(uint32(0), cfg); err != nil {
 		r.Close()
@@ -239,6 +264,12 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		{"getpeername4", agentsDir, ebpf.AttachCgroupInet4GetPeername, r.objs.Peer4Prog, on},
 		{"getpeername6", agentsDir, ebpf.AttachCgroupInet6GetPeername, r.objs.Peer6Prog, on},
 		{"sockops", agentsDir, ebpf.AttachCGroupSockOps, r.objs.SockopsProg, on},
+		{"sendmsg4", agentsDir, ebpf.AttachCGroupUDP4Sendmsg, r.objs.Send4Prog, on},
+		{"sendmsg6", agentsDir, ebpf.AttachCGroupUDP6Sendmsg, r.objs.Send6Prog, on},
+		{"recvmsg4", agentsDir, ebpf.AttachCGroupUDP4Recvmsg, r.objs.Recv4Prog, on},
+		{"recvmsg6", agentsDir, ebpf.AttachCGroupUDP6Recvmsg, r.objs.Recv6Prog, on},
+		// The packet backstop; it acts in enforce only.
+		{"egress", agentsDir, ebpf.AttachCGroupInetEgress, r.objs.EgressProg, on},
 		// On the root: the proxy runs outside agents/, wherever its
 		// operator put it. The program answers only tasks outside runs.
 		{"getsockopt", CgroupV2Root, ebpf.AttachCGroupGetsockopt, r.objs.SockoptProg, on},
@@ -349,6 +380,18 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		d.Server = net.IP(append([]byte(nil), server...)).String()
 		ev.Type = EventDNS
 		ev.Data = d
+
+	case bpfEventDrop:
+		var e bpfDropEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		ip := net.IP(append([]byte(nil), e.DAddr[:4]...))
+		if e.Family == afInet6 {
+			ip = net.IP(append([]byte(nil), e.DAddr[:]...))
+		}
+		ev.Type = EventDrop
+		ev.Data = DropData{DstIP: ip.String(), DstPort: e.DPort, Protocol: ipProtoName(e.Protocol), Count: e.Count, Enforced: e.Enforced != 0}
 
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent

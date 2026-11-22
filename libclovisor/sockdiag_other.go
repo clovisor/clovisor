@@ -19,3 +19,8 @@ import (
 func SockCgroup(local, remote netip.AddrPort) (uint64, error) {
 	return 0, errors.New("socket cgroup lookup needs Linux; use credential identity")
 }
+
+// SockCgroupUDP needs Linux socket diagnostics.
+func SockCgroupUDP(client, server netip.AddrPort) (uint64, error) {
+	return 0, errors.New("socket cgroup lookup needs Linux")
+}

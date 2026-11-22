@@ -343,11 +343,20 @@ type EffectiveDecision struct {
 // enforce-mode deny blocks; audit-mode denies are recorded; otherwise the
 // attempt is allowed, deferred to request phase if any layer needs it.
 func (e *Effective) Decide(req Request) EffectiveDecision {
+	return e.decide(func(cp *CompiledProfile) Decision { return cp.Decide(req) })
+}
+
+// DecideName is Decide for a DNS name (see CompiledProfile.DecideName).
+func (e *Effective) DecideName(name string) EffectiveDecision {
+	return e.decide(func(cp *CompiledProfile) Decision { return cp.DecideName(name) })
+}
+
+func (e *Effective) decide(decide func(*CompiledProfile) Decision) EffectiveDecision {
 	var out EffectiveDecision
 	out.Action = ActionAllow
 	var deferred bool
 	for _, l := range e.Layers {
-		d := l.Profile.Decide(req)
+		d := decide(l.Profile)
 		if !d.Allowed() {
 			if l.Profile.Mode == ModeEnforce {
 				return EffectiveDecision{Decision: d, Enforced: true, Layer: l.Profile.Name, WouldDeny: out.WouldDeny}

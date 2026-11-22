@@ -22,7 +22,19 @@ const (
 	EventDNS      // a resolver reply delivered to a socket in a run
 	EventHTTP     // a request through the node's proxy, and its decision
 	EventMCP      // an MCP operation through the local gateway, and its decision
+	EventDrop     // packets from a run the backstop dropped (milestone 3.3)
 )
+
+// DropData reports packets the egress backstop dropped: they got past the
+// socket hooks (an unconnected ICMP datagram, a raw socket). Reports are
+// rate-limited; Count is the packets since the previous one.
+type DropData struct {
+	DstIP    string
+	DstPort  uint16 // 0 unless TCP or UDP
+	Protocol string
+	Count    uint32
+	Enforced bool
+}
 
 // AuditEvent represents an audit event
 type AuditEvent struct {

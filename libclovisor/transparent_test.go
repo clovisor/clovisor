@@ -42,7 +42,7 @@ func TestTransparentOptions(t *testing.T) {
 func TestTransparentReceipt(t *testing.T) {
 	p, _ := policy.Parse([]byte(xpProfile))
 	for mode, want := range map[policy.DeploymentMode]string{
-		policy.Transparent:      "Routing     enforced for TCP",
+		policy.Transparent:      "Routing     enforced: every TCP connect",
 		policy.TransparentAudit: "Routing     advisory, auditing",
 		policy.ExplicitProxy:    "Routing     advisory: only traffic sent to the proxy",
 	} {
@@ -193,5 +193,35 @@ func TestRunRecorderTransparentConnects(t *testing.T) {
 	}
 	if strings.Join(verdicts, "|") != "redirect|refused: node agent down|same-run loopback" {
 		t.Fatalf("connect verdicts: %q", verdicts)
+	}
+}
+
+func TestRunRecorderUDPAndDrops(t *testing.T) {
+	r := newTestRecorder(t)
+	udp := connEv(1, 10, "8.8.8.8", 443)
+	cd := udp.Data.(ConnectData)
+	cd.Protocol, cd.Verdict = "UDP", VerdictUDP
+	udp.Data = cd
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		udp,
+		AuditEvent{Type: EventDrop, Timestamp: at(2), CgroupID: testRunCg, RunCgroupID: testRunCg,
+			Data: DropData{DstIP: "1.1.1.1", Protocol: "ICMP", Count: 3, Enforced: true}},
+		AuditEvent{Type: EventDrop, Timestamp: at(3), CgroupID: testRunCg, RunCgroupID: testRunCg,
+			Data: DropData{DstIP: "1.1.1.1", Protocol: "ICMP", Count: 2, Enforced: true}},
+		runEv(EventRunEnd, 4, "/agents/run-abc"),
+	)
+	s := tl.Summary
+	if s.UDPRefused != 1 || s.Dropped != 5 || s.Connects != 0 || len(s.Destinations) != 0 {
+		t.Fatalf("summary: %+v", s)
+	}
+	drops := 0
+	for _, e := range tl.Events {
+		if e.Type == "drop" {
+			drops++
+		}
+	}
+	if drops != 2 {
+		t.Fatalf("%d drop events", drops)
 	}
 }

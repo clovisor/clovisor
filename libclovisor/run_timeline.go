@@ -49,11 +49,14 @@ type RunTimeline struct {
 
 // RunSummary aggregates a run's events.
 type RunSummary struct {
-	Execs        int           `json:"execs"`
-	Connects     int           `json:"connects"`
-	DNSReplies   int           `json:"dns_replies"`
-	Binaries     []string      `json:"binaries"`
-	DNSNames     []string      `json:"dns_names"` // distinct names looked up
+	Execs      int      `json:"execs"`
+	Connects   int      `json:"connects"`
+	DNSReplies int      `json:"dns_replies"`
+	Binaries   []string `json:"binaries"`
+	DNSNames   []string `json:"dns_names"` // distinct names looked up and answered
+	// DNSBlocked are names the node's resolver refused to resolve
+	// (milestone 3.4); they never left the node.
+	DNSBlocked   []string      `json:"dns_blocked,omitempty"`
 	Destinations []Destination `json:"destinations"`
 	// Proxied is what the run asked the node's proxy for, by destination.
 	// Connections to the proxy itself are counted in ProxyConnects and
@@ -66,6 +69,11 @@ type RunSummary struct {
 	// because the node agent was down.
 	Redirected int `json:"redirected,omitempty"`
 	Refused    int `json:"refused,omitempty"`
+	// UDPRefused counts refused UDP sends (milestone 3.3): one per connect,
+	// or per unconnected socket. Dropped counts packets the egress
+	// backstop dropped.
+	UDPRefused int `json:"udp_refused,omitempty"`
+	Dropped    int `json:"dropped,omitempty"`
 	// MCP is what the run did through the local MCP gateway.
 	MCP []MCPUse `json:"mcp,omitempty"`
 }
@@ -177,7 +185,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, connect, dns, http, gap
+	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -229,6 +237,7 @@ type runState struct {
 	binaries map[string]struct{}
 	dests    map[destKey]*destState
 	names    map[string]struct{}
+	blocked  map[string]struct{} // names the resolver refused
 	// ipName maps an address to the name whose lookup most recently
 	// returned it in this run.
 	ipName  map[string]string
@@ -357,6 +366,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		binaries: make(map[string]struct{}),
 		dests:    make(map[destKey]*destState),
 		names:    make(map[string]struct{}),
+		blocked:  make(map[string]struct{}),
 		ipName:   make(map[string]string),
 		proxied:  make(map[proxKey]*ProxiedDest),
 		mcp:      make(map[mcpKey]*MCPUse),
@@ -386,6 +396,9 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			}
 			for _, n := range prev.Summary.DNSNames {
 				st.names[n] = struct{}{}
+			}
+			for _, n := range prev.Summary.DNSBlocked {
+				st.blocked[n] = struct{}{}
 			}
 			for _, d := range prev.Summary.Destinations {
 				ds := &destState{count: d.Count, names: make(map[string]struct{})}
@@ -472,13 +485,16 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			st.tl.Summary.ProxyConnects++
 			return nil, nil
 		}
-		if d.Verdict == VerdictRedirect || d.Verdict == VerdictRefused {
+		if d.Verdict == VerdictRedirect || d.Verdict == VerdictRefused || d.Verdict == VerdictUDP {
 			// Redirected: it went to the proxy, and what it was for
 			// arrives as http events. Refused: it went nowhere. Neither
 			// is a destination the run reached directly.
-			if d.Verdict == VerdictRedirect {
+			switch d.Verdict {
+			case VerdictRedirect:
 				st.tl.Summary.Redirected++
-			} else {
+			case VerdictUDP:
+				st.tl.Summary.UDPRefused++
+			default:
 				st.tl.Summary.Refused++
 			}
 			st.add(TimelineEvent{Time: ev.Timestamp, Type: "connect", PID: ev.PID, CgroupID: ev.CgroupID,
@@ -576,6 +592,16 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			AddrMismatch: d.AddrMismatch,
 		}, r.MaxEvents)
 
+	case EventDrop:
+		d := ev.Data.(DropData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		st.tl.Summary.Dropped += int(d.Count)
+		st.add(TimelineEvent{Time: ev.Timestamp, Type: "drop", CgroupID: ev.CgroupID, Proto: d.Protocol,
+			DstIP: d.DstIP, DstPort: d.DstPort, Note: fmt.Sprintf("%d packets dropped by the backstop (a lower bound: the last second before a run goes quiet is not reported)", d.Count)}, r.MaxEvents)
+
 	case EventDNS:
 		d := ev.Data.(DNSData)
 		st := r.state(ev, "")
@@ -583,7 +609,9 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			return nil, nil
 		}
 		st.tl.Summary.DNSReplies++
-		if d.Query != "" {
+		if d.Enforced {
+			st.blocked[d.Query] = struct{}{}
+		} else if d.Query != "" {
 			st.names[d.Query] = struct{}{}
 			for _, ip := range d.Addrs() {
 				st.ipName[ip] = d.Query
@@ -599,6 +627,14 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Server:   d.Server,
 			Answers:  d.Answers,
 			Partial:  d.Partial,
+
+			Decision:  d.Decision,
+			Enforced:  d.Enforced,
+			Rule:      d.Rule,
+			Layer:     d.Layer,
+			WouldDeny: d.WouldDeny,
+			Reason:    d.Reason,
+			Note:      echNote(d.ECHStripped),
 		}, r.MaxEvents)
 	}
 	return nil, nil
@@ -654,6 +690,9 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl.Summary.Binaries = sortedKeys(st.binaries)
 
 	tl.Summary.DNSNames = sortedKeys(st.names)
+	if len(st.blocked) > 0 {
+		tl.Summary.DNSBlocked = sortedKeys(st.blocked)
+	}
 
 	tl.Summary.MCP = nil
 	for _, u := range st.mcp {
@@ -752,4 +791,11 @@ func ReadRunTimeline(path string) (*RunTimeline, error) {
 // TimelinePath returns where the timeline for runID lives in outDir.
 func TimelinePath(outDir, runID string) string {
 	return filepath.Join(outDir, "run-"+runID+".json")
+}
+
+func echNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("ech removed from %d records", n)
 }

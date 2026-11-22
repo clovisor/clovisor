@@ -30,6 +30,19 @@ const (
 // uses it to learn a client's run from the client's source port (Phase 2
 // finding 1). The cgroup is the one the socket was created in.
 func SockCgroup(local, remote netip.AddrPort) (uint64, error) {
+	return sockLookup(unix.IPPROTO_TCP, local, remote)
+}
+
+// SockCgroupUDP returns the cgroup id of the UDP socket a datagram from
+// client to server came from, connected or not (milestone 3.4: the local
+// resolver identifying a query's run). UDP socket diagnostics find the
+// socket that would receive a datagram from the first address to the
+// second (udp_dump_one), so the server goes first (3.0 spike).
+func SockCgroupUDP(client, server netip.AddrPort) (uint64, error) {
+	return sockLookup(unix.IPPROTO_UDP, server, client)
+}
+
+func sockLookup(proto byte, local, remote netip.AddrPort) (uint64, error) {
 	if local.Addr().Is4() != remote.Addr().Is4() {
 		return 0, fmt.Errorf("mixed address families")
 	}
@@ -56,7 +69,7 @@ func SockCgroup(local, remote netip.AddrPort) (uint64, error) {
 	le.PutUint32(req[8:], 1) // seq
 	b := req[16:]
 	b[0] = family
-	b[1] = unix.IPPROTO_TCP
+	b[1] = proto
 	b[2] = 0                        // idiag_ext
 	le.PutUint32(b[4:], 0xffffffff) // all states
 	id := b[8:]                     // inet_diag_sockid

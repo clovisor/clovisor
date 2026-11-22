@@ -70,6 +70,8 @@ place:
 | Phase 3 broken into milestones. Redirected connections become a `CONNECT` into the Phase 2 pipeline, routed by SNI; identity reuses socket diagnostics; same-run loopback allowed; fail closed by heartbeat. | [Phase 3 plan](#phase-3-plan-2026-11-22) |
 | 3.0 spikes: original-destination recovery, the Envoy transparent listener, forced DNS with ECH stripping, UDP deny and fail closed all work. Sockets made before joining a run bypass the hooks; a direct connect to the transparent port loops. | [3.0 spike results](#30-spike-results-2026-11-22) |
 | Redirect-or-deny and the transparent data plane implemented (`-transparent audit\|enforce`): pinned hooks that fail closed, same-run loopback, SNI routing into the CONNECT pipeline, clean-start check at attach. | [3.1 and 3.2 status](#31-and-32-status-2026-11-22) |
+| Forced local DNS: every run query to the node's resolver, which answers only names the profile could allow (NXDOMAIN with an EDE reason otherwise) and strips ECH. | [3.4 status](#34-status-2026-11-22) |
+| UDP refused except DNS, node-wide exceptions and same-run loopback, QUIC included; a packet backstop drops what gets past the socket hooks. | [3.3 status](#33-status-2026-11-22) |
 
 ---
 
@@ -2347,6 +2349,119 @@ Findings:
   Revisit when Envoy marks it stable.
 - `agentctl explain` offline still compiles for explicit-proxy mode; the
   node agent's receipt reflects the node's mode.
+
+#### 3.4 status (2026-11-22)
+
+Implemented: the forced local resolver, in the node agent, for transparent
+audit and enforce.
+
+- **Redirect.** The connect hooks send port 53, UDP and TCP, to the resolver
+  on `127.0.0.1` and `::1` (port 15053) instead of the transparent listener.
+  New `sendmsg4/6` hooks do the same for unconnected sockets, and
+  `recvmsg4/6` make replies appear to come from the server the client
+  asked. In enforce, DNS is refused with the rest when the heartbeat is
+  stale. Other UDP is still untouched (3.3).
+- **Identity.** Socket diagnostics on the client's UDP or TCP socket, as for
+  the proxy. Clients outside runs get REFUSED.
+- **Decision.** `DecideName` in the policy engine: a name is resolvable if a
+  connection to it could be allowed on some port, tried on every port the
+  rules name plus one they do not. That is exact under first-match rules.
+  Across layers it behaves like `Decide`: an enforce layer's deny refuses,
+  an audit layer's is recorded. A refused name gets NXDOMAIN with an
+  Extended DNS Error (RFC 8914, code 15) carrying the narration, and is never
+  forwarded. In audit mode every name is answered and refusals are recorded
+  as would-deny.
+- **ECH.** The `ech` SvcParam is removed from HTTPS and SVCB records, and from
+  a `mandatory` list naming it. This is done on the raw RDATA, since the
+  module's `dnsmessage` predates SVCB.
+- **Timelines.** The resolver emits the run's DNS events, with decision,
+  rule and the upstream that answered. Refused names go to `dns_blocked`,
+  not `dns_names`, so learn mode does not draft rules for them. Replies now
+  come from the resolver's port, so the kernel's port-53 capture no longer
+  sees them, and nothing is counted twice.
+- **Receipt.** States what the resolver does in each mode.
+
+Verified live on kernel 7.0 with the `dev` profile:
+
+- glibc, Python and `dig` resolving allowed names, over UDP and TCP, IPv4 and
+  IPv6, against `@1.1.1.1` and `@8.8.8.8` (replies accepted as theirs);
+- NXDOMAIN with the EDE reason for unlisted names and a tunnelling-shaped
+  query, the upstream never asked;
+- `ech` gone from `crypto.cloudflare.com`'s HTTPS record inside a run, and
+  the following HTTPS request routed by its cleartext SNI;
+- DNS refused with the node agent stopped;
+- audit answering with `would-deny`;
+- the integration suite unchanged.
+
+Findings:
+
+- **Names are decided before resolution, so `cidr` rules do not make names
+  resolvable.** Deciding by the answer would mean forwarding the name, which
+  is what tunnelling needs. Internal hosts need `fqdn` rules. The operator
+  guide says so.
+- **Stripping `ech` invalidates the record's DNSSEC signature.** Stub
+  resolvers that validate would reject it; none of the tested clients do.
+  The alternative is to drop HTTPS records entirely, which loses ALPN hints.
+  Revisit if a validating client appears.
+- The resolver has no cache; the host resolver behind it (systemd-resolved
+  here) caches.
+
+#### 3.3 status (2026-11-22)
+
+Implemented on top of 3.4:
+
+- **UDP refused.** UDP `connect` and `sendmsg`, over IPv4 and IPv6, get
+  `EPERM` unless the destination is:
+  - DNS, which goes to the resolver;
+  - a `-udp-allow` exception (node-wide, at most four);
+  - a loopback socket bound by the same run (found with
+    `bpf_sk_lookup_udp`, tagged at `bind`);
+  - a loopback port nobody listens on.
+
+  QUIC is refused like any other UDP, at once, so clients fall back to TCP.
+  The same decision covers ICMP datagram sockets once connected.
+- **Reported once.** A refused connect is one event. An unconnected socket is
+  reported the first time it is refused, through a per-socket storage flag,
+  so a sender in a loop cannot flood the ring buffer. Timelines count
+  `udp_refused`; refused UDP is not a destination.
+- **Packet backstop.** `cgroup_skb/egress` on `agents/`, in enforce only. In
+  enforce every legitimate packet from a run goes to loopback (the proxy,
+  the resolver, same-run services) or to an exception, so anything else
+  left through a path the socket hooks do not see, and is dropped. Drops are
+  reported at most once a second per run, with a count, as `drop` events and
+  `dropped` in the summary. The backstop is pinned with the other hooks.
+- **Audit** records `would refuse: UDP` and lets it through; the backstop is
+  off there, since audit runs reach the network directly.
+- **Receipt.** Routing is reported as enforced for TCP and UDP, listing what
+  remains: Unix and raw sockets as such, and host daemons.
+
+Verified live on kernel 7.0:
+
+- `EPERM` for UDP to 8.8.8.8:443 and `[2606:4700::1111]:443`, for a UDP
+  `connect`, and for a host UDP service on loopback;
+- an NTP exchange through `-udp-allow`; same-run loopback UDP;
+- an unconnected ICMP echo dropped by the backstop (the 3.0 gap), reported
+  as a drop;
+- HTTPS (transparent and explicit), git and DNS unaffected;
+- audit letting UDP and ICMP through with would-refuse events;
+- a clean in-place swap of all thirteen pinned links;
+- the integration suite unchanged.
+
+Findings:
+
+- **The backstop's report rate limit drops the tail.** Packets dropped in the
+  last second before a run goes quiet are counted in the kernel but never
+  reported. The count is a lower bound, and the timeline says so. Flushing
+  it would need a timer (`bpf_timer`) or the node agent polling the map;
+  neither is worth it yet.
+- **`ping` fails outright.** iputils probes with a UDP connect before
+  pinging, and that is refused. ICMP to permitted hosts would need an ICMP
+  exception class; none is planned.
+- **UDP exceptions are node-wide.** Granting UDP per user (by ceiling) needs
+  per-run state in the kernel, a map from run cgroup to allowed
+  destinations. Deferred until someone needs it.
+- Not tested with a real QUIC client: this curl has no HTTP/3. UDP 443 gets
+  `EPERM`, which is what browsers fall back on.
 
 #### Decisions
 

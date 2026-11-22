@@ -361,3 +361,63 @@ func TestGlob(t *testing.T) {
 		}
 	}
 }
+
+func TestDecideName(t *testing.T) {
+	p, err := Parse([]byte(`kind: AgentProfile
+metadata: { name: n }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: no-ssh, to: { fqdn: ["git.example"], ports: [22] }, action: deny, message: "No SSH." }
+      - { name: git, to: { fqdn: ["git.example"], ports: [443] }, action: allow }
+      - { name: only-ssh, to: { fqdn: ["ssh.example"], ports: [22] }, action: deny, message: "No SSH here." }
+      - { name: api, to: { fqdn: ["*.api.example"] }, http: { paths: ["/v1/*"] }, action: allow }
+      - { name: lan, to: { cidr: ["10.0.0.0/8"] }, action: allow }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, diags := Compile(Options{Linux: true}, p)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	cp := c.Profiles[0]
+	for name, want := range map[string]string{
+		"git.example":     "git", // denied on 22, allowed on 443
+		"GIT.example.":    "git",
+		"eu.api.example":  "api", // a path rule: resolvable, decided per request
+		"ssh.example":     "",    // only a deny rule and the default
+		"evil.example":    "",
+		"10.in-addr.arpa": "", // cidr rules do not make names resolvable
+		"x.git.example":   "",
+	} {
+		d := cp.DecideName(name)
+		if (want != "") != d.Allowed() || (want != "" && d.Rule != want) {
+			t.Errorf("%s: %+v, want rule %q", name, d, want)
+		}
+	}
+	if d := cp.DecideName("ssh.example"); d.Message != "No SSH here." {
+		t.Errorf("message from the deciding rule: %q", d.Message)
+	}
+	if d := cp.DecideName("evil.example"); !strings.Contains(d.Message, "not resolved") {
+		t.Errorf("default message: %q", d.Message)
+	}
+	// Across layers: an audit layer's deny is only recorded.
+	ap, err := Parse([]byte("kind: AgentProfile\nmetadata: { name: a }\nspec:\n  mode: audit\n  egress: { default: deny }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, diags := Compile(Options{Linux: true}, ap)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	e := &Effective{Layers: []Layer{{Profile: cp}, {Profile: audit.Profiles[0]}}}
+	if d := e.DecideName("git.example"); !d.Allowed() || len(d.WouldDeny) != 1 {
+		t.Errorf("layers: %+v", d)
+	}
+	if d := e.DecideName("evil.example"); d.Allowed() || !d.Enforced {
+		t.Errorf("enforced deny: %+v", d)
+	}
+}

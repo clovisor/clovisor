@@ -120,6 +120,9 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-transparent off\|audit\|enforce` | Transparent mode (§11). Needs `-proxy-listen` and cgroup identity. |
 | `-transparent-port 15001` | The transparent listener's port, on `127.0.0.1` and `::1`. |
 | `-transparent-stale 3s` | How long after the node agent stops its heartbeat connects are refused. |
+| `-transparent-dns-port 15053` | The local resolver's port, on `127.0.0.1` and `::1`, UDP and TCP. |
+| `-udp-allow ip:port,…` | UDP destinations runs may reach in transparent mode (NTP, say). All other UDP but DNS is refused. At most four. |
+| `-dns-upstream ip:port,…` | Where the local resolver forwards allowed names. Default: the nameservers in `/etc/resolv.conf`. |
 
 Signals: `SIGHUP` reloads the policy directory (a bad edit is rejected and the
 policy in force stays); `SIGINT`/`SIGTERM` stop the agent, leaving live runs
@@ -346,9 +349,10 @@ hosts whose rules need it, and treat the node as sensitive accordingly.
 
 With the explicit proxy alone, routing is advisory: a tool that ignores the
 proxy variables (Node `fetch`, `curl --noproxy`, a Go binary with its own
-dialer) goes direct. Transparent mode makes routing binding for TCP. Every
-TCP connect from a run is either redirected to Envoy's transparent listener
-or refused (design §6.5). The policy, termination, MCP inspection and
+dialer) goes direct. Transparent mode makes routing binding. Every TCP
+connect from a run is either redirected to Envoy's transparent listener or
+refused, DNS goes to the node's resolver, and other UDP is refused (design
+§6.5, §6.8). The policy, termination, MCP inspection and
 timelines are the explicit proxy's, unchanged.
 
 **Requirements.** Linux with cgroup v2, root, cgroup identity,
@@ -378,6 +382,11 @@ tested.
 | TLS with a server name | `CONNECT <name>:<port>` into the proxy. The proxy resolves the name, so a client that pairs an allowed name with another address reaches the name's address. The timeline notes the mismatch. |
 | TLS without a server name; other TCP (SSH, databases) | `CONNECT <ip>:<port>`. Only `cidr` rules match it: a hostname rule does not allow `ssh github.com`. |
 | Plain HTTP | Routed by `Host`, with method and path rules. |
+| DNS (port 53, UDP or TCP, to any server) | To the node's resolver (below). |
+| UDP to a `-udp-allow` destination | Direct. |
+| UDP on loopback, socket bound by the same run, or nothing listening | Direct. |
+| Any other UDP, QUIC included | Refused with `EPERM`. Browsers and HTTP/3 clients fall back to TCP at once. Recorded once per connect, or once per unconnected socket. |
+| Any other packet leaving the node (an unconnected ICMP datagram, a raw socket) | Dropped by the packet backstop. Recorded at most once a second per run, with a count. |
 | Anything, while the node agent is down | Refused with `EPERM`. |
 
 **Fail closed.** In enforce mode the connect hooks are pinned in
@@ -399,12 +408,38 @@ bypass them. In enforce mode the run API refuses to start a run whose first
 process holds network sockets (for example, a TCP socket as standard input).
 Audit mode logs it instead.
 
+**DNS.** In audit and enforce mode every DNS query from a run goes to the
+node agent's resolver, whichever server the run asked; replies appear to come
+from that server. The resolver:
+
+- answers a name only if some rule in the run's profile could allow a
+  connection to it, on some port, and answers NXDOMAIN otherwise, with the
+  reason as an Extended DNS Error (`dig` prints it as `EDE: 15 (Blocked)`).
+  A refused name never leaves the node, which is what stops DNS tunnelling.
+  Audit mode answers every name and records the ones enforce would refuse;
+- removes `ech` from HTTPS records, so clients send a server name the
+  transparent listener can route by;
+- records each query in the run's timeline, with refused names under
+  `dns_blocked`;
+- answers only runs: anything else gets REFUSED.
+
+A `cidr` rule does not make names resolvable, since deciding a name by what
+it resolves to would mean forwarding it first. Give internal hosts `fqdn`
+rules, or have the agent use addresses. DNS over HTTPS and over TLS are
+ordinary connections to their servers, decided by the profile.
+
 **Denials.** Plain HTTP and terminated hosts get the narrated 403 body. A
 refused TLS or TCP connection is closed (clients report a reset); the reason
 is in the timeline and the node agent's log.
 
-**Not covered yet:** UDP, including DNS and QUIC (milestones 3.3 and 3.4);
-raw and Unix sockets; a host daemon connecting on a run's behalf (Phase 4).
+In audit mode UDP and ICMP go through, and refusals are recorded as `would
+refuse: UDP`; the packet backstop is off.
+
+`ping` fails in enforce mode: it refuses to start when its probe UDP
+connect is refused.
+
+**Not covered yet:** Unix sockets, raw sockets to loopback, and a host
+daemon connecting on a run's behalf (Phase 4).
 
 ## 12. Incident response
 
@@ -474,6 +509,9 @@ agentctl events --json <run-id>
 | A run's connects fail with `EPERM` (transparent enforce) | The node agent is down or wedged, so its heartbeat is stale. Start it; to drop enforcement, start it with `-transparent off`. |
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination reached by address needs a `cidr` rule. |
+| UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS and `-udp-allow`. Check `udp_refused` and the connect events in the timeline. |
+| `Name or service not known` in a run (transparent) | The resolver refused the name: no rule allows a connection to it. Check `dns_blocked` in the timeline, or `dig` for the EDE reason. |
+| DNS in runs fails entirely (transparent) | The node agent is down (DNS is refused with it), or the resolver cannot reach `-dns-upstream`: see `server` and `reason` on the timeline's dns events. |
 
 ## 16. Testing a deployment
 

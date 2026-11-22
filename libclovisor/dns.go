@@ -27,6 +27,20 @@ type DNSData struct {
 	// Partial is set when the reply was cut off at the capture limit, so
 	// later answers may be missing.
 	Partial bool
+
+	// Set by the node's resolver (milestone 3.4); empty for replies the
+	// kernel captured. Decision is allow, deny or tag-and-log; Enforced
+	// marks a deny that was answered NXDOMAIN.
+	Decision  string
+	Enforced  bool
+	Rule      string
+	Layer     string
+	WouldDeny []string
+	Reason    string
+	Message   string
+	// ECHStripped counts HTTPS and SVCB records the resolver removed the
+	// ech parameter from.
+	ECHStripped int
 }
 
 // DNSAnswer is one answer record.
@@ -55,6 +69,12 @@ func dnsName(n dnsmessage.Name) string {
 }
 
 func dnsTypeName(t dnsmessage.Type) string {
+	switch t { // newer than this dnsmessage
+	case 64:
+		return "SVCB"
+	case 65:
+		return "HTTPS"
+	}
 	return strings.TrimPrefix(t.String(), "Type")
 }
 

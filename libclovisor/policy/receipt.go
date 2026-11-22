@@ -31,13 +31,19 @@ func (c *Compiled) WriteReceipt(w io.Writer) error {
 	p("Identity    %s", identity)
 	switch c.Options.Mode {
 	case Transparent:
-		p("Routing     enforced for TCP: every connect from a run reaches the proxy or is refused,")
-		p("            and refused while the node agent is down (design §6.5). Not yet covered:")
-		p("            UDP (milestone 3.3), sockets created before the process joined the run")
-		p("            (refused at attach), raw and Unix sockets, host daemons (Phase 4).")
+		p("Routing     enforced: every TCP connect from a run reaches the proxy or is refused, UDP")
+		p("            other than DNS and the node's UDP exceptions is refused (QUIC included), and")
+		p("            all of it while the node agent is down (design §6.5, §6.8). A packet")
+		p("            backstop drops what gets past the socket hooks. Not covered: raw and Unix")
+		p("            sockets as such (Phase 4; raw packets off the node are dropped), host")
+		p("            daemons acting for a run.")
+		p("DNS         every query from a run goes to the node's resolver, which answers only names")
+		p("            some rule allows (NXDOMAIN otherwise) and strips ECH from HTTPS records.")
 	case TransparentAudit:
 		p("Routing     advisory, auditing: connects that bypass the proxy go direct and are")
 		p("            recorded with what transparent mode would have done.")
+		p("DNS         every query from a run goes to the node's resolver, which answers all of them")
+		p("            and records the names enforce would refuse.")
 	default:
 		p("Routing     advisory: only traffic sent to the proxy is governed. Pair with a")
 		p("            sandbox, or transparent mode, to make it binding (design §4.3).")

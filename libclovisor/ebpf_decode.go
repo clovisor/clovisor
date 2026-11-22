@@ -39,6 +39,21 @@ func splitArgs(b []byte) []string {
 	return args
 }
 
+// ipProtoName names an IP protocol number.
+func ipProtoName(p uint32) string {
+	switch p {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 58:
+		return "ICMPv6"
+	}
+	return fmt.Sprintf("proto %d", p)
+}
+
 func protoName(p uint32) string {
 	switch p {
 	case syscall.IPPROTO_TCP:

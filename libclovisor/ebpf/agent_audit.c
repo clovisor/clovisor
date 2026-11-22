@@ -21,8 +21,27 @@
  *                     the configured addresses (explicit proxy, MCP
  *                     gateway), a loopback listener bound by the same run,
  *                     and loopback ports nobody listens on (they fail with
- *                     ECONNREFUSED as they would anyway). UDP is left to
- *                     3.3.
+ *                     ECONNREFUSED as they would anyway).
+ *          In audit and enforce, DNS (port 53, UDP and TCP) goes to the
+ *          node agent's resolver (milestone 3.4); in enforce, refused while
+ *          the heartbeat is stale. Other UDP (milestone 3.3): allowed to
+ *          the configured UDP exceptions, a loopback socket bound by the
+ *          same run, and loopback ports nobody listens on; refused with
+ *          EPERM otherwise (QUIC included, so clients fall back to TCP at
+ *          once). Audit records it and lets it through. A refused
+ *          unconnected socket is reported once, not per datagram.
+ *
+ * backstop: cgroup_skb/egress on agents/, enforce only (in audit runs reach
+ *          the network directly, so nothing is out of place). Every
+ *          legitimate packet from a run goes to loopback (proxy,
+ *          resolver, same-run services) or to an exception, so anything
+ *          else got past the socket hooks (an unconnected ICMP datagram,
+ *          a raw socket) and is dropped. Drops are reported at most once a
+ *          second per run, with a count.
+ *
+ * dns:     cgroup/sendmsg4,6 send unconnected port-53 datagrams to the
+ *          resolver too; cgroup/recvmsg4,6 make its replies appear to come
+ *          from the server the client asked, which resolvers check.
  *
  * transparent (mode audit or enforce, milestone 3.1):
  *          cgroup/bind4,6 on agents/ tag each socket with its run, for the
@@ -67,9 +86,11 @@
 #define ETH_P_IP     0x0800
 #define ETH_P_IPV6   0x86DD
 #define IPPROTO_UDP  17
+#define IPPROTO_TCP_ 6
 #define DNS_PORT     53
 
 #define SOCK_STREAM 1
+#define SOCK_DGRAM  2
 
 #define AF_INET  2
 #define AF_INET6 10
@@ -79,6 +100,7 @@
 #define EVENT_RUN_START 2
 #define EVENT_RUN_END   3
 #define EVENT_DNS       4
+#define EVENT_DROP      5
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct linux_binprm {
@@ -120,6 +142,9 @@ struct cgroup {
 #define V_UNBOUND        5 /* loopback, nobody listening: left alone */
 #define V_AUDIT_REDIRECT 6
 #define V_AUDIT_DENY     7
+#define V_DNS            8 /* port 53, to the local resolver */
+#define V_UDP_DENY       9
+#define V_AUDIT_UDP      10
 
 /* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
 struct addr {
@@ -141,9 +166,10 @@ struct audit_config {
     __u32 mode;           /* MODE_* */
     __u64 stale_ns;       /* heartbeat older than this: unhealthy */
     __u16 tproxy_port;    /* transparent listener on 127.0.0.1 and ::1, host order */
-    __u16 _pad;
+    __u16 dns_port;       /* local resolver on 127.0.0.1 and ::1, host order; 0: none */
     __u32 _pad2;
     struct exception exc[MAX_EXCEPTIONS];
+    struct exception udp_exc[MAX_EXCEPTIONS]; /* UDP destinations runs may reach */
 };
 
 /* Original destination of a redirected socket. */
@@ -185,6 +211,17 @@ struct connect_event {
     __u8  daddr[16];      /* v4 in first 4 bytes, network order */
     __u32 verdict;        /* V_* */
     __u32 _pad;
+};
+
+/* Packets the backstop dropped (or, in audit, would have). pid is 0. */
+struct drop_event {
+    struct event_hdr hdr;
+    __u16 family;
+    __u16 dport;          /* host byte order; 0 if not TCP or UDP */
+    __u32 protocol;       /* IP protocol */
+    __u8  daddr[16];      /* v4 in first 4 bytes, network order */
+    __u32 count;          /* packets since the last report */
+    __u32 enforced;       /* 1: dropped; 0: audit, let through */
 };
 
 /* hdr.cgroup_id and hdr.run_cgroup_id are both the run cgroup's id. */
@@ -239,6 +276,28 @@ struct {
     __type(key, int);
     __type(value, __u64);
 } run_by_sk SEC(".maps");
+
+/* Unconnected UDP sockets whose refusal was already reported. */
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, __u32);
+} udp_reported SEC(".maps");
+
+/* Backstop reporting, per run: last report time and drops since. */
+struct drop_state {
+    __u64 last_ns;
+    __u32 count;
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct drop_state);
+} drop_rate SEC(".maps");
 
 /* The proxy's view: its peer (the client) to the original destination. */
 struct {
@@ -521,11 +580,11 @@ static __always_inline int is_loopback(struct addr *a)
     return a->a[0] == 0 && a->a[1] == 0 && a->a[2] == 0 && a->a[3] == bpf_htonl(1);
 }
 
-static __always_inline int is_exception(struct audit_config *cfg, struct addr *ip, __u16 hport)
+static __always_inline int in_exceptions(struct exception *list, struct addr *ip, __u16 hport)
 {
 #pragma unroll
     for (int i = 0; i < MAX_EXCEPTIONS; i++) {
-        struct exception *x = &cfg->exc[i];
+        struct exception *x = &list[i];
         if (x->port == 0)
             break;
         if (x->port != hport)
@@ -552,7 +611,7 @@ static __always_inline int is_exception(struct audit_config *cfg, struct addr *i
  * with ECONNREFUSED, as it would without Clovisor, and a client trying ::1
  * before 127.0.0.1 falls back (3.0 spike).
  */
-static __always_inline int loopback_listener(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u64 run)
+static __always_inline int loopback_listener(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u64 run, int udp)
 {
     struct bpf_sock_tuple t = {};
     struct bpf_sock *sk;
@@ -560,11 +619,13 @@ static __always_inline int loopback_listener(struct bpf_sock_addr *ctx, struct a
     if (is_v4mapped(ip)) {
         t.ipv4.daddr = ip->a[3];
         t.ipv4.dport = port;
-        sk = bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv4), BPF_F_CURRENT_NETNS, 0);
+        sk = udp ? bpf_sk_lookup_udp(ctx, &t, sizeof(t.ipv4), BPF_F_CURRENT_NETNS, 0)
+                 : bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv4), BPF_F_CURRENT_NETNS, 0);
     } else {
         __builtin_memcpy(t.ipv6.daddr, ip->a, 16);
         t.ipv6.dport = port;
-        sk = bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv6), BPF_F_CURRENT_NETNS, 0);
+        sk = udp ? bpf_sk_lookup_udp(ctx, &t, sizeof(t.ipv6), BPF_F_CURRENT_NETNS, 0)
+                 : bpf_sk_lookup_tcp(ctx, &t, sizeof(t.ipv6), BPF_F_CURRENT_NETNS, 0);
     }
     if (!sk)
         return LISTENER_NONE;
@@ -581,16 +642,44 @@ static __always_inline int loopback_listener(struct bpf_sock_addr *ctx, struct a
  * destination must be rewritten to the transparent listener.
  */
 static __always_inline __u32 decide(struct bpf_sock_addr *ctx, struct audit_config *cfg, __u64 run,
-                                    struct addr *ip, __u16 port, int *rewrite)
+                                    struct addr *ip, __u16 port, __u16 *to_port)
 {
-    *rewrite = 0;
-    if (cfg->mode == MODE_OFF || ctx->type != SOCK_STREAM)
+    *to_port = 0;
+    if (cfg->mode == MODE_OFF)
         return V_NONE;
     __u16 hport = bpf_ntohs(port);
-    if (is_exception(cfg, ip, hport))
+    __u32 type = ctx->type;
+
+    /* DNS goes to the resolver in audit too: it answers everything there,
+     * recording what enforce would refuse. */
+    if (hport == 53 && cfg->dns_port != 0 && (type == SOCK_DGRAM || type == SOCK_STREAM)) {
+        if (!healthy(cfg))
+            return cfg->mode == MODE_ENFORCE ? V_DENY_UNHEALTHY : V_AUDIT_DENY;
+        *to_port = cfg->dns_port;
+        return V_DNS;
+    }
+    if (type == SOCK_DGRAM) {
+        if (in_exceptions(cfg->udp_exc, ip, hport))
+            return V_EXCEPTION;
+        if (is_loopback(ip)) {
+            if (hport == cfg->dns_port && cfg->dns_port != 0)
+                return V_EXCEPTION;
+            int who = loopback_listener(ctx, ip, port, run, 1);
+            if (who == LISTENER_SAME)
+                return V_SAME_RUN;
+            if (who == LISTENER_NONE)
+                return V_UNBOUND;
+        }
+        return cfg->mode == MODE_ENFORCE ? V_UDP_DENY : V_AUDIT_UDP;
+    }
+    if (type != SOCK_STREAM)
+        return V_NONE;
+    if (in_exceptions(cfg->exc, ip, hport))
         return V_EXCEPTION;
     if (is_loopback(ip)) {
-        int who = loopback_listener(ctx, ip, port, run);
+        if (hport == cfg->dns_port && cfg->dns_port != 0)
+            return V_EXCEPTION;
+        int who = loopback_listener(ctx, ip, port, run, 0);
         if (who == LISTENER_SAME)
             return V_SAME_RUN;
         if (who == LISTENER_NONE)
@@ -601,7 +690,7 @@ static __always_inline __u32 decide(struct bpf_sock_addr *ctx, struct audit_conf
         return ok ? V_AUDIT_REDIRECT : V_AUDIT_DENY;
     if (!ok)
         return V_DENY_UNHEALTHY;
-    *rewrite = 1;
+    *to_port = cfg->tproxy_port;
     return V_REDIRECT;
 }
 
@@ -616,6 +705,41 @@ static __always_inline void stash(struct bpf_sock_addr *ctx, struct addr *ip, __
     o->_pad = 0;
 }
 
+/* Apply a verdict: refuse, or rewrite to 127.0.0.1:to, remembering the
+ * original destination. Returns the hook's return value. */
+static __always_inline int rewrite4(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u32 v, __u16 to)
+{
+    if (v == V_DENY_UNHEALTHY || v == V_UDP_DENY)
+        return 0;
+    if (to) {
+        stash(ctx, ip, port, AF_INET);
+        ctx->user_ip4 = bpf_htonl(0x7f000001);
+        ctx->user_port = bpf_htons(to);
+    }
+    return 1;
+}
+
+static __always_inline int rewrite6(struct bpf_sock_addr *ctx, struct addr *ip, __u16 port, __u32 v, __u16 to)
+{
+    if (v == V_DENY_UNHEALTHY || v == V_UDP_DENY)
+        return 0;
+    if (to) {
+        int mapped = is_v4mapped(ip);
+        stash(ctx, ip, port, mapped ? AF_INET : AF_INET6);
+        if (mapped) {
+            /* Dual-stack socket to an IPv4 address: keep it IPv4. */
+            ctx->user_ip6[3] = bpf_htonl(0x7f000001);
+        } else {
+            ctx->user_ip6[0] = 0;
+            ctx->user_ip6[1] = 0;
+            ctx->user_ip6[2] = 0;
+            ctx->user_ip6[3] = bpf_htonl(1);
+        }
+        ctx->user_port = bpf_htons(to);
+    }
+    return 1;
+}
+
 SEC("cgroup/connect4")
 int on_connect4(struct bpf_sock_addr *ctx)
 {
@@ -628,17 +752,10 @@ int on_connect4(struct bpf_sock_addr *ctx)
     struct addr ip;
     v4mapped(&ip, ctx->user_ip4);
     __u16 port = (__u16)ctx->user_port;
-    int rewrite;
-    __u32 v = decide(ctx, cfg, run, &ip, port, &rewrite);
+    __u16 to;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &to);
     emit_connect(ctx, AF_INET, &ip, port, v);
-    if (v == V_DENY_UNHEALTHY)
-        return 0;
-    if (rewrite) {
-        stash(ctx, &ip, port, AF_INET);
-        ctx->user_ip4 = bpf_htonl(0x7f000001);
-        ctx->user_port = bpf_htons(cfg->tproxy_port);
-    }
-    return 1;
+    return rewrite4(ctx, &ip, port, v, to);
 }
 
 SEC("cgroup/connect6")
@@ -656,26 +773,95 @@ int on_connect6(struct bpf_sock_addr *ctx)
     ip.a[2] = ctx->user_ip6[2];
     ip.a[3] = ctx->user_ip6[3];
     __u16 port = (__u16)ctx->user_port;
-    int mapped = is_v4mapped(&ip);
-    int rewrite;
-    __u32 v = decide(ctx, cfg, run, &ip, port, &rewrite);
+    __u16 to;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &to);
     /* An IPv4-mapped destination is reported as IPv4. */
-    emit_connect(ctx, mapped ? AF_INET : AF_INET6, &ip, port, v);
-    if (v == V_DENY_UNHEALTHY)
-        return 0;
-    if (rewrite) {
-        stash(ctx, &ip, port, mapped ? AF_INET : AF_INET6);
-        if (mapped) {
-            /* Dual-stack socket to an IPv4 address: keep it IPv4. */
-            ctx->user_ip6[3] = bpf_htonl(0x7f000001);
-        } else {
-            ctx->user_ip6[0] = 0;
-            ctx->user_ip6[1] = 0;
-            ctx->user_ip6[2] = 0;
-            ctx->user_ip6[3] = bpf_htonl(1);
-        }
-        ctx->user_port = bpf_htons(cfg->tproxy_port);
+    emit_connect(ctx, is_v4mapped(&ip) ? AF_INET : AF_INET6, &ip, port, v);
+    return rewrite6(ctx, &ip, port, v, to);
+}
+
+/* Unconnected UDP: the same decision, without an event per datagram. A
+ * refusal is reported the first time each socket meets one. */
+static __always_inline void report_udp_once(struct bpf_sock_addr *ctx, __u16 family, struct addr *ip, __u16 port, __u32 v)
+{
+    if (v != V_UDP_DENY && v != V_AUDIT_UDP)
+        return;
+    __u32 *seen = bpf_sk_storage_get(&udp_reported, ctx->sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+    if (!seen || *seen)
+        return;
+    *seen = 1;
+    emit_connect(ctx, family, ip, port, v);
+}
+
+SEC("cgroup/sendmsg4")
+int on_sendmsg4(struct bpf_sock_addr *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 1;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 1;
+    struct addr ip;
+    v4mapped(&ip, ctx->user_ip4);
+    __u16 port = (__u16)ctx->user_port, to;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &to);
+    report_udp_once(ctx, AF_INET, &ip, port, v);
+    return rewrite4(ctx, &ip, port, v, to);
+}
+
+SEC("cgroup/sendmsg6")
+int on_sendmsg6(struct bpf_sock_addr *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 1;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 1;
+    struct addr ip;
+    ip.a[0] = ctx->user_ip6[0];
+    ip.a[1] = ctx->user_ip6[1];
+    ip.a[2] = ctx->user_ip6[2];
+    ip.a[3] = ctx->user_ip6[3];
+    __u16 port = (__u16)ctx->user_port, to;
+    __u32 v = decide(ctx, cfg, run, &ip, port, &to);
+    report_udp_once(ctx, is_v4mapped(&ip) ? AF_INET : AF_INET6, &ip, port, v);
+    return rewrite6(ctx, &ip, port, v, to);
+}
+
+/* A reply from the resolver appears to come from the server the client
+ * asked; resolvers drop replies from anyone else. */
+SEC("cgroup/recvmsg4")
+int on_recvmsg4(struct bpf_sock_addr *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->dns_port == 0)
+        return 1;
+    if (ctx->user_ip4 != bpf_htonl(0x7f000001) || ctx->user_port != bpf_htons(cfg->dns_port))
+        return 1;
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
+    if (o && o->family == AF_INET) {
+        ctx->user_ip4 = o->ip.a[3];
+        ctx->user_port = o->port;
     }
+    return 1;
+}
+
+SEC("cgroup/recvmsg6")
+int on_recvmsg6(struct bpf_sock_addr *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->dns_port == 0 || ctx->user_port != bpf_htons(cfg->dns_port))
+        return 1;
+    struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
+    if (!o)
+        return 1;
+    ctx->user_ip6[0] = o->ip.a[0];
+    ctx->user_ip6[1] = o->ip.a[1];
+    ctx->user_ip6[2] = o->ip.a[2];
+    ctx->user_ip6[3] = o->ip.a[3];
+    ctx->user_port = o->port;
     return 1;
 }
 
@@ -837,6 +1023,95 @@ int on_getsockopt(struct bpf_sockopt *ctx)
     }
     ctx->retval = 0;
     return 1;
+}
+
+static __always_inline int backstop_exception(struct audit_config *cfg, struct addr *ip, __u16 hport, __u8 proto)
+{
+    if (proto == IPPROTO_UDP)
+        return in_exceptions(cfg->udp_exc, ip, hport);
+    if (proto == IPPROTO_TCP_)
+        return in_exceptions(cfg->exc, ip, hport);
+    return 0;
+}
+
+SEC("cgroup_skb/egress")
+int on_egress(struct __sk_buff *skb)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->mode != MODE_ENFORCE)
+        return 1;
+    __u64 run = bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level + 1);
+    if (run == 0 || bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level) != cfg->agents_cgroup_id)
+        return 1;
+
+    struct addr ip = {};
+    __u8 proto;
+    __u32 l4off;
+    __u16 family;
+    if (skb->protocol == bpf_htons(ETH_P_IP)) {
+        __u8 vihl;
+        __u32 d4;
+        if (bpf_skb_load_bytes(skb, 0, &vihl, 1) < 0 || bpf_skb_load_bytes(skb, 9, &proto, 1) < 0 ||
+            bpf_skb_load_bytes(skb, 16, &d4, 4) < 0)
+            return 1;
+        v4mapped(&ip, d4);
+        l4off = (vihl & 0x0f) * 4;
+        family = AF_INET;
+    } else if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+        if (bpf_skb_load_bytes(skb, 6, &proto, 1) < 0 || bpf_skb_load_bytes(skb, 24, ip.a, 16) < 0)
+            return 1;
+        l4off = 40; /* extension headers: no port, so no exception matches */
+        family = AF_INET6;
+    } else {
+        return 1;
+    }
+    if (is_loopback(&ip))
+        return 1;
+    __u16 dport = 0;
+    if (proto == IPPROTO_UDP || proto == IPPROTO_TCP_) {
+        __u16 p;
+        if (bpf_skb_load_bytes(skb, l4off + 2, &p, 2) == 0)
+            dport = bpf_ntohs(p);
+    }
+    if (backstop_exception(cfg, &ip, dport, proto))
+        return 1;
+
+    int enforce = 1;
+    __u64 now = bpf_ktime_get_ns();
+    struct drop_state *ds = bpf_map_lookup_elem(&drop_rate, &run);
+    if (!ds) {
+        struct drop_state fresh = {};
+        bpf_map_update_elem(&drop_rate, &run, &fresh, BPF_NOEXIST);
+        ds = bpf_map_lookup_elem(&drop_rate, &run);
+        if (!ds)
+            return !enforce;
+    }
+    __sync_fetch_and_add(&ds->count, 1);
+    if (now - ds->last_ns < 1000000000ULL)
+        return !enforce;
+    ds->last_ns = now;
+    __u32 count = __sync_lock_test_and_set(&ds->count, 0);
+
+    struct drop_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return !enforce;
+    e->hdr.type = EVENT_DROP;
+    e->hdr.pid = 0;
+    e->hdr.timestamp_ns = bpf_ktime_get_boot_ns();
+    e->hdr.cgroup_id = bpf_skb_cgroup_id(skb);
+    e->hdr.run_cgroup_id = run;
+    e->family = family;
+    e->dport = dport;
+    e->protocol = proto;
+    __builtin_memset(e->daddr, 0, sizeof(e->daddr));
+    if (family == AF_INET)
+        __builtin_memcpy(e->daddr, &ip.a[3], 4);
+    else
+        __builtin_memcpy(e->daddr, ip.a, 16);
+    e->count = count;
+    e->enforced = enforce;
+    bpf_ringbuf_submit(e, 0);
+    return !enforce;
 }
 
 char LICENSE[] SEC("license") = "GPL";
