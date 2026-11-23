@@ -373,13 +373,10 @@ tested.
 
    Besides egress rules, this decides every looked-up name as the resolver
    would (NXDOMAIN shows as a `dns` violation) and every UDP send (a `udp`
-   violation unless `--udp-allow` covers it). It flags TCP to a name on a
-   port that is usually neither TLS nor HTTP, where only a hostname rule
-   allows it (`by-address`): enforce will see only the address there.
-   `agentctl explain --transparent enforce p.yaml` shows the receipt for
-   the transparent node, with the same warning on each affected rule.
+   violation unless `--udp-allow` covers it). `agentctl explain
+   --transparent enforce p.yaml` shows the receipt for the transparent node.
    `agentctl learn` drafts from these timelines with notes for each of the
-   above, including a cidr line for the addresses seen.
+   above.
 2. `-transparent enforce` on a test host, with real agent work.
 3. `-transparent enforce` everywhere. Restart Envoy after the node agent
    starts, so it loads the bootstrap with the transparent listener.
@@ -393,7 +390,7 @@ tested.
 | Loopback, nothing listening | Direct: fails with `ECONNREFUSED`, as it would anyway. |
 | Loopback, a listener outside the run (a host Redis) | Redirected; the proxy refuses node-local destinations. |
 | TLS with a server name | `CONNECT <name>:<port>` into the proxy. The proxy resolves the name, so a client that pairs an allowed name with another address reaches the name's address. The timeline notes the mismatch. |
-| TLS without a server name; other TCP (SSH, databases) | `CONNECT <ip>:<port>`. Only `cidr` rules match it: a hostname rule does not allow `ssh github.com`. |
+| TLS without a server name; other TCP (SSH, databases) | `CONNECT <ip>:<port>`. A `cidr` rule naming the address decides. Otherwise, a hostname rule decides if the node's resolver answered that name with this address for this run, so `ssh github.com` matches a `github.com` rule on port 22. A hard-coded address with no such lookup needs a `cidr` rule. |
 | Plain HTTP | Routed by `Host`, with method and path rules. |
 | DNS (port 53, UDP or TCP, to any server) | To the node's resolver (below). |
 | UDP to a `-udp-allow` destination | Direct. |
@@ -556,7 +553,7 @@ agentctl events --json <run-id>
 | A timeline has `lost_events` and `complete: false` | The kernel's event buffer was full. Its counts are lower bounds. |
 | A timeline has `suppressed_events` and `complete: false` | The run produced events faster than its budget (bursts of about 1,300 execs, then about 5,000 execs or 70,000 connects a second), so the excess was not reported, to keep it from crowding out other runs. Enforcement was unaffected. |
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
-| A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination reached by address needs a `cidr` rule. |
+| A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination the run did not look up through the node (a hard-coded address) needs a `cidr` rule. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS and `-udp-allow`. Check `udp_refused` and the connect events in the timeline. |
 | `Name or service not known` in a run (transparent) | The resolver refused the name: no rule allows a connection to it. Check `dns_blocked` in the timeline, or `dig` for the EDE reason. |
 | DNS in runs fails entirely (transparent) | The node agent is down (DNS is refused with it), or the resolver cannot reach `-dns-upstream`: see `server` and `reason` on the timeline's dns events. |

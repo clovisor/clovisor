@@ -63,6 +63,10 @@ type HTTPData struct {
 	// name does not resolve to. It was routed by name, so it reached the
 	// name's address, not the one it chose.
 	AddrMismatch bool
+	// ResolvedName: a tunnel known only by address was decided by this
+	// name, which the node's resolver had answered with the address for
+	// this run (transparent mode).
+	ResolvedName string
 }
 
 // ExtProcServer decides proxied requests for runs (milestone 2.3). It
@@ -87,6 +91,10 @@ type ExtProcServer struct {
 	grpc *grpc.Server
 	ln   net.Listener
 	path string
+
+	// Names, if set, returns the names the node's resolver answered with
+	// an address for a run (Resolver.NamesFor).
+	Names func(runCg uint64, ip netip.Addr) []string
 
 	// Pins is the tool-definition pin store, shared with the gateway.
 	Pins  *PinStore
@@ -507,6 +515,29 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			r.Host = host
 		}
 		ed := eff.Decide(r)
+		if !ed.Allowed() && ed.Rule == "" && d.Transparent && ip.IsValid() && s.Names != nil {
+			// Known only by address (raw TCP, or TLS without a server
+			// name), and no rule names the address: decide by the name
+			// the run looked up, if the node's resolver answered it with
+			// this address. An allow wins over an explicit deny.
+			var deny *policy.EffectiveDecision
+			for _, n := range s.Names(runCg, ip) {
+				nr := r
+				nr.IP, nr.Host = netip.Addr{}, n
+				nd := eff.Decide(nr)
+				if nd.Allowed() {
+					ed, d.ResolvedName, deny = nd, n, nil
+					break
+				}
+				if nd.Rule != "" && deny == nil {
+					nd := nd
+					deny, d.ResolvedName = &nd, n
+				}
+			}
+			if deny != nil {
+				ed = *deny
+			}
+		}
 		d.Decision, d.Rule, d.Layer, d.WouldDeny, d.Enforced, d.Message = ed.Action, ed.Rule, ed.Layer, ed.WouldDeny, ed.Enforced, ed.Message
 		switch {
 		case ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() && terminated:

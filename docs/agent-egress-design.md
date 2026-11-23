@@ -74,6 +74,7 @@ place:
 | UDP refused except DNS, node-wide exceptions and same-run loopback, QUIC included; a packet backstop drops what gets past the socket hooks. | [3.3 status](#33-status-2026-11-22) |
 | Heartbeat tied to Envoy's health; the proxy's own connects gated in the kernel (closing DNS rebinding); lost kernel events counted per run; `agentctl status`; overhead measured. | [3.5 status](#35-status-2026-11-22) |
 | Learn, check and receipt for transparent deployments: `check --transparent` replays DNS, UDP and by-address TCP as enforce decides; learn notes for each; `explain --transparent`. | [3.6 status](#36-status-2026-11-22) |
+| Raw TCP tunnels known only by address are decided by a name the node's resolver answered with that address for the run, when no rule names the address. | [Resolved-name matching](#resolved-name-matching-2026-11-22) |
 
 ---
 
@@ -2601,12 +2602,49 @@ Findings:
 - **The by-address case needs cidr rules that go stale.** github.com
   answered with a different address in the enforced run than in the audit
   run (172.182.252.133, then 20.172.24.160), so the drafted cidr line would
-  not have matched. This is the strongest argument for the narrower name
-  rule considered in the 3.1/3.2 findings: match a hostname rule for raw TCP
-  when the run's own resolver answer mapped that name to that address. The
-  forced resolver now has exactly that record. It needs a decision.
+  not have matched. *Resolved by resolved-name matching, below: `by-address`
+  findings and the cidr suggestion are gone.*
 - An enforce-mode draft must set `exec.audit_only: true` until Phase 4; learn
   drafts audit-mode profiles, so this only bites when promoting one by hand.
+
+#### Resolved-name matching (2026-11-22)
+
+*Decided 2026-11-22.* A tunnel the proxy knows only by address (raw TCP such
+as SSH or a database, or TLS with no server name) is decided as follows:
+
+1. By the address. A `cidr` rule that matches it decides, allow or deny.
+2. Otherwise, by the names the node's resolver answered with that address
+   **for this run**. The first name a rule allows decides; failing that, the
+   first name an explicit rule denies (with its message).
+3. Otherwise, the profile default.
+
+The resolver records each answer per run, keyed by address. A binding lives
+for the record's TTL, at least five minutes (clients cache answers before
+connecting, and reconnect from cache), at most 4,096 per run, and is dropped
+when the run ends.
+
+The run cannot forge a binding: the answer came from upstream through the
+node's resolver, and the node-local guard runs first. The exposure equals
+SNI routing, where the proxy resolves the name itself: whoever controls an
+allowed name's DNS reaches the same addresses either way. The explicit proxy
+does not consult bindings, since a CONNECT to an address literal is the
+client's own choice there, with no forced DNS behind it.
+
+Effects elsewhere:
+
+- `check --transparent` decides such TCP by the names the run looked up, as
+  everywhere else, so `by-address` findings are gone.
+- Learn's note says a hard-coded address still needs a `cidr` rule, and
+  lists the addresses seen.
+- The receipt's note on affected rules says the same.
+- Timeline events carry `resolved_name`.
+
+Verified live, with the 3.6 draft (a `github.com` rule on port 22) enforced:
+
+- SSH to github.com after a normal lookup was allowed, `by-name=github.com`;
+  in the 3.6 round trip it had been refused;
+- the same address hard-coded, with no lookup through the node, was refused;
+- github.com on port 2222, which the rule does not name, was refused.
 
 #### Decisions
 

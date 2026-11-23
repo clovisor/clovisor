@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 
@@ -248,5 +249,89 @@ func TestRunRecorderLostEvents(t *testing.T) {
 	tl = feed(t, r, runEv(EventRunStart, 4, "/agents/run-abc"), runEv(EventRunEnd, 5, "/agents/run-abc"))
 	if !tl.Complete {
 		t.Fatal("clean run not complete")
+	}
+}
+
+func TestResolverBindings(t *testing.T) {
+	now := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+	r := &Resolver{now: func() time.Time { return now }}
+	r.init()
+	ip := netip.MustParseAddr("20.0.0.9")
+	r.bind(7, "github.com", []DNSAnswer{{Type: "CNAME", Value: "x"}, {Type: "A", Value: "20.0.0.9", TTL: 30}})
+	r.bind(7, "gh.example", []DNSAnswer{{Type: "A", Value: "20.0.0.9", TTL: 3600}})
+	if got := r.NamesFor(7, ip); strings.Join(got, ",") != "github.com,gh.example" {
+		t.Fatalf("names: %v", got)
+	}
+	if got := r.NamesFor(8, ip); len(got) != 0 {
+		t.Fatalf("another run sees %v", got)
+	}
+	// A 30 s TTL still binds for the floor of five minutes.
+	now = now.Add(4 * time.Minute)
+	if got := r.NamesFor(7, netip.MustParseAddr("::ffff:20.0.0.9")); len(got) != 2 {
+		t.Fatalf("within the floor (IPv4-mapped lookup): %v", got)
+	}
+	now = now.Add(2 * time.Minute)
+	if got := r.NamesFor(7, ip); strings.Join(got, ",") != "gh.example" {
+		t.Fatalf("after the floor: %v", got)
+	}
+	r.Forget(7)
+	if got := r.NamesFor(7, ip); len(got) != 0 {
+		t.Fatalf("after Forget: %v", got)
+	}
+}
+
+const byNameProfile = `kind: AgentProfile
+metadata: { name: bn }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: no-lan, to: { cidr: ["10.0.0.0/8"] }, action: deny, message: "No LAN." }
+      - { name: gh-ssh, to: { fqdn: ["github.com"], ports: [22] }, action: allow }
+      - { name: no-db, to: { fqdn: ["db.example"] }, action: deny, message: "No databases." }
+`
+
+func TestExtProcByResolvedName(t *testing.T) {
+	xp, events, c := newTestExtProc(t, false)
+	p, _ := policy.Parse([]byte(byNameProfile))
+	comp, diags := policy.Compile(policy.Options{Linux: true}, p)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	cg := ownCgroupID(t)
+	b := &boundRun{runID: "testrun", cgroupID: cg, eff: &policy.Effective{Layers: []policy.Layer{{Profile: comp.Profiles[0], Source: "granted"}}}}
+	xp.api.bound["testrun"], xp.api.byCg[cg] = b, b
+	names := map[string][]string{"20.0.0.9": {"github.com"}, "10.1.2.3": {"github.com"}, "20.0.0.10": {"db.example"}}
+	xp.Names = func(_ uint64, ip netip.Addr) []string { return names[ip.String()] }
+
+	inner := map[string]interface{}{"source.address": "envoy://internal_client_address/", "destination.address": "envoy://transparent-connect/"}
+	tunnel := func(authority string) (bool, HTTPData) {
+		h := map[string]string{hdrClient: c.src.String() + "," + c.dst.String(), hdrConnect: authority, hdrOrigDst: authority}
+		req, hh := reqWith(inner, "CONNECT", authority, "", h)
+		ok := first(xp.onHeaders(context.Background(), req, hh)).GetImmediateResponse() == nil
+		return ok, (<-events).Data.(HTTPData)
+	}
+	if ok, d := tunnel("20.0.0.9:22"); !ok || d.Rule != "gh-ssh" || d.ResolvedName != "github.com" {
+		t.Errorf("SSH by resolved name: %v %+v", ok, d)
+	}
+	if ok, d := tunnel("20.0.0.9:2222"); ok || d.ResolvedName != "" {
+		t.Errorf("other port: %v %+v", ok, d)
+	}
+	if ok, d := tunnel("10.1.2.3:22"); ok || d.Rule != "no-lan" {
+		t.Errorf("a rule on the address wins: %v %+v", ok, d)
+	}
+	if ok, d := tunnel("20.0.0.10:5432"); ok || d.Message != "No databases." || d.ResolvedName != "db.example" {
+		t.Errorf("explicit name deny: %v %+v", ok, d)
+	}
+	if ok, _ := tunnel("20.0.0.11:22"); ok {
+		t.Error("an address with no binding allowed")
+	}
+	// The explicit proxy does not consult bindings: a CONNECT to an IP
+	// literal is the client's own choice there.
+	outer := map[string]interface{}{"source.address": c.src.String(), "destination.address": c.dst.String()}
+	req, hh := reqWith(outer, "CONNECT", "20.0.0.9:22", "", nil)
+	if first(xp.onHeaders(context.Background(), req, hh)).GetImmediateResponse() == nil {
+		t.Error("explicit CONNECT to an address allowed by binding")
 	}
 }

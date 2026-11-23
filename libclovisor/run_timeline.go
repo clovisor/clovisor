@@ -227,6 +227,9 @@ type TimelineEvent struct {
 	OrigDst      string `json:"orig_dst,omitempty"`
 	SNI          string `json:"sni,omitempty"`
 	AddrMismatch bool   `json:"addr_mismatch,omitempty"`
+	// ResolvedName: decided by this name, which the node's resolver had
+	// answered with the address for this run.
+	ResolvedName string `json:"resolved_name,omitempty"`
 	// Verdict is what transparent mode did with a connect.
 	Verdict string `json:"verdict,omitempty"`
 	// mcp events:
@@ -623,6 +626,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			OrigDst:      d.OrigDst,
 			SNI:          d.SNI,
 			AddrMismatch: d.AddrMismatch,
+			ResolvedName: d.ResolvedName,
 		}, r.MaxEvents)
 
 	case EventDrop:

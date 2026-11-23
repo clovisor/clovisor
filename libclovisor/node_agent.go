@@ -366,6 +366,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		na.proxyOpts = &o
 	}
 	api.Status = na.Status
+	if xp != nil && resolver != nil {
+		xp.Names = resolver.NamesFor
+	}
 	if r := audit.reader; r != nil && recorder != nil {
 		recorder.LostFor = r.LostFor
 	}
@@ -742,11 +745,17 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			if d.AddrMismatch {
 				extra += " addr-mismatch"
 			}
+			if d.ResolvedName != "" {
+				extra += " by-name=" + d.ResolvedName
+			}
 		}
 		fmt.Printf("%s [HTTP] run=%d %s decision=%s%s\n", ts, event.RunCgroupID, what, d.Decision, extra)
 	case EventRunStart:
 		fmt.Printf("%s [RUN START] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	case EventRunEnd:
+		if na.resolver != nil {
+			na.resolver.Forget(event.RunCgroupID)
+		}
 		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}
 

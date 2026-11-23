@@ -443,7 +443,7 @@ spec:
 		}
 		for _, pl := range c.Profiles[0].Placements {
 			if pl.Rule == rule {
-				return strings.Contains(strings.Join(pl.Notes, ";"), "known by address only")
+				return strings.Contains(strings.Join(pl.Notes, ";"), "run's own lookup of the name")
 			}
 		}
 		return false

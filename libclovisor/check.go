@@ -53,16 +53,17 @@ type CheckReport struct {
 // CheckOptions describe the deployment to replay against.
 type CheckOptions struct {
 	// Transparent replays as transparent enforce mode decides (milestone
-	// 3.6): DNS names against the resolver's rule, UDP refused unless in
-	// UDPAllow, and TCP that is likely neither TLS nor HTTP matched by
-	// address only.
+	// 3.6): DNS names against the resolver's rule, and UDP refused unless
+	// in UDPAllow. TCP the run reached by a looked-up name is decided by
+	// that name, as transparent mode does with the resolver's answers
+	// even when the traffic carries no name.
 	Transparent bool
 	UDPAllow    []netip.AddrPort
 }
 
-// httpish are ports whose traffic is assumed TLS or HTTP, so that
-// transparent mode routes it by name. Others reach the proxy as a raw
-// TCP tunnel, known by address alone.
+// httpish are ports whose traffic is assumed TLS or HTTP, so that it
+// carries its name. On other ports transparent mode knows a connection by
+// its address, and by names the node's resolver answered with it.
 var httpish = map[uint16]bool{80: true, 443: true, 8080: true, 8443: true}
 
 type findingKey struct{ kind, what string }
@@ -161,26 +162,6 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				add("not-governed", d.Proto+" "+addr+namesSuffix(d.Names), CheckFinding{Decision: "UDP never reaches an explicit proxy"}, tl.RunID, d.Count)
 				continue
 			}
-			if o.Transparent && len(d.Names) > 0 && !httpish[d.Port] && ip.IsValid() {
-				// Likely neither TLS nor HTTP: the proxy sees only the
-				// address. A rule that allows the name does not allow it.
-				byName := false
-				for _, n := range d.Names {
-					if cp.Decide(policy.Request{Host: n, Port: d.Port}).Allowed() {
-						byName = true
-					}
-				}
-				byAddr := cp.Decide(policy.Request{IP: ip, Port: d.Port})
-				if byName && !byAddr.Allowed() {
-					add("by-address", fmt.Sprintf("%s %s:%d (%s)", d.Proto, d.Names[0], d.Port, d.IP), CheckFinding{
-						Decision: "allowed by name, denied by address",
-						Rule:     byAddr.Rule,
-						Message: fmt.Sprintf("unless this is TLS or HTTP, transparent mode sees only %s, which no cidr rule allows",
-							addr),
-					}, tl.RunID, d.Count)
-					continue
-				}
-			}
 			reqs := []policy.Request{}
 			labels := []string{}
 			for _, n := range d.Names {
@@ -241,8 +222,6 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 		case "egress-deny", "http-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny":
 			f.Kind = strings.TrimSuffix(k.kind, "-deny")
 			rep.Violations = append(rep.Violations, f)
-		case "by-address":
-			rep.Unverifiable = append(rep.Unverifiable, f)
 		case "egress-allow", "http-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow":
 			f.Kind = strings.TrimSuffix(k.kind, "-allow")
 			rep.Allowed = append(rep.Allowed, f)
@@ -306,10 +285,7 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 		return "rule " + f.Rule + runs(f)
 	})
 	if len(rep.Unverifiable) > 0 {
-		section("Depends on what audit data lacks (method, path, or whether it was TLS)", rep.Unverifiable, func(f CheckFinding) string {
-			if f.Kind == "by-address" {
-				return f.Message + runs(f)
-			}
+		section("Depends on method or path, which audit data lacks", rep.Unverifiable, func(f CheckFinding) string {
 			return "first matching rule " + f.Rule + runs(f)
 		})
 	}

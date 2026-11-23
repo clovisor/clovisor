@@ -418,7 +418,7 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 		pl.Notes = append(pl.Notes, "allowed and tagged in the audit log")
 	}
 	if (c.opts.Mode == Transparent || c.opts.Mode == TransparentAudit) && len(r.To.FQDN) > 0 && r.Action != ActionDeny && mayCarryRawTCP(r.To.Ports) {
-		pl.Notes = append(pl.Notes, "transparent: traffic that is neither TLS nor HTTP (SSH, databases) is known by address only, so this name does not match it")
+		pl.Notes = append(pl.Notes, "transparent: traffic that is neither TLS nor HTTP (SSH, databases) matches through the run's own lookup of the name via the node; a hard-coded address does not")
 	}
 	return pl
 }

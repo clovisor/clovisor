@@ -117,6 +117,7 @@ func newTestResolver(t *testing.T, enforce bool) (*Resolver, chan AuditEvent, *a
 	api.bound["testrun"], api.byCg[cg] = b, b
 	events := make(chan AuditEvent, 16)
 	r := &Resolver{api: api, agentsDir: cm.agents, enforce: enforce, upstreams: []string{up}, events: events}
+	r.init()
 	// Port 1 is the run's client; anything else is outside any run.
 	r.lookupUDP = func(client, _ netip.AddrPort) (uint64, error) {
 		if client.Port() == 1 {

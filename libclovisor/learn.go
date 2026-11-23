@@ -421,10 +421,11 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 				}
 			}
 			sort.Strings(ips)
-			p("      # Port %s: unless that traffic is TLS or HTTP, transparent mode sees only the", strings.Join(raw, ", "))
-			p("      # address, and this fqdn rule does not match it. If so, it needs a cidr rule,")
+			p("      # Port %s: if that traffic is neither TLS nor HTTP, transparent mode matches", strings.Join(raw, ", "))
+			p("      # this rule through the run's own lookup of the name via the node. A client")
+			p("      # using a hard-coded address needs a cidr rule instead")
 			if len(ips) > 0 {
-				p("      # e.g. to: { cidr: [%s], ports: [%s] } for the addresses seen.", strings.Join(ips, ", "), strings.Join(raw, ", "))
+				p("      # (seen: %s).", strings.Join(ips, ", "))
 			} else {
 				p("      # for the addresses the host uses.")
 			}
@@ -516,10 +517,8 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	if len(d.byAddress) > 0 {
 		sort.Strings(d.byAddress)
 		p("")
-		p("      # Refused TCP to addresses the run had looked up by name. Transparent mode")
-		p("      # knows traffic that is neither TLS nor HTTP (SSH, databases) by address only,")
-		p("      # so an fqdn rule cannot allow it: it needs a cidr rule for the name's")
-		p("      # addresses, which may change.")
+		p("      # Refused TCP to addresses the run had looked up by name: no rule allowed the")
+		p("      # name on that port, or the lookup did not go through the node's resolver.")
 		for _, s := range d.byAddress {
 			p("      #   %s", commentSafe(s))
 		}

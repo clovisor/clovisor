@@ -72,14 +72,13 @@ func TestCheckTransparent(t *testing.T) {
 	if !allowed["dns github.com"] || !allowed["udp UDP 162.159.200.123:123"] {
 		t.Errorf("allowed: %v", allowed)
 	}
-	// SSH to github.com: allowed by name, but transparent mode sees the
-	// address only.
-	if len(rep.Unverifiable) != 1 || rep.Unverifiable[0].Kind != "by-address" || !strings.Contains(rep.Unverifiable[0].What, "github.com:22") {
-		t.Errorf("unverifiable: %+v", rep.Unverifiable)
+	// SSH to github.com: decided by the name the run looked up.
+	if !allowed["egress TCP github.com:22 (20.0.0.1)"] {
+		t.Errorf("SSH by resolved name not allowed: %v", allowed)
 	}
 	var b strings.Builder
 	rep.WriteText(&b)
-	if !strings.Contains(b.String(), "as transparent enforce would decide") || !strings.Contains(b.String(), "no cidr rule allows") {
+	if !strings.Contains(b.String(), "as transparent enforce would decide") {
 		t.Errorf("report:\n%s", b.String())
 	}
 
@@ -87,7 +86,7 @@ func TestCheckTransparent(t *testing.T) {
 	// and SSH is allowed by name.
 	rep = CheckRuns(cp, runs)
 	for _, f := range append(rep.Violations, rep.Unverifiable...) {
-		if f.Kind == "dns" || f.Kind == "udp" || f.Kind == "by-address" {
+		if f.Kind == "dns" || f.Kind == "udp" {
 			t.Errorf("explicit-proxy replay has %s %s", f.Kind, f.What)
 		}
 	}
@@ -100,14 +99,14 @@ func TestLearnTransparentNotes(t *testing.T) {
 	}
 	s := b.String()
 	for _, want := range []string{
-		"Port 22: unless that traffic is TLS or HTTP",
-		`cidr: ["20.0.0.1/32"], ports: [22]`,
+		"Port 22: if that traffic is neither TLS nor HTTP",
+		`(seen: "20.0.0.1/32")`,
 		"2 connections sent to an address github.com does not resolve to",
 		"UDP the node refused",
 		"1.2.3.4:5000 game.example (9 attempts)",
 		"refused by the node's resolver",
 		"#   blocked.test",
-		"Refused TCP to addresses the run had looked up by name",
+		"Refused TCP to addresses the run had looked up by name: no rule allowed",
 		"#   20.0.0.9:22 (github.com) 1 time",
 	} {
 		if !strings.Contains(s, want) {

@@ -52,7 +52,25 @@ type Resolver struct {
 	packets []net.PacketConn
 	streams []net.Listener
 	wg      sync.WaitGroup
+
+	// bindings remember, per run, which names this resolver answered
+	// with which addresses (see NamesFor).
+	bmu      sync.Mutex
+	bindings map[uint64]map[netip.Addr][]binding
+	now      func() time.Time
 }
+
+type binding struct {
+	name    string
+	expires time.Time
+}
+
+// Name bindings outlive a short DNS TTL by this much at least: clients
+// cache answers for a while before connecting, and reconnect from cache.
+const (
+	bindingFloor      = 5 * time.Minute
+	maxBindingsPerRun = 4096
+)
 
 // resolverTimeout bounds one upstream exchange.
 const resolverTimeout = 3 * time.Second
@@ -69,6 +87,7 @@ func NewResolver(api *RunAPIServer, agentsDir string, port uint16, upstreams []s
 	}
 	r := &Resolver{api: api, agentsDir: agentsDir, enforce: enforce, upstreams: upstreams, events: events,
 		lookupUDP: SockCgroupUDP, lookupTCP: SockCgroup}
+	r.init()
 	for _, host := range []string{"127.0.0.1", "::1"} {
 		addr := net.JoinHostPort(host, fmt.Sprint(port))
 		pc, err := net.ListenPacket("udp", addr)
@@ -90,6 +109,98 @@ func NewResolver(api *RunAPIServer, agentsDir string, port uint16, upstreams []s
 		r.streams = append(r.streams, ln)
 	}
 	return r, nil
+}
+
+func (r *Resolver) init() {
+	r.bindings = map[uint64]map[netip.Addr][]binding{}
+	if r.now == nil {
+		r.now = time.Now
+	}
+}
+
+// bind records that name was answered with the given addresses for run.
+func (r *Resolver) bind(runCg uint64, name string, answers []DNSAnswer) {
+	if runCg == 0 || len(answers) == 0 {
+		return
+	}
+	now := r.now()
+	r.bmu.Lock()
+	defer r.bmu.Unlock()
+	m := r.bindings[runCg]
+	if m == nil {
+		m = map[netip.Addr][]binding{}
+		r.bindings[runCg] = m
+	}
+	for _, a := range answers {
+		if a.Type != "A" && a.Type != "AAAA" {
+			continue
+		}
+		ip, err := netip.ParseAddr(a.Value)
+		if err != nil {
+			continue
+		}
+		ip = ip.Unmap()
+		ttl := time.Duration(a.TTL) * time.Second
+		if ttl < bindingFloor {
+			ttl = bindingFloor
+		}
+		bs := m[ip]
+		found := false
+		for i := range bs {
+			if bs[i].name == name {
+				bs[i].expires, found = now.Add(ttl), true
+			}
+		}
+		if !found {
+			if len(m) >= maxBindingsPerRun {
+				r.pruneLocked(m, now)
+				if len(m) >= maxBindingsPerRun {
+					continue
+				}
+			}
+			bs = append(bs, binding{name: name, expires: now.Add(ttl)})
+		}
+		m[ip] = bs
+	}
+}
+
+func (r *Resolver) pruneLocked(m map[netip.Addr][]binding, now time.Time) {
+	for ip, bs := range m {
+		live := bs[:0]
+		for _, b := range bs {
+			if now.Before(b.expires) {
+				live = append(live, b)
+			}
+		}
+		if len(live) == 0 {
+			delete(m, ip)
+		} else {
+			m[ip] = live
+		}
+	}
+}
+
+// NamesFor returns the names this resolver recently answered with ip for
+// run, most recent last. Transparent mode uses them to decide a raw TCP
+// tunnel, known only by address, by the name the run looked up.
+func (r *Resolver) NamesFor(runCg uint64, ip netip.Addr) []string {
+	now := r.now()
+	r.bmu.Lock()
+	defer r.bmu.Unlock()
+	var out []string
+	for _, b := range r.bindings[runCg][ip.Unmap()] {
+		if now.Before(b.expires) {
+			out = append(out, b.name)
+		}
+	}
+	return out
+}
+
+// Forget drops a finished run's bindings.
+func (r *Resolver) Forget(runCg uint64) {
+	r.bmu.Lock()
+	delete(r.bindings, runCg)
+	r.bmu.Unlock()
 }
 
 // SystemResolvers reads the nameservers of a resolv.conf file.
@@ -267,6 +378,7 @@ func (r *Resolver) answer(q []byte, proto string, client, server netip.AddrPort)
 	resp, d.ECHStripped = stripECH(resp)
 	if parsed, err := parseDNSResponse(resp, false); err == nil {
 		d.RCode, d.Answers = parsed.RCode, parsed.Answers
+		r.bind(runCg, name, parsed.Answers)
 	}
 	d.Server = upstream
 	r.record(runCg, runID, d)
