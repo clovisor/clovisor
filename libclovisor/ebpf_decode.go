@@ -39,6 +39,31 @@ func splitArgs(b []byte) []string {
 	return args
 }
 
+// socketFamily names an address family.
+func socketFamily(f uint16) string {
+	switch f {
+	case 1:
+		return "unix"
+	case 2:
+		return "inet"
+	case 10:
+		return "inet6"
+	case 16:
+		return "netlink"
+	case 17:
+		return "packet"
+	case 29:
+		return "can"
+	case 31:
+		return "bluetooth"
+	case 40:
+		return "vsock"
+	case 44:
+		return "xdp"
+	}
+	return fmt.Sprintf("family %d", f)
+}
+
 // ipProtoName names an IP protocol number.
 func ipProtoName(p uint32) string {
 	switch p {

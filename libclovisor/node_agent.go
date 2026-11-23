@@ -44,6 +44,7 @@ type NodeAgent struct {
 	httpEvents chan AuditEvent
 	policyDir  string
 	deployment policy.DeploymentMode
+	lsm        bool
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
 	running    bool
@@ -184,7 +185,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	}
 	// Load policy before touching the kernel or the socket: a policy that
 	// does not load is fatal, and failing here leaves nothing behind.
-	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode())
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsmFor(*t, credential))
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +366,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		httpEvents: httpEvents,
 		policyDir:  opts.PolicyDir,
 		deployment: t.DeploymentMode(),
+		lsm:        lsmFor(*t, credential),
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -387,7 +389,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm)
 	if err != nil {
 		return err
 	}
@@ -512,12 +514,17 @@ func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]str
 // loadNodePolicy loads the policy directory. A root node agent requires
 // it to be root-owned. kernelIdentity says runs are known by cgroup,
 // which the receipt reports as enforcement-grade identity.
-func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode) (*policy.Set, error) {
+// lsmFor says whether the BPF LSM socket hooks will be governing runs.
+func lsmFor(t TransparentOptions, credential bool) bool {
+	return !credential && t.Mode != TransparentOff && BPFLSMActive()
+}
+
+func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity}, os.Geteuid() == 0)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -711,6 +718,10 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		}
 		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v%s\n",
 			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs(), extra)
+	case EventSocket:
+		d := event.Data.(SocketData)
+		fmt.Printf("%s [SOCKET] run=%d pid=%d %s %s type=%d proto=%d socket-cgroup=%d verdict=%q\n", ts, event.RunCgroupID,
+			event.PID, d.Op, d.Family, d.Type, d.Protocol, d.SocketCgroup, d.Verdict)
 	case EventDrop:
 		d := event.Data.(DropData)
 		fmt.Printf("%s [DROP] run=%d proto=%s dst=%s count=%d\n", ts, event.RunCgroupID, d.Protocol,
@@ -851,6 +862,7 @@ func (na *NodeAgent) Status() NodeStatus {
 		s.ProxyGated = r.GatedProxy() != ""
 		s.ProxyRefused = r.ProxyRefused()
 		s.LostEvents, s.SuppressedEvents = r.LostTotal()
+		s.Sockets = r.LSMState()
 	}
 	if why, _ := na.gateWhy.Load().(string); !s.ProxyGated {
 		s.ProxyGateWhy = why

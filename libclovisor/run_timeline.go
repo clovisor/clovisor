@@ -82,6 +82,10 @@ type RunSummary struct {
 	// backstop dropped.
 	UDPRefused int `json:"udp_refused,omitempty"`
 	Dropped    int `json:"dropped,omitempty"`
+	// SocketsRefused counts sockets the BPF LSM hooks refused: unusual
+	// families and raw sockets, and network sockets created outside the
+	// run (milestones 4.1, 4.3). In audit, those that would have been.
+	SocketsRefused int `json:"sockets_refused,omitempty"`
 	// UDPRefusedTo is where refused UDP was sent, by destination: what a
 	// reviewer weighs against the node's -udp-allow (milestone 3.6).
 	UDPRefusedTo []Destination `json:"udp_refused_to,omitempty"`
@@ -196,7 +200,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, gap
+	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, socket, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -628,6 +632,23 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			AddrMismatch: d.AddrMismatch,
 			ResolvedName: d.ResolvedName,
 		}, r.MaxEvents)
+
+	case EventSocket:
+		d := ev.Data.(SocketData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		st.tl.Summary.SocketsRefused++
+		note := fmt.Sprintf("%s %s socket", d.Op, d.Family)
+		switch d.Op {
+		case "create":
+			note = fmt.Sprintf("create %s socket, type %d, protocol %d", d.Family, d.Type, d.Protocol)
+		default:
+			note += fmt.Sprintf(" created outside the run (cgroup %d)", d.SocketCgroup)
+		}
+		st.add(TimelineEvent{Time: ev.Timestamp, Type: "socket", PID: ev.PID, CgroupID: ev.CgroupID,
+			Verdict: d.Verdict, Note: note}, r.MaxEvents)
 
 	case EventDrop:
 		d := ev.Data.(DropData)

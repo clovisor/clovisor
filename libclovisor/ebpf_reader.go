@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,7 @@ const (
 	bpfEventRunEnd   = 3
 	bpfEventDNS      = 4
 	bpfEventDrop     = 5
+	bpfEventSocket   = 6
 
 	afInet  = 2
 	afInet6 = 10
@@ -100,6 +102,32 @@ type bpfDropEvent struct {
 	DAddr    [16]byte
 	Count    uint32
 	Enforced uint32
+}
+
+type bpfSocketEvent struct {
+	Hdr      bpfEventHdr
+	Family   uint16
+	Type     uint16
+	Protocol uint32
+	Op       uint32
+	Verdict  uint32
+	SkCgroup uint64
+}
+
+// bpfLSMObjects are loaded only where BPF LSM is active: on a kernel
+// without it, LSM programs do not even load.
+type bpfLSMObjects struct {
+	SocketCreate  *ebpf.Program `ebpf:"on_lsm_socket_create"`
+	SocketConnect *ebpf.Program `ebpf:"on_lsm_socket_connect"`
+	SocketSendmsg *ebpf.Program `ebpf:"on_lsm_socket_sendmsg"`
+}
+
+func (o *bpfLSMObjects) Close() {
+	for _, p := range []*ebpf.Program{o.SocketCreate, o.SocketConnect, o.SocketSendmsg} {
+		if p != nil {
+			p.Close()
+		}
+	}
 }
 
 type bpfCgroupEvent struct {
@@ -185,6 +213,9 @@ type EBPFReader struct {
 	gateMu    sync.Mutex
 	gateCg    string
 	gateLinks []link.Link
+
+	lsm      bpfLSMObjects
+	lsmState string // what the socket hooks do, for status
 }
 
 // NewEBPFReader loads the BPF object at bpfObjPath, configures it to
@@ -293,6 +324,10 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 			r.Close()
 			return nil, err
 		}
+	}
+	if err := r.attachLSM(spec); err != nil {
+		r.Close()
+		return nil, err
 	}
 	if t.Mode != TransparentOff {
 		r.beatDone = make(chan struct{})
@@ -408,6 +443,15 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		ev.Type = EventDrop
 		ev.Data = DropData{DstIP: ip.String(), DstPort: e.DPort, Protocol: ipProtoName(e.Protocol), Count: e.Count, Enforced: e.Enforced != 0}
 
+	case bpfEventSocket:
+		var e bpfSocketEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		ev.Type = EventSocket
+		ev.Data = SocketData{Family: socketFamily(e.Family), Type: e.Type, Protocol: e.Protocol,
+			Op: []string{"create", "connect", "send"}[min(int(e.Op), 2)], Verdict: connectVerdicts[e.Verdict], SocketCgroup: e.SkCgroup}
+
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent
 		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
@@ -454,6 +498,101 @@ func (r *EBPFReader) Stop() error {
 func (r *EBPFReader) Events() <-chan AuditEvent {
 	return r.eventsCh
 }
+
+// BPFLSMActive reports whether the kernel runs BPF LSM programs, from
+// securityfs's list of active LSMs. Only the list tells: BPF LSM can be
+// built in but not active, and then programs attach and never run. As
+// root, where securityfs is not mounted (in a container, say), it mounts
+// it to read the list.
+func BPFLSMActive() bool {
+	const lsmList = "/sys/kernel/security/lsm"
+	data, err := os.ReadFile(lsmList)
+	if errors.Is(err, os.ErrNotExist) && os.Geteuid() == 0 {
+		if unix.Mount("securityfs", "/sys/kernel/security", "securityfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "") == nil {
+			data, err = os.ReadFile(lsmList)
+		}
+	}
+	if err != nil {
+		return false
+	}
+	for _, m := range strings.Split(strings.TrimSpace(string(data)), ",") {
+		if m == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
+// lsmNames are the socket hooks (milestones 4.1, 4.3), for pins and status.
+var lsmNames = []string{"lsm-socket-create", "lsm-socket-connect", "lsm-socket-sendmsg"}
+
+// attachLSM loads and attaches the socket hooks in audit and enforce, if
+// BPF LSM is active; in enforce they are pinned like the cgroup hooks.
+// Otherwise it removes pins an earlier enforce left.
+func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
+	t := r.transparent
+	switch {
+	case t.Mode == TransparentOff:
+		r.lsmState = "off"
+	case !BPFLSMActive():
+		r.lsmState = "not active: socket families and foreign sockets are not governed (boot with bpf in lsm=)"
+		log.Printf("bpf: BPF LSM is not active; socket families and foreign sockets are not governed")
+	}
+	if r.lsmState != "" {
+		for _, n := range lsmNames {
+			if l, err := link.LoadPinnedLink(r.pinPath(n), nil); err == nil {
+				l.Unpin()
+				l.Close()
+				log.Printf("bpf: %s: removed the pin left by transparent enforce", n)
+			}
+		}
+		return nil
+	}
+	// The programs share the main object's maps: config, events and the
+	// per-run budget.
+	replace := map[string]*ebpf.Map{"config": r.objs.Config, "events": r.objs.Events, "lost": r.objs.Lost,
+		"suppressed": r.objs.Suppressed, "run_budget": r.objs.RunBudget}
+	if err := spec.LoadAndAssign(&r.lsm, &ebpf.CollectionOptions{MapReplacements: replace}); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			return fmt.Errorf("load BPF LSM programs: %+v", ve)
+		}
+		return fmt.Errorf("load BPF LSM programs: %w", err)
+	}
+	pin := t.Mode == TransparentEnforce
+	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg} {
+		name := lsmNames[i]
+		// A tracing link cannot take a new program in place, so attach
+		// the new one first, then let go of a pinned predecessor: for a
+		// moment both run, and both refuse the same things.
+		l, err := link.AttachLSM(link.LSMOptions{Program: p})
+		if err != nil {
+			return fmt.Errorf("attach %s: %w", name, err)
+		}
+		path := r.pinPath(name)
+		if old, err := link.LoadPinnedLink(path, nil); err == nil {
+			old.Unpin()
+			old.Close()
+		}
+		if pin {
+			if err := os.MkdirAll(t.PinDir, 0o700); err != nil {
+				l.Close()
+				return err
+			}
+			if err := l.Pin(path); err != nil {
+				l.Close()
+				return fmt.Errorf("pin %s: %w", name, err)
+			}
+		}
+		r.links = append(r.links, l)
+	}
+	r.lsmState = map[string]string{TransparentAudit: "audit: refusals recorded, not made",
+		TransparentEnforce: "enforce: unusual families, raw sockets and foreign sockets refused"}[t.Mode]
+	return nil
+}
+
+// LSMState says what the BPF LSM socket hooks do on this node.
+func (r *EBPFReader) LSMState() string { return r.lsmState }
 
 // pinPath is where the link name is pinned.
 func (r *EBPFReader) pinPath(name string) string {
@@ -666,5 +805,6 @@ func (r *EBPFReader) Close() {
 			r.wg.Wait()
 		}
 		r.objs.Close()
+		r.lsm.Close()
 	})
 }

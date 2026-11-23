@@ -335,3 +335,43 @@ func TestExtProcByResolvedName(t *testing.T) {
 		t.Error("explicit CONNECT to an address allowed by binding")
 	}
 }
+
+func TestRunRecorderSocketEvents(t *testing.T) {
+	r := newTestRecorder(t)
+	sock := func(ms int, d SocketData) AuditEvent {
+		return AuditEvent{Type: EventSocket, Timestamp: at(ms), CgroupID: testRunCg, RunCgroupID: testRunCg, PID: 10, Data: d}
+	}
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		sock(1, SocketData{Family: "inet", Type: 3, Protocol: 1, Op: "create", Verdict: "refused: socket"}),
+		sock(2, SocketData{Family: "inet", Op: "send", Verdict: "refused: socket", SocketCgroup: 99}),
+		runEv(EventRunEnd, 3, "/agents/run-abc"),
+	)
+	if tl.Summary.SocketsRefused != 2 {
+		t.Fatalf("summary: %+v", tl.Summary)
+	}
+	var notes []string
+	for _, e := range tl.Events {
+		if e.Type == "socket" {
+			notes = append(notes, e.Note)
+		}
+	}
+	if strings.Join(notes, "|") != "create inet socket, type 3, protocol 1|send inet socket created outside the run (cgroup 99)" {
+		t.Fatalf("notes: %q", notes)
+	}
+}
+
+func TestReceiptSockets(t *testing.T) {
+	p, _ := policy.Parse([]byte(xpProfile))
+	for lsm, want := range map[bool]string{true: "raw and packet sockets refused", false: "BPF LSM is not active"} {
+		c, diags := policy.Compile(policy.Options{Mode: policy.Transparent, Linux: true, KernelLSM: lsm}, p)
+		if len(diags) > 0 {
+			t.Fatal(diags)
+		}
+		var b strings.Builder
+		c.WriteReceipt(&b)
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("KernelLSM=%v receipt lacks %q", lsm, want)
+		}
+	}
+}

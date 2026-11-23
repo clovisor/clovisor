@@ -30,3 +30,7 @@ func (r *EBPFReader) LostTotal() (uint64, uint64)     { return 0, 0 }
 func (r *EBPFReader) ProxyRefused() uint64            { return 0 }
 func (r *EBPFReader) GateProxy(string) error          { return errors.New("needs Linux") }
 func (r *EBPFReader) GatedProxy() string              { return "" }
+func (r *EBPFReader) LSMState() string                { return "needs Linux" }
+
+// BPFLSMActive is false off Linux.
+func BPFLSMActive() bool { return false }

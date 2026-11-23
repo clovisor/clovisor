@@ -499,8 +499,17 @@ refuse: UDP`; the packet backstop is off.
 `ping` fails in enforce mode: it refuses to start when its probe UDP
 connect is refused.
 
-**Not covered yet:** Unix sockets, raw sockets to loopback, and a host
-daemon connecting on a run's behalf (Phase 4).
+**Sockets, where BPF LSM is active.** Runs may create IPv4, IPv6, Unix and
+netlink sockets only: raw IP, packet, vsock and other families get `EPERM`.
+A network socket created outside the run (inherited, or passed in over a
+Unix socket) is refused at connect and send. Audit mode records these
+instead. `agentctl status` shows the `Sockets` line. Enable BPF LSM by adding
+`bpf` to the kernel's `lsm=` boot parameter (check
+`/sys/kernel/security/lsm`); without it these are not governed, and the
+receipt says so.
+
+**Not covered yet:** Unix sockets to host daemons (Docker, ssh-agent, D-Bus,
+systemd-resolved), and a host daemon connecting on a run's behalf (Phase 4).
 
 ## 12. Incident response
 
@@ -624,6 +633,8 @@ ignore the proxy, it checks:
 - UDP refused, QUIC-shaped included, and a `-udp-allow` echo answered;
 - a same-run dev server reached and a host service on loopback refused;
 - a run with an inherited TCP socket refused at start;
+- where BPF LSM is active: raw, packet and vsock sockets refused, netlink
+  allowed, and a socket passed in after the run started refused on send;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

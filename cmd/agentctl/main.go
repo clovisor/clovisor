@@ -510,6 +510,9 @@ func showStatus() error {
 	if s.Resolver != "" {
 		fmt.Printf("Resolver      forwarding to %s\n", s.Resolver)
 	}
+	if s.Sockets != "" {
+		fmt.Printf("Sockets       %s\n", s.Sockets)
+	}
 	fmt.Printf("Active runs   %d\n", s.ActiveRuns)
 	fmt.Printf("Lost events   %d (ring buffer full), %d suppressed (a run over its event budget)\n", s.LostEvents, s.SuppressedEvents)
 	return nil
@@ -938,7 +941,10 @@ func explainProfiles(argv []string) error {
 	if *transparent != clovisor.TransparentOff && mode == policy.ExplicitProxy {
 		return fmt.Errorf("--transparent must be off, audit or enforce")
 	}
-	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux"})
+	// Offline, assume this machine's kernel: whether BPF LSM is active
+	// decides what transparent mode does with sockets.
+	lsm := mode != policy.ExplicitProxy && *platform == "linux" && clovisor.BPFLSMActive()
+	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux", KernelLSM: lsm})
 	if err != nil {
 		return err
 	}

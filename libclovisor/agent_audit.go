@@ -23,7 +23,20 @@ const (
 	EventHTTP     // a request through the node's proxy, and its decision
 	EventMCP      // an MCP operation through the local gateway, and its decision
 	EventDrop     // packets from a run the backstop dropped (milestone 3.3)
+	EventSocket   // a socket refused at creation, connect or send (milestones 4.1, 4.3)
 )
+
+// SocketData reports a socket the BPF LSM hooks refused, or in audit would
+// have: an unusual family or a raw socket at creation, or a network socket
+// created outside the run, used to connect or send.
+type SocketData struct {
+	Family       string // inet, inet6, unix, netlink, packet, or a number
+	Type         uint16 // creation only: 1 stream, 2 dgram, 3 raw, ...
+	Protocol     uint32
+	Op           string // create, connect, send
+	Verdict      string
+	SocketCgroup uint64 // connect, send: the cgroup the socket was made in
+}
 
 // DropData reports packets the egress backstop dropped: they got past the
 // socket hooks (an unconnected ICMP datagram, a raw socket). Reports are

@@ -38,5 +38,7 @@ type NodeStatus struct {
 	// SuppressedEvents exceeded a run's event budget and were not reported.
 	SuppressedEvents uint64 `json:"suppressed_events"`
 	Resolver         string `json:"resolver,omitempty"`
-	ActiveRuns       int    `json:"active_runs"`
+	// Sockets is what the BPF LSM socket hooks do (milestones 4.1, 4.3).
+	Sockets    string `json:"sockets,omitempty"`
+	ActiveRuns int    `json:"active_runs"`
 }

@@ -83,6 +83,7 @@ place:
 | Transparent mode tested end to end in a privileged container; kernel floor revised to 5.12; operator guide gains requirements and the test. Phase 3 complete. | [3.7 status](#37-status-2026-11-23), [operator guide](operator-guide.md) |
 | Phase 4 broken into milestones. Found: where glibc resolves through systemd-resolved's Unix socket, forced DNS is bypassed until Unix-socket gating. | [Phase 4 plan](#phase-4-plan-2026-11-23) |
 | 4.0 spikes: global BPF LSM hooks gate exec (trusted path, IMA hash without policy), raw and packet sockets, Unix sockets with the peer's cgroup, and foreign sockets; `lsm_cgroup` works in the kernel but not through cilium/ebpf. Exec gating conflicts with coding agents running what they build. | [4.0 spike results](#40-spike-results-2026-11-23) |
+| Socket families limited and sockets made outside the run refused, through BPF LSM, pinned to fail closed. | [4.1 and 4.3 status](#41-and-43-status-2026-11-23) |
 
 ---
 
@@ -2791,6 +2792,49 @@ Findings that change the plan:
   past v0.17.
 - **Hash mode** caches per file (inode and change counter) in a map instead
   of hashing every exec, or hashes only files that fail the trusted-path test.
+
+#### 4.1 and 4.3 status (2026-11-23)
+
+Implemented, under the transparent mode (audit records, enforce refuses),
+where BPF LSM is active:
+
+- **Socket families (4.1).** `lsm/socket_create` lets runs create only IPv4,
+  IPv6, Unix and netlink sockets. Raw IP (`SOCK_RAW`, `SOCK_PACKET`),
+  `AF_PACKET`, vsock, Bluetooth, CAN, XDP and other families are refused with
+  `EPERM`. Kernel-internal sockets are untouched. Datagram ICMP stays with
+  the UDP rules of 3.3.
+- **Foreign sockets (4.3).** `lsm/socket_connect` and `lsm/socket_sendmsg`
+  refuse a run's task using an IPv4 or IPv6 socket created outside the run:
+  inherited past the start-time check, or passed in later over a Unix socket.
+  The socket's creating cgroup is read through CO-RE, with `ancestors[]` on
+  6.2 and later and `ancestor_ids[]` before.
+- **Loading.** The LSM programs are a separate object set, loaded only where
+  BPF LSM is active (LSM programs do not load at all without it). They share
+  the main program's maps: config, events and the per-run budget.
+  `BPFLSMActive` reads securityfs's list of active LSMs, mounting securityfs
+  if it is missing, as in a container. Only the list tells: BPF LSM built in
+  but inactive accepts programs that never run.
+- **Pinning.** In enforce the three links are pinned with the others, so
+  refusals continue while the node agent is down. A tracing link cannot take
+  a new program, so a restart attaches the new link before releasing the
+  pinned one; both refuse the same things meanwhile. Off and audit remove
+  the pins.
+- **Reporting.** `socket` timeline events (charged to the per-run budget),
+  `sockets_refused` in the summary, a `[SOCKET]` log line, a `Sockets` line
+  in `agentctl status`, and a receipt line that says what is governed, or
+  that BPF LSM is not active.
+
+Verified on kernel 7.0:
+
+- raw, packet and vsock sockets refused from a run; netlink allowed (`ip`
+  works); the run's own HTTPS unaffected;
+- a TCP socket connected outside the run and passed in over a Unix socket
+  after the run started was refused on send, with its creating cgroup in
+  the timeline;
+- raw sockets refused with the node agent stopped;
+- three programs across stop and restart, none duplicated, none after off;
+- `make integration-transparent`, now twelve checks, including both cases
+  above, with BPF LSM detected inside the privileged container.
 
 #### Decisions
 

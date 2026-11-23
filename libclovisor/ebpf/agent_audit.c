@@ -31,6 +31,16 @@
  *          once). Audit records it and lets it through. A refused
  *          unconnected socket is reported once, not per datagram.
  *
+ * sockets: BPF LSM, where active (milestones 4.1 and 4.3); filtered to
+ *          tasks in runs, since global hooks see every task. In audit they
+ *          report, in enforce they refuse with EPERM:
+ *            socket_create   families other than IPv4, IPv6, Unix and
+ *                            netlink, and raw or packet sockets;
+ *            socket_connect, socket_sendmsg
+ *                            a network socket created outside the run
+ *                            (inherited, or passed in): its traffic would
+ *                            never meet the cgroup hooks above.
+ *
  * backstop: cgroup_skb/egress on agents/, enforce only (in audit runs reach
  *          the network directly, so nothing is out of place). Every
  *          legitimate packet from a run goes to loopback (proxy,
@@ -101,6 +111,7 @@
 #define EVENT_RUN_END   3
 #define EVENT_DNS       4
 #define EVENT_DROP      5
+#define EVENT_SOCKET    6
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct linux_binprm {
@@ -127,6 +138,33 @@ struct cgroup {
     int level;
 } __attribute__((preserve_access_index));
 
+/* A cgroup's ancestors by level: pointers since 6.2, ids before. The
+ * ___flavours let CO-RE pick whichever the running kernel has. */
+struct cgroup___ptrs {
+    struct cgroup *ancestors[1];
+} __attribute__((preserve_access_index));
+
+struct cgroup___ids {
+    __u64 ancestor_ids[1];
+} __attribute__((preserve_access_index));
+
+struct sock_cgroup_data {
+    struct cgroup *cgroup;
+} __attribute__((preserve_access_index));
+
+struct sock_common {
+    unsigned short skc_family;
+} __attribute__((preserve_access_index));
+
+struct sock {
+    struct sock_common __sk_common;
+    struct sock_cgroup_data sk_cgrp_data;
+} __attribute__((preserve_access_index));
+
+struct socket {
+    struct sock *sk;
+} __attribute__((preserve_access_index));
+
 #define MAX_EXCEPTIONS 4
 
 #define MODE_OFF     0
@@ -145,6 +183,8 @@ struct cgroup {
 #define V_DNS            8 /* port 53, to the local resolver */
 #define V_UDP_DENY       9
 #define V_AUDIT_UDP      10
+#define V_SOCK_DENY      11 /* family, raw socket, or foreign socket */
+#define V_AUDIT_SOCK     12
 
 /* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
 struct addr {
@@ -212,6 +252,23 @@ struct connect_event {
     __u32 verdict;        /* V_* */
     __u32 _pad;
 };
+
+/* A socket refused (or, in audit, that would be): an unusual family or a
+ * raw socket at creation (milestone 4.1), or a network socket created
+ * outside the run, at connect or send (4.3). */
+struct socket_event {
+    struct event_hdr hdr;
+    __u16 family;
+    __u16 type;           /* creation only */
+    __u32 protocol;       /* creation only */
+    __u32 op;             /* SOCK_OP_* */
+    __u32 verdict;        /* V_* */
+    __u64 sk_cgroup;      /* cgroup the socket was created in (connect, send) */
+};
+
+#define SOCK_OP_CREATE  0
+#define SOCK_OP_CONNECT 1
+#define SOCK_OP_SEND    2
 
 /* Packets the backstop dropped (or, in audit, would have). pid is 0. */
 struct drop_event {
@@ -1296,6 +1353,136 @@ int on_proxy_connect6(struct bpf_sock_addr *ctx)
     ip.a[2] = ctx->user_ip6[2];
     ip.a[3] = ctx->user_ip6[3];
     return proxy_gate(&ip, (__u16)ctx->user_port);
+}
+
+/* ---- BPF LSM (milestones 4.1 and 4.3) ---- */
+
+#define EPERM_ 1
+#define AF_UNIX_    1
+#define AF_NETLINK_ 16
+#define SOCK_RAW_    3
+#define SOCK_PACKET_ 10
+
+/* An LSM program passes on an earlier program's refusal, bounded as the
+ * verifier requires. */
+static __always_inline int lsm_prev(long ret)
+{
+    return ret < 0 && ret >= -4095 ? (int)ret : -EPERM_;
+}
+
+/* The id of cg's ancestor at level (cg itself at its own level), or 0. */
+static __always_inline __u64 cgroup_ancestor_id(struct cgroup *cg, __u32 level)
+{
+    if (!cg)
+        return 0;
+    int l = BPF_CORE_READ(cg, level);
+    if ((int)level > l || level > 63)
+        return 0;
+    if (bpf_core_field_exists(struct cgroup___ptrs, ancestors)) {
+        struct cgroup___ptrs *c = (void *)cg;
+        struct cgroup *a = 0;
+        if (bpf_core_read(&a, sizeof(a), &c->ancestors[level & 63]) < 0 || !a)
+            return 0;
+        return BPF_CORE_READ(a, kn, id);
+    }
+    struct cgroup___ids *c = (void *)cg;
+    __u64 id = 0;
+    bpf_core_read(&id, sizeof(id), &c->ancestor_ids[level & 63]);
+    return id;
+}
+
+static __always_inline void emit_socket(struct audit_config *cfg, __u64 run, __u16 family, __u16 type,
+                                        __u32 protocol, __u32 op, __u32 verdict, __u64 sk_cg)
+{
+    struct event_hdr hdr = {};
+    if (!fill_hdr(&hdr, EVENT_SOCKET))
+        return;
+    if (!within_budget(hdr.run_cgroup_id, sizeof(struct socket_event)))
+        return;
+    struct socket_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        note_lost(hdr.run_cgroup_id);
+        return;
+    }
+    e->hdr = hdr;
+    e->family = family;
+    e->type = type;
+    e->protocol = protocol;
+    e->op = op;
+    e->verdict = verdict;
+    e->sk_cgroup = sk_cg;
+    bpf_ringbuf_submit(e, 0);
+}
+
+/* security_socket_create(int family, int type, int protocol, int kern) */
+SEC("lsm/socket_create")
+int on_lsm_socket_create(__u64 *ctx)
+{
+    int family = (int)ctx[0], type = (int)ctx[1], protocol = (int)ctx[2], kern = (int)ctx[3];
+    long ret = (long)(int)ctx[4];
+    if (ret)
+        return lsm_prev(ret);
+    if (kern)
+        return 0;
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->mode == MODE_OFF)
+        return 0;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 0;
+    int inet = family == AF_INET || family == AF_INET6;
+    int ok = (inet || family == AF_UNIX_ || family == AF_NETLINK_) &&
+             !(inet && (type == SOCK_RAW_ || type == SOCK_PACKET_));
+    if (ok)
+        return 0;
+    int enforce = cfg->mode == MODE_ENFORCE;
+    emit_socket(cfg, run, family, type, protocol, SOCK_OP_CREATE, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, 0);
+    return enforce ? -EPERM_ : 0;
+}
+
+/* A network socket used by a task in a run must have been created in that
+ * run; otherwise its traffic skipped every cgroup hook. */
+static __always_inline int foreign_socket(struct socket *sock, __u32 op)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->mode == MODE_OFF)
+        return 0;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 0;
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk)
+        return 0;
+    __u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family != AF_INET && family != AF_INET6)
+        return 0; /* Unix sockets: milestone 4.2 */
+    struct cgroup *cg = BPF_CORE_READ(sk, sk_cgrp_data.cgroup);
+    if (cgroup_ancestor_id(cg, cfg->agents_level + 1) == run)
+        return 0;
+    int enforce = cfg->mode == MODE_ENFORCE;
+    __u64 sk_cg = cg ? BPF_CORE_READ(cg, kn, id) : 0;
+    emit_socket(cfg, run, family, 0, 0, op, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, sk_cg);
+    return enforce ? -EPERM_ : 0;
+}
+
+/* security_socket_connect(struct socket *sock, struct sockaddr *address, int addrlen) */
+SEC("lsm/socket_connect")
+int on_lsm_socket_connect(__u64 *ctx)
+{
+    long ret = (long)(int)ctx[3];
+    if (ret)
+        return lsm_prev(ret);
+    return foreign_socket((struct socket *)ctx[0], SOCK_OP_CONNECT);
+}
+
+/* security_socket_sendmsg(struct socket *sock, struct msghdr *msg, int size) */
+SEC("lsm/socket_sendmsg")
+int on_lsm_socket_sendmsg(__u64 *ctx)
+{
+    long ret = (long)(int)ctx[3];
+    if (ret)
+        return lsm_prev(ret);
+    return foreign_socket((struct socket *)ctx[0], SOCK_OP_SEND);
 }
 
 char LICENSE[] SEC("license") = "GPL";

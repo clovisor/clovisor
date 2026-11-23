@@ -72,6 +72,8 @@ func TestTransparent(t *testing.T) {
 	t.Run("udp", e.testUDP)
 	t.Run("loopback", e.testLoopback)
 	t.Run("inherited-socket", e.testInheritedSocket)
+	t.Run("socket-families", e.testSocketFamilies)
+	t.Run("passed-in-socket", e.testPassedInSocket)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -202,7 +204,7 @@ func (e *env) testStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, out, "Transparent   enforce", "Healthy       yes", "Proxy gated   yes", "Envoy ready   yes")
+	expect(t, out, "Transparent   enforce", "Healthy       yes", "Proxy gated   yes", "Envoy ready   yes", "Sockets       ")
 }
 
 func (e *env) testTransparentHTTPS(t *testing.T) {
@@ -287,6 +289,62 @@ func (e *env) testInheritedSocket(t *testing.T) {
 	if err == nil || !strings.Contains(errOut, "network sockets created outside the run") {
 		t.Fatalf("run with an inherited socket: %v %s", err, errOut)
 	}
+}
+
+// needLSM skips a test of the BPF LSM socket hooks where BPF LSM is not
+// active on the host.
+func (e *env) needLSM(t *testing.T) {
+	out, _, _ := e.sh("/it/bin/agentctl status")
+	if !strings.Contains(out, "Sockets       enforce") {
+		t.Skip("BPF LSM not active on this host")
+	}
+}
+
+func (e *env) testSocketFamilies(t *testing.T) {
+	e.needLSM(t)
+	out, id := e.trun(e.py("families", `import socket
+for fam, typ, proto, name in [(socket.AF_INET, socket.SOCK_RAW, 1, "raw"), (17, socket.SOCK_RAW, 0, "packet"),
+                              (40, socket.SOCK_STREAM, 0, "vsock"), (socket.AF_NETLINK, socket.SOCK_RAW, 0, "netlink")]:
+    try:
+        socket.socket(fam, typ, proto)
+        print(name, "created")
+    except OSError as err:
+        print(name, "refused", err.errno)
+`))
+	expect(t, out, "raw refused 1", "packet refused 1", "vsock refused 1", "netlink created")
+	expect(t, e.timeline(id), `"sockets_refused": 3`, `"create inet socket, type 3, protocol 1"`)
+}
+
+func (e *env) testPassedInSocket(t *testing.T) {
+	// A process outside the run connects to the origin and hands the
+	// socket over a Unix socket to a process in the run, after the run has
+	// started: its sends would meet no cgroup hook.
+	e.needLSM(t)
+	pass := e.py("fdpass", `import array, os, socket, sys
+mode, path = sys.argv[1], sys.argv[2]
+if mode == "serve":
+    tcp = socket.create_connection(("`+e.originIP+`", 2222), timeout=5)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)
+    c, _ = srv.accept()
+    c.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [tcp.fileno()]))])
+else:
+    u = socket.socket(socket.AF_UNIX)
+    u.connect(path)
+    _, anc, _, _ = u.recvmsg(1, socket.CMSG_LEN(4))
+    s = socket.socket(fileno=array.array("i", anc[0][2])[0])
+    try:
+        s.sendall(b"x")
+        print("sent on the passed-in socket")
+    except OSError as err:
+        print("passed-in socket refused", err.errno)
+`)
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "rm -f /tmp/fd.sock; "+pass+" serve /tmp/fd.sock")
+	time.Sleep(time.Second)
+	out, id := e.trun(pass + " use /tmp/fd.sock")
+	expect(t, out, "passed-in socket refused 1")
+	expect(t, e.timeline(id), `"send inet socket created outside the run`)
 }
 
 func (e *env) testCheckTransparent(t *testing.T) {

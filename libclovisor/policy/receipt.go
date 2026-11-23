@@ -34,9 +34,16 @@ func (c *Compiled) WriteReceipt(w io.Writer) error {
 		p("Routing     enforced: every TCP connect from a run reaches the proxy or is refused, UDP")
 		p("            other than DNS and the node's UDP exceptions is refused (QUIC included), and")
 		p("            all of it while the node agent is down (design §6.5, §6.8). A packet")
-		p("            backstop drops what gets past the socket hooks. Not covered: raw and Unix")
-		p("            sockets as such (Phase 4; raw packets off the node are dropped), host")
-		p("            daemons acting for a run.")
+		p("            backstop drops what gets past the socket hooks.")
+		if c.Options.KernelLSM {
+			p("Sockets     only IPv4, IPv6, Unix and netlink sockets; raw and packet sockets refused;")
+			p("            network sockets created outside the run refused at connect and send")
+			p("            (BPF LSM). Not covered: Unix sockets to host daemons (Phase 4).")
+		} else {
+			p("Sockets     not governed: BPF LSM is not active. Raw sockets need CAP_NET_RAW; their")
+			p("            packets off the node are dropped by the backstop. Not covered: Unix")
+			p("            sockets to host daemons, sockets passed in from outside the run.")
+		}
 		p("DNS         every query from a run goes to the node's resolver, which answers only names")
 		p("            some rule allows (NXDOMAIN otherwise) and strips ECH from HTTPS records.")
 	case TransparentAudit:

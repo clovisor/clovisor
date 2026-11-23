@@ -58,6 +58,9 @@ type Options struct {
 	// Linux deployments resolve run identity from the client socket's
 	// cgroup; others use a per-run proxy credential.
 	Linux bool
+	// KernelLSM: BPF LSM is active, so transparent mode also governs
+	// socket families, raw sockets and sockets made outside the run.
+	KernelLSM bool
 }
 
 // Diagnostic is one compile error.
