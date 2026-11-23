@@ -86,6 +86,10 @@ type RunSummary struct {
 	// families and raw sockets, and network sockets created outside the
 	// run (milestones 4.1, 4.3). In audit, those that would have been.
 	SocketsRefused int `json:"sockets_refused,omitempty"`
+	// Unix lists Unix sockets outside the run the run used, with what was
+	// done (milestone 4.2): refused, or in audit would have been. Each is
+	// reported once per run.
+	Unix []UnixUse `json:"unix,omitempty"`
 	// UDPRefusedTo is where refused UDP was sent, by destination: what a
 	// reviewer weighs against the node's -udp-allow (milestone 3.6).
 	UDPRefusedTo []Destination `json:"udp_refused_to,omitempty"`
@@ -200,7 +204,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, socket, gap
+	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -633,6 +637,16 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			ResolvedName: d.ResolvedName,
 		}, r.MaxEvents)
 
+	case EventUnix:
+		d := ev.Data.(UnixData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		st.tl.Summary.Unix = append(st.tl.Summary.Unix, UnixUse{Path: d.Path, Verdict: d.Verdict, Datagram: d.Datagram})
+		st.add(TimelineEvent{Time: ev.Timestamp, Type: "unix", PID: ev.PID, CgroupID: ev.CgroupID,
+			DstName: d.Path, Verdict: d.Verdict}, r.MaxEvents)
+
 	case EventSocket:
 		d := ev.Data.(SocketData)
 		st := r.state(ev, "")
@@ -869,4 +883,11 @@ func destinationList(m map[destKey]*destState) []Destination {
 		return a.Proto < b.Proto
 	})
 	return out
+}
+
+// UnixUse is a Unix socket outside the run, as first used.
+type UnixUse struct {
+	Path     string `json:"path"`
+	Verdict  string `json:"verdict"`
+	Datagram bool   `json:"datagram,omitempty"`
 }

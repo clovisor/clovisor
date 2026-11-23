@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -36,6 +37,9 @@ type CeilingSpec struct {
 	Default string `yaml:"default,omitempty" json:"default,omitempty"`
 	// Clamp is intersected into every grant under this ceiling.
 	Clamp string `yaml:"clamp,omitempty" json:"clamp,omitempty"`
+	// AllowRootSockets lets profiles under this ceiling allow Unix sockets
+	// that give root: Docker, Podman, containerd, CRI-O (milestone 4.2).
+	AllowRootSockets bool `yaml:"allowRootSockets,omitempty" json:"allowRootSockets,omitempty"`
 }
 
 // AppliesTo selects callers by platform identity. On a host that is the
@@ -202,6 +206,18 @@ func NewSet(opts Options, profiles []*AgentProfile, ceilings []*ProfileCeiling,
 		}
 		if c.Spec.Clamp != "" && !have[c.Spec.Clamp] {
 			errf("spec.clamp", "no profile named %q", c.Spec.Clamp)
+		}
+		if !c.Spec.AllowRootSockets && compiled != nil {
+			grants := append(append([]string{}, c.Spec.Allow...), c.Spec.Default)
+			for _, g := range grants {
+				if cp := compiled.Profile(g); cp != nil {
+					for _, pat := range cp.UnixAllow {
+						if RootSocket(pat) {
+							errf("spec.allow", "profile %s allows %s, which gives root; set allowRootSockets: true to permit it", g, pat)
+						}
+					}
+				}
+			}
 		}
 		set.ceilings = append(set.ceilings, rc)
 	}
@@ -393,4 +409,45 @@ func RevokedProfile() *CompiledProfile {
 	cp := c.Profiles[0]
 	cp.DefaultMessage = "Egress for this run has been revoked."
 	return cp
+}
+
+// UnixAllow is the run's effective unix.allow for uid: the intersection
+// across its enforce-mode layers, with {uid} filled in. A run with no
+// enforce layer has none (and nothing is refused: audit layers only
+// record). The second result says whether any layer enforces.
+func (e *Effective) UnixAllow(uid int) ([]string, bool) {
+	var acc []string
+	enforcing := false
+	for _, l := range e.Layers {
+		if l.Profile.Mode != ModeEnforce {
+			continue
+		}
+		pats := l.Profile.UnixAllow
+		if !enforcing {
+			acc, enforcing = append([]string{}, pats...), true
+			continue
+		}
+		var next []string
+		for _, a := range acc {
+			for _, b := range pats {
+				switch {
+				case UnixCovers(a, b):
+					next = append(next, b)
+				case UnixCovers(b, a):
+					next = append(next, a)
+				}
+			}
+		}
+		acc = next
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range acc {
+		p = strings.ReplaceAll(p, "{uid}", strconv.Itoa(uid))
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out, enforcing
 }

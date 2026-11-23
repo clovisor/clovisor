@@ -84,6 +84,7 @@ place:
 | Phase 4 broken into milestones. Found: where glibc resolves through systemd-resolved's Unix socket, forced DNS is bypassed until Unix-socket gating. | [Phase 4 plan](#phase-4-plan-2026-11-23) |
 | 4.0 spikes: global BPF LSM hooks gate exec (trusted path, IMA hash without policy), raw and packet sockets, Unix sockets with the peer's cgroup, and foreign sockets; `lsm_cgroup` works in the kernel but not through cilium/ebpf. Exec gating conflicts with coding agents running what they build. | [4.0 spike results](#40-spike-results-2026-11-23) |
 | Socket families limited and sockets made outside the run refused, through BPF LSM, pinned to fail closed. | [4.1 and 4.3 status](#41-and-43-status-2026-11-23) |
+| Unix sockets outside the run refused unless `unix.allow` names them; root-equivalent sockets need the ceiling's consent; closes the nss-resolve bypass. | [4.2 status](#42-status-2026-11-23) |
 
 ---
 
@@ -2835,6 +2836,67 @@ Verified on kernel 7.0:
 - three programs across stop and restart, none duplicated, none after off;
 - `make integration-transparent`, now twelve checks, including both cases
   above, with BPF LSM detected inside the privileged container.
+
+#### 4.2 status (2026-11-23)
+
+Implemented on the BPF LSM hooks, not on `cgroup/connect_unix` as planned.
+Only the LSM hooks see the listening socket's cgroup, which is what lets a
+run reach its own sockets, and one mechanism serves 4.1 to 4.3. The
+consequence: no Unix gating without BPF LSM, as for 4.1 and 4.3, and no
+cilium/ebpf upgrade needed.
+
+- **Hooks.** `unix_stream_connect` (stream and seqpacket) and
+  `unix_may_send` (datagrams) take the peer socket. They allow:
+  - a socket created in the same run;
+  - an unbound peer (a socketpair, handed over by its owner);
+  - the node's patterns, which hold the run API;
+  - the run's patterns.
+
+  Everything else is refused with `EPERM` for runs with an enforcing
+  profile, and recorded for the rest, once per run and address.
+- **Address.** The listener's bound address, read through CO-RE from
+  `unix_sock.addr`: what the daemon called it, not what the client typed.
+  Abstract names become `@name`.
+- **Matching.** The node agent writes each pattern with a byte mask, so the
+  kernel compares eight bytes at a time with no branches. The first version
+  looped with early exits and exceeded the verifier's instruction budget.
+- **Policy.** A `unix:` block, `allow:` with at most eight entries: absolute
+  paths or `@names`, a trailing `*`, and `{uid}`. A run's patterns are the
+  intersection across its enforcing layers, with `{uid}` filled in. They are
+  written at bind and at clamp or revoke, and dropped when the run ends.
+- **Root-equivalent sockets** (Docker, Podman, containerd, CRI-O, or a
+  prefix covering them) make the policy fail to load unless the granting
+  ceiling sets `allowRootSockets: true`.
+- **Bypass notes.** systemd-resolved's varlink socket and the system D-Bus
+  are flagged in the receipt. Learn drafts `unix.allow` from recorded uses,
+  turning `/run/user/<uid>/` into `{uid}`, and leaves resolved's socket and
+  root sockets commented out. `check --transparent` replays the uses.
+
+Verified on kernel 7.0, with a profile allowing only the system bus:
+
+- the system bus reached;
+- systemd-resolved's socket and syslog (`/run/systemd/journal/dev-log`)
+  refused;
+- the Docker socket refused even to a root run, while Docker kept working
+  outside;
+- the run's own filesystem and abstract sockets, and the run API, reached;
+- `getent passwd` unaffected;
+- in audit, everything reached and recorded; learn drafted the two paths
+  (now with resolved's commented out); check flagged both;
+- `make integration-transparent`, now thirteen checks, including an allowed
+  and a refused socket outside the run. The passed-in-socket check now
+  needs its handover socket in `unix.allow`: 4.2 refuses that channel
+  before 4.3's check is reached.
+
+This closes [finding 1](#phase-4-plan-2026-11-23), the nss-resolve bypass of
+forced DNS, for runs with an enforcing profile where BPF LSM is active.
+
+Limits:
+
+- Runs that outlive a node agent restart come back unprofiled, so their
+  Unix connects are recorded, not refused, as with egress since Phase 2.
+- A daemon reached through an allowed socket acts with its own authority.
+  That is what the root and bypass notes are for.
 
 #### Decisions
 

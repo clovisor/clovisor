@@ -119,3 +119,38 @@ func TestLearnTransparentNotes(t *testing.T) {
 		t.Errorf("rules: %d", len(cp.Rules))
 	}
 }
+
+func TestLearnAndCheckUnix(t *testing.T) {
+	uid := 1000
+	tl := &RunTimeline{RunID: "u1", Complete: true, StartedAt: t0, Command: []string{"agent"}, UID: &uid,
+		Summary: RunSummary{Unix: []UnixUse{
+			{Path: "/run/user/1000/bus", Verdict: "would refuse: unix"},
+			{Path: "@myapp", Verdict: "would refuse: unix"},
+			{Path: "/var/run/docker.sock", Verdict: "would refuse: unix"},
+			{Path: "/run/systemd/resolve/io.systemd.Resolve", Verdict: "would refuse: unix"},
+		}}}
+	var b strings.Builder
+	if err := LearnProfile("lu", []*RunTimeline{tl}).WriteYAML(&b, t0); err != nil {
+		t.Fatal(err)
+	}
+	s := b.String()
+	for _, want := range []string{`- "/run/user/{uid}/bus"`, `- "@myapp"`, `# - "/var/run/docker.sock"  # gives root`,
+		`# - "/run/systemd/resolve/io.systemd.Resolve"  # systemd-resolved resolves any name`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("draft lacks %q:\n%s", want, s)
+		}
+	}
+	// The draft, minus the commented-out Docker socket, against the run:
+	// only what it left out is refused.
+	cp := compileOne(t, s)
+	rep := CheckRunsWith(cp, []*RunTimeline{tl}, CheckOptions{Transparent: true})
+	var denied []string
+	for _, f := range rep.Violations {
+		if f.Kind == "unix" {
+			denied = append(denied, f.What)
+		}
+	}
+	if strings.Join(denied, ",") != "unix /run/systemd/resolve/io.systemd.Resolve,unix /var/run/docker.sock" {
+		t.Errorf("unix violations: %v", denied)
+	}
+}

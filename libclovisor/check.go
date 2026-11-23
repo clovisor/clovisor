@@ -187,6 +187,28 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 			}
 		}
 		checkMCP(cp, tl, add)
+		if o.Transparent {
+			uid := -1
+			if tl.UID != nil {
+				uid = *tl.UID
+			}
+			for _, u := range tl.Summary.Unix {
+				what := "unix " + u.Path
+				rule := ""
+				for _, pat := range cp.UnixAllow {
+					if policy.UnixCovers(strings.ReplaceAll(pat, "{uid}", strconv.Itoa(uid)), u.Path) {
+						rule = "unix/" + pat
+						break
+					}
+				}
+				if rule != "" {
+					add("unix-allow", what, CheckFinding{Decision: policy.ActionAllow, Rule: rule}, tl.RunID, 1)
+				} else {
+					add("unix-deny", what, CheckFinding{Decision: policy.ActionDeny,
+						Message: "no unix.allow entry covers it (BPF LSM refuses it under enforce)"}, tl.RunID, 1)
+				}
+			}
+		}
 		for _, b := range tl.Summary.Binaries {
 			ed := cp.DecideExec(b)
 			f := CheckFinding{Decision: policy.ActionAllow}
@@ -219,10 +241,10 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 		f := *found[k]
 		sort.Strings(f.Runs)
 		switch k.kind {
-		case "egress-deny", "http-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny":
+		case "egress-deny", "http-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny", "unix-deny":
 			f.Kind = strings.TrimSuffix(k.kind, "-deny")
 			rep.Violations = append(rep.Violations, f)
-		case "egress-allow", "http-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow":
+		case "egress-allow", "http-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow", "unix-allow":
 			f.Kind = strings.TrimSuffix(k.kind, "-allow")
 			rep.Allowed = append(rep.Allowed, f)
 		case "unverifiable":

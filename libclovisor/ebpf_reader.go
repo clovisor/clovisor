@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,7 @@ const (
 	bpfEventDNS      = 4
 	bpfEventDrop     = 5
 	bpfEventSocket   = 6
+	bpfEventUnix     = 7
 
 	afInet  = 2
 	afInet6 = 10
@@ -120,14 +122,111 @@ type bpfLSMObjects struct {
 	SocketCreate  *ebpf.Program `ebpf:"on_lsm_socket_create"`
 	SocketConnect *ebpf.Program `ebpf:"on_lsm_socket_connect"`
 	SocketSendmsg *ebpf.Program `ebpf:"on_lsm_socket_sendmsg"`
+	UnixStream    *ebpf.Program `ebpf:"on_lsm_unix_stream_connect"`
+	UnixSend      *ebpf.Program `ebpf:"on_lsm_unix_may_send"`
+	UnixPolicy    *ebpf.Map     `ebpf:"unix_policy"`
+	UnixNode      *ebpf.Map     `ebpf:"unix_node"`
+	UnixSeen      *ebpf.Map     `ebpf:"unix_seen"`
 }
 
 func (o *bpfLSMObjects) Close() {
-	for _, p := range []*ebpf.Program{o.SocketCreate, o.SocketConnect, o.SocketSendmsg} {
-		if p != nil {
-			p.Close()
+	for _, c := range []interface{ Close() error }{o.SocketCreate, o.SocketConnect, o.SocketSendmsg,
+		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen} {
+		if c != nil && !reflect.ValueOf(c).IsNil() {
+			c.Close()
 		}
 	}
+}
+
+// Wire formats of unix_policy (agent_audit.c).
+const (
+	maxUnixPatterns = 8
+	unixPathBytes   = 112
+)
+
+type bpfUnixPat struct {
+	Len    uint16
+	Prefix uint8
+	_      [5]uint8
+	B      [unixPathBytes]byte
+	M      [unixPathBytes]byte // 0xff over the first Len bytes
+}
+
+type bpfUnixPolicy struct {
+	N       uint32
+	Enforce uint32
+	P       [maxUnixPatterns]bpfUnixPat
+}
+
+type bpfUnixEvent struct {
+	Hdr        bpfEventHdr
+	Path       [unixPathBytes]byte
+	Len        uint32
+	Verdict    uint32
+	Dgram      uint32
+	_          uint32
+	PeerCgroup uint64
+}
+
+// unixPolicyOf encodes patterns (absolute paths or @names, a trailing *
+// for a prefix) for the kernel.
+func unixPolicyOf(patterns []string, enforce bool) (bpfUnixPolicy, error) {
+	var p bpfUnixPolicy
+	if len(patterns) > maxUnixPatterns {
+		return p, fmt.Errorf("at most %d unix patterns, got %d", maxUnixPatterns, len(patterns))
+	}
+	for i, pat := range patterns {
+		body, prefix := strings.CutSuffix(pat, "*")
+		if len(body) > 108 {
+			return p, fmt.Errorf("unix pattern %q is too long", pat)
+		}
+		p.P[i].Len = uint16(len(body))
+		if prefix {
+			p.P[i].Prefix = 1
+		}
+		copy(p.P[i].B[:], body)
+		for j := 0; j < len(body); j++ {
+			p.P[i].M[j] = 0xff
+		}
+	}
+	p.N = uint32(len(patterns))
+	if enforce {
+		p.Enforce = 1
+	}
+	return p, nil
+}
+
+// SetUnixPolicy gives a run its effective unix.allow (milestone 4.2).
+// enforce says whether the run has an enforcing profile; without one,
+// Unix sockets outside the run are reported, not refused.
+func (r *EBPFReader) SetUnixPolicy(runCg uint64, patterns []string, enforce bool) error {
+	if r.lsm.UnixPolicy == nil {
+		return nil // BPF LSM not in use
+	}
+	p, err := unixPolicyOf(patterns, enforce)
+	if err != nil {
+		return err
+	}
+	return r.lsm.UnixPolicy.Put(runCg, p)
+}
+
+// ForgetUnixPolicy drops a finished run's entry.
+func (r *EBPFReader) ForgetUnixPolicy(runCg uint64) {
+	if r.lsm.UnixPolicy != nil {
+		r.lsm.UnixPolicy.Delete(runCg)
+	}
+}
+
+// SetUnixNode sets the sockets every run may reach: the run API.
+func (r *EBPFReader) SetUnixNode(patterns []string) error {
+	if r.lsm.UnixNode == nil {
+		return nil
+	}
+	p, err := unixPolicyOf(patterns, false)
+	if err != nil {
+		return err
+	}
+	return r.lsm.UnixNode.Put(uint32(0), p)
 }
 
 type bpfCgroupEvent struct {
@@ -452,6 +551,15 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		ev.Data = SocketData{Family: socketFamily(e.Family), Type: e.Type, Protocol: e.Protocol,
 			Op: []string{"create", "connect", "send"}[min(int(e.Op), 2)], Verdict: connectVerdicts[e.Verdict], SocketCgroup: e.SkCgroup}
 
+	case bpfEventUnix:
+		var e bpfUnixEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		ev.Type = EventUnix
+		ev.Data = UnixData{Path: string(e.Path[:min(int(e.Len), len(e.Path))]), Verdict: connectVerdicts[e.Verdict],
+			Datagram: e.Dgram != 0, PeerCgroup: e.PeerCgroup}
+
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent
 		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
@@ -524,7 +632,8 @@ func BPFLSMActive() bool {
 }
 
 // lsmNames are the socket hooks (milestones 4.1, 4.3), for pins and status.
-var lsmNames = []string{"lsm-socket-create", "lsm-socket-connect", "lsm-socket-sendmsg"}
+var lsmNames = []string{"lsm-socket-create", "lsm-socket-connect", "lsm-socket-sendmsg",
+	"lsm-unix-stream-connect", "lsm-unix-may-send"}
 
 // attachLSM loads and attaches the socket hooks in audit and enforce, if
 // BPF LSM is active; in enforce they are pinned like the cgroup hooks.
@@ -560,7 +669,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("load BPF LSM programs: %w", err)
 	}
 	pin := t.Mode == TransparentEnforce
-	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg} {
+	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg, r.lsm.UnixStream, r.lsm.UnixSend} {
 		name := lsmNames[i]
 		// A tracing link cannot take a new program in place, so attach
 		// the new one first, then let go of a pinned predecessor: for a
@@ -587,7 +696,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		r.links = append(r.links, l)
 	}
 	r.lsmState = map[string]string{TransparentAudit: "audit: refusals recorded, not made",
-		TransparentEnforce: "enforce: unusual families, raw sockets and foreign sockets refused"}[t.Mode]
+		TransparentEnforce: "enforce: unusual families, raw sockets, foreign sockets and Unix sockets outside unix.allow refused"}[t.Mode]
 	return nil
 }
 

@@ -167,6 +167,9 @@ type RunAPIServer struct {
 	Transparent string
 	// Status reports the node's enforcement state (agentctl status).
 	Status func() NodeStatus
+	// OnPolicy, if set, hears a run's effective policy whenever it is
+	// bound or clamped, so kernel state can follow (milestone 4.2).
+	OnPolicy func(runCg uint64, uid int, eff *policy.Effective)
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.
@@ -605,6 +608,9 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	if err != nil {
 		return fail("%v", err)
 	}
+	if binding != nil && ac.s.OnPolicy != nil {
+		ac.s.OnPolicy(id, int(ac.cred.Uid), binding.Effective)
+	}
 	ac.runID, ac.runPath, ac.cgID, ac.cwd = runID, path, id, req.Cwd
 	rp := runPolicyRecord(binding)
 	ac.s.reg.Put(RunMeta{
@@ -782,10 +788,15 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 		ac.s.mu.Unlock()
 		return fail("run %s belongs to another user", runID)
 	}
+	var eff *policy.Effective
 	if ok {
 		b.eff = b.eff.With(layer)
+		eff = b.eff
 	}
 	ac.s.mu.Unlock()
+	if ok && ac.s.OnPolicy != nil {
+		ac.s.OnPolicy(b.cgroupID, b.uid, eff)
+	}
 	if !ok {
 		return fail("no live profiled run %s", runID)
 	}

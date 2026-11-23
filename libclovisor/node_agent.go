@@ -375,6 +375,18 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		na.proxyOpts = &o
 	}
 	api.Status = na.Status
+	if r := audit.reader; r != nil && lsmFor(*t, credential) {
+		// Every run may reach the run API (agentctl inside a run).
+		if err := r.SetUnixNode([]string{opts.SocketPath}); err != nil {
+			fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
+		}
+		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective) {
+			pats, enforce := eff.UnixAllow(uid)
+			if err := r.SetUnixPolicy(runCg, pats, enforce); err != nil {
+				fmt.Fprintf(os.Stderr, "node agent: run cgroup %d: unix policy: %v\n", runCg, err)
+			}
+		}
+	}
 	if xp != nil && resolver != nil {
 		xp.Names = resolver.NamesFor
 	}
@@ -718,6 +730,13 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		}
 		fmt.Printf("%s [DNS] run=%d cgroup=%d server=%s query=%s %s rcode=%s addrs=%v%s\n",
 			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs(), extra)
+	case EventUnix:
+		d := event.Data.(UnixData)
+		kind := "stream"
+		if d.Datagram {
+			kind = "dgram"
+		}
+		fmt.Printf("%s [UNIX] run=%d pid=%d %s %s peer-cgroup=%d verdict=%q\n", ts, event.RunCgroupID, event.PID, kind, d.Path, d.PeerCgroup, d.Verdict)
 	case EventSocket:
 		d := event.Data.(SocketData)
 		fmt.Printf("%s [SOCKET] run=%d pid=%d %s %s type=%d proto=%d socket-cgroup=%d verdict=%q\n", ts, event.RunCgroupID,
@@ -773,6 +792,9 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 	case EventRunEnd:
 		if na.resolver != nil {
 			na.resolver.Forget(event.RunCgroupID)
+		}
+		if na.audit != nil && na.audit.reader != nil {
+			na.audit.reader.ForgetUnixPolicy(event.RunCgroupID)
 		}
 		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}

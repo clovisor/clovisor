@@ -40,6 +40,12 @@
  *                            a network socket created outside the run
  *                            (inherited, or passed in): its traffic would
  *                            never meet the cgroup hooks above.
+ *            unix_stream_connect, unix_may_send (milestone 4.2)
+ *                            a Unix socket bound outside the run, unless
+ *                            its address matches the node's patterns (the
+ *                            run API) or the run's unix.allow. Refused only
+ *                            for runs with an enforcing profile; reported
+ *                            once per run and address.
  *
  * backstop: cgroup_skb/egress on agents/, enforce only (in audit runs reach
  *          the network directly, so nothing is out of place). Every
@@ -112,6 +118,7 @@
 #define EVENT_DNS       4
 #define EVENT_DROP      5
 #define EVENT_SOCKET    6
+#define EVENT_UNIX      7
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct linux_binprm {
@@ -165,6 +172,20 @@ struct socket {
     struct sock *sk;
 } __attribute__((preserve_access_index));
 
+struct sockaddr_un_k {
+    unsigned short sun_family;
+    char sun_path[108];
+};
+
+struct unix_address {
+    int len;
+    struct sockaddr_un_k name[1];
+} __attribute__((preserve_access_index));
+
+struct unix_sock {
+    struct unix_address *addr;
+} __attribute__((preserve_access_index));
+
 #define MAX_EXCEPTIONS 4
 
 #define MODE_OFF     0
@@ -185,6 +206,8 @@ struct socket {
 #define V_AUDIT_UDP      10
 #define V_SOCK_DENY      11 /* family, raw socket, or foreign socket */
 #define V_AUDIT_SOCK     12
+#define V_UNIX_DENY      13 /* a Unix socket outside the run */
+#define V_AUDIT_UNIX     14
 
 /* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
 struct addr {
@@ -264,6 +287,37 @@ struct socket_event {
     __u32 op;             /* SOCK_OP_* */
     __u32 verdict;        /* V_* */
     __u64 sk_cgroup;      /* cgroup the socket was created in (connect, send) */
+};
+
+/* A Unix socket outside the run (milestone 4.2). */
+struct unix_event {
+    struct event_hdr hdr;
+    __u8  path[112];      /* filesystem path, or @name for an abstract one */
+    __u32 len;
+    __u32 verdict;        /* V_* */
+    __u32 dgram;
+    __u32 _pad;
+    __u64 peer_cgroup;    /* cgroup the listening socket was created in */
+};
+
+#define MAX_UNIX_PATTERNS 8
+#define UNIX_WORDS        14 /* 112 bytes */
+
+/* m holds a mask over the pattern's len bytes, computed by the node agent,
+ * so matching is a fixed sequence of masked compares with no branches:
+ * the verifier would otherwise explore every early exit. */
+struct unix_pat {
+    __u16 len;
+    __u8  prefix;         /* a trailing * */
+    __u8  _pad[5];
+    __u64 b[UNIX_WORDS];
+    __u64 m[UNIX_WORDS];
+};
+
+struct unix_policy {
+    __u32 n;
+    __u32 enforce;        /* the run has an enforcing profile */
+    struct unix_pat p[MAX_UNIX_PATTERNS];
 };
 
 #define SOCK_OP_CREATE  0
@@ -464,6 +518,36 @@ struct {
     __type(key, __u64);
     __type(value, struct drop_state);
 } drop_rate SEC(".maps");
+
+/* Per run: its effective unix.allow, written by the node agent at bind
+ * and clamp (milestone 4.2). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct unix_policy);
+} unix_policy SEC(".maps");
+
+/* Node-wide patterns: the run API. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct unix_policy);
+} unix_node SEC(".maps");
+
+struct unix_seen_key {
+    __u64 run;
+    __u64 hash;
+};
+
+/* Unix addresses already reported for a run. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct unix_seen_key);
+    __type(value, __u8);
+} unix_seen SEC(".maps");
 
 /* The proxy's view: its peer (the client) to the original destination. */
 struct {
@@ -1463,6 +1547,115 @@ static __always_inline int foreign_socket(struct socket *sock, __u32 op)
     __u64 sk_cg = cg ? BPF_CORE_READ(cg, kn, id) : 0;
     emit_socket(cfg, run, family, 0, 0, op, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, sk_cg);
     return enforce ? -EPERM_ : 0;
+}
+
+/* ---- Unix sockets (milestone 4.2) ---- */
+
+static __always_inline int unix_match(struct unix_policy *pol, __u64 *b, __u32 len)
+{
+    if (!pol)
+        return 0;
+    __u32 n = pol->n;
+#pragma unroll
+    for (int i = 0; i < MAX_UNIX_PATTERNS; i++) {
+        struct unix_pat *p = &pol->p[i];
+        __u64 diff = 0;
+#pragma unroll
+        for (int j = 0; j < UNIX_WORDS; j++)
+            diff |= (b[j] ^ p->b[j]) & p->m[j];
+        __u32 plen = p->len;
+        int len_ok = p->prefix ? plen <= len : plen == len;
+        if ((__u32)i < n && len_ok && diff == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static __always_inline int unix_decide(struct sock *peer, __u32 dgram)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->mode == MODE_OFF || !peer)
+        return 0;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 0;
+    struct cgroup *pcg = BPF_CORE_READ(peer, sk_cgrp_data.cgroup);
+    if (cgroup_ancestor_id(pcg, cfg->agents_level + 1) == run)
+        return 0; /* the run's own socket */
+    struct unix_address *addr = BPF_CORE_READ((struct unix_sock *)peer, addr);
+    if (!addr)
+        return 0; /* unbound: a socketpair or similar, handed over by its owner */
+
+    __u64 b[UNIX_WORDS] = {};
+    if (bpf_core_read(b, 108, &addr->name[0].sun_path) < 0)
+        return 0;
+    /* The bound length counts sun_family (2 bytes) and, for a filesystem
+     * path, a trailing NUL the kernel adds. */
+    int alen = BPF_CORE_READ(addr, len) - 2;
+    if (alen < 0)
+        alen = 0;
+    if (alen > 108)
+        alen = 108;
+    __u8 *c = (__u8 *)b;
+    __u32 len = alen;
+    if (c[0] == 0) {
+        c[0] = '@'; /* abstract: shown as @name */
+    } else if (len > 0 && c[(len - 1) & 127] == 0) {
+        len--;
+    }
+
+    __u32 zero = 0;
+    if (unix_match(bpf_map_lookup_elem(&unix_node, &zero), b, len))
+        return 0;
+    struct unix_policy *pol = bpf_map_lookup_elem(&unix_policy, &run);
+    if (unix_match(pol, b, len))
+        return 0;
+    int enforce = cfg->mode == MODE_ENFORCE && pol && pol->enforce;
+
+    struct unix_seen_key k = {.run = run, .hash = 14695981039346656037ULL};
+    for (int j = 0; j < UNIX_WORDS; j++)
+        k.hash = (k.hash ^ b[j]) * 1099511628211ULL;
+    __u8 one = 1;
+    if (bpf_map_update_elem(&unix_seen, &k, &one, BPF_NOEXIST) == 0) {
+        struct event_hdr hdr = {};
+        if (fill_hdr(&hdr, EVENT_UNIX) && within_budget(hdr.run_cgroup_id, sizeof(struct unix_event))) {
+            struct unix_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+            if (e) {
+                e->hdr = hdr;
+                __builtin_memcpy(e->path, b, sizeof(e->path));
+                e->len = len;
+                e->verdict = enforce ? V_UNIX_DENY : V_AUDIT_UNIX;
+                e->dgram = dgram;
+                e->_pad = 0;
+                e->peer_cgroup = pcg ? BPF_CORE_READ(pcg, kn, id) : 0;
+                bpf_ringbuf_submit(e, 0);
+            } else {
+                note_lost(hdr.run_cgroup_id);
+            }
+        }
+    }
+    return enforce ? -EPERM_ : 0;
+}
+
+/* security_unix_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk) */
+SEC("lsm/unix_stream_connect")
+int on_lsm_unix_stream_connect(__u64 *ctx)
+{
+    long ret = (long)(int)ctx[3];
+    if (ret)
+        return lsm_prev(ret);
+    return unix_decide((struct sock *)ctx[1], 0);
+}
+
+/* security_unix_may_send(struct socket *sock, struct socket *other) */
+SEC("lsm/unix_may_send")
+int on_lsm_unix_may_send(__u64 *ctx)
+{
+    long ret = (long)(int)ctx[2];
+    if (ret)
+        return lsm_prev(ret);
+    struct socket *other = (struct socket *)ctx[1];
+    return unix_decide(BPF_CORE_READ(other, sk), 1);
 }
 
 /* security_socket_connect(struct socket *sock, struct sockaddr *address, int addrlen) */

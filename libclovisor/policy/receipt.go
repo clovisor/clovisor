@@ -37,8 +37,9 @@ func (c *Compiled) WriteReceipt(w io.Writer) error {
 		p("            backstop drops what gets past the socket hooks.")
 		if c.Options.KernelLSM {
 			p("Sockets     only IPv4, IPv6, Unix and netlink sockets; raw and packet sockets refused;")
-			p("            network sockets created outside the run refused at connect and send")
-			p("            (BPF LSM). Not covered: Unix sockets to host daemons (Phase 4).")
+			p("            network sockets created outside the run refused at connect and send;")
+			p("            Unix sockets outside the run refused unless unix.allow names them, for runs")
+			p("            with an enforcing profile (BPF LSM). The run API is always reachable.")
 		} else {
 			p("Sockets     not governed: BPF LSM is not active. Raw sockets need CAP_NET_RAW; their")
 			p("            packets off the node are dropped by the backstop. Not covered: Unix")

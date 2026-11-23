@@ -24,7 +24,18 @@ const (
 	EventMCP      // an MCP operation through the local gateway, and its decision
 	EventDrop     // packets from a run the backstop dropped (milestone 3.3)
 	EventSocket   // a socket refused at creation, connect or send (milestones 4.1, 4.3)
+	EventUnix     // a Unix socket outside the run, first use (milestone 4.2)
 )
+
+// UnixData reports a run's first connect or send to a Unix socket bound
+// outside the run that no pattern allowed: refused under an enforcing
+// profile, recorded otherwise.
+type UnixData struct {
+	Path       string // the listener's address; @name for an abstract one
+	Verdict    string
+	Datagram   bool
+	PeerCgroup uint64 // the cgroup the listening socket was created in
+}
 
 // SocketData reports a socket the BPF LSM hooks refused, or in audit would
 // have: an unusual family or a raw socket at creation, or a network socket

@@ -89,3 +89,17 @@ func TestInetSockets(t *testing.T) {
 		t.Fatalf("network sockets: %d before, %d after opening two", before, after)
 	}
 }
+
+func TestUnixPolicyEncoding(t *testing.T) {
+	p, err := unixPolicyOf([]string{"/run/x.sock", "/tmp/ssh-*", "@abc"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.N != 3 || p.Enforce != 1 || p.P[0].Len != 11 || p.P[0].Prefix != 0 || p.P[1].Len != 9 || p.P[1].Prefix != 1 ||
+		string(p.P[2].B[:p.P[2].Len]) != "@abc" {
+		t.Fatalf("%+v", p)
+	}
+	if _, err := unixPolicyOf(make([]string, 9), false); err == nil {
+		t.Error("nine patterns accepted")
+	}
+}

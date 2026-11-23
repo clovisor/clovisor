@@ -74,6 +74,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("inherited-socket", e.testInheritedSocket)
 	t.Run("socket-families", e.testSocketFamilies)
 	t.Run("passed-in-socket", e.testPassedInSocket)
+	t.Run("unix-sockets", e.testUnixSockets)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -345,6 +346,42 @@ else:
 	out, id := e.trun(pass + " use /tmp/fd.sock")
 	expect(t, out, "passed-in socket refused 1")
 	expect(t, e.timeline(id), `"send inet socket created outside the run`)
+}
+
+func (e *env) testUnixSockets(t *testing.T) {
+	// Two sockets bound outside the run, one of them in unix.allow.
+	e.needLSM(t)
+	serve := e.py("unixserve", `import os, socket, sys
+srv = socket.socket(socket.AF_UNIX)
+if os.path.exists(sys.argv[1]):
+    os.unlink(sys.argv[1])
+srv.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o777)
+srv.listen(8)
+while True:
+    srv.accept()[0].close()
+`)
+	for _, p := range []string{"/run/it-allowed.sock", "/run/it-denied.sock"} {
+		e.run("exec", "-d", e.name("agent"), "sh", "-c", serve+" "+p)
+	}
+	time.Sleep(time.Second)
+	out, id := e.trun(e.py("unixuse", `import socket
+def connect(path):
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(path)
+        return "ok"
+    except OSError as err:
+        return "refused %d" % err.errno
+print("allowed", connect("/run/it-allowed.sock"))
+print("denied", connect("/run/it-denied.sock"))
+own = socket.socket(socket.AF_UNIX)
+own.bind("\0it-own")
+own.listen(1)
+print("own", connect("\0it-own"))
+`) + "; /it/bin/agentctl status | grep -c Transparent")
+	expect(t, out, "allowed ok", "denied refused 1", "own ok", "\n1\n")
+	expect(t, e.timeline(id), `"path": "/run/it-denied.sock"`, `"verdict": "refused: unix"`)
 }
 
 func (e *env) testCheckTransparent(t *testing.T) {

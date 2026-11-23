@@ -479,10 +479,11 @@ from that server. The resolver:
 **Check `/etc/nsswitch.conf`.** If its `hosts:` line lists `resolve`
 before `dns` (Fedora and others), glibc resolves through systemd-resolved's
 Unix socket instead of sending DNS, and the node's resolver never sees those
-lookups: runs can resolve any name, which reopens DNS tunnelling. Until
-Unix-socket gating (Phase 4), put `dns` before `resolve` on transparent
-nodes, or point `/etc/resolv.conf` at systemd-resolved's stub and drop
-`resolve` from the line.
+lookups: runs can resolve any name, which reopens DNS tunnelling. Where BPF
+LSM is active, a run with an enforcing profile cannot reach that socket
+unless `unix.allow` names it, and glibc falls back to `dns`. Elsewhere, put
+`dns` before `resolve` on transparent nodes, or point `/etc/resolv.conf` at
+systemd-resolved's stub and drop `resolve` from the line.
 
 A `cidr` rule does not make names resolvable, since deciding a name by what
 it resolves to would mean forwarding it first. Give internal hosts `fqdn`
@@ -508,8 +509,37 @@ instead. `agentctl status` shows the `Sockets` line. Enable BPF LSM by adding
 `/sys/kernel/security/lsm`); without it these are not governed, and the
 receipt says so.
 
-**Not covered yet:** Unix sockets to host daemons (Docker, ssh-agent, D-Bus,
-systemd-resolved), and a host daemon connecting on a run's behalf (Phase 4).
+**Unix sockets, where BPF LSM is active.** A run reaches Unix sockets it
+created itself, and the node agent's run API. Any other Unix socket is
+refused, for runs with an enforcing profile, unless the profile's `unix:`
+block names it:
+
+```yaml
+spec:
+  unix:
+    allow:
+      - "/run/user/{uid}/ssh-agent.sock"   # {uid}: the run's uid
+      - "/tmp/ssh-*"                       # a trailing * matches the rest
+      - "@my-abstract-name"                # an abstract socket
+```
+
+- **The address is the one the socket was bound to**, not the path the
+  client used: `/dev/log` is `/run/systemd/journal/dev-log`, and
+  `/var/run/docker.sock` is `/run/docker.sock` on a host where `/var/run`
+  is a link. The timeline records the bound address.
+- **At most eight entries.** Across clamps, a run gets the intersection.
+- **Sockets that give root** (Docker, Podman, containerd, CRI-O) may be
+  allowed only under a ceiling with `allowRootSockets: true`; the policy
+  does not load otherwise.
+- **Sockets that reach around the resolver** (systemd-resolved's varlink
+  socket, and the system D-Bus) are flagged in the receipt. Learn leaves
+  resolved's socket commented out.
+- **Audit and runs without an enforcing profile:** each Unix socket outside
+  the run is recorded once per run, under `unix` in the summary, and not
+  refused. Learn drafts the `unix:` block from those records.
+
+**Not covered yet:** a host daemon connecting on a run's behalf through a
+socket the profile allows.
 
 ## 12. Incident response
 
@@ -635,6 +665,8 @@ ignore the proxy, it checks:
 - a run with an inherited TCP socket refused at start;
 - where BPF LSM is active: raw, packet and vsock sockets refused, netlink
   allowed, and a socket passed in after the run started refused on send;
+  a Unix socket in `unix.allow` reached, another one bound outside the run
+  refused, the run's own and the run API reached;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

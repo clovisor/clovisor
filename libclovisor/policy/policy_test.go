@@ -452,3 +452,89 @@ spec:
 		t.Error("transparent by-address note misplaced")
 	}
 }
+
+func TestUnixBlock(t *testing.T) {
+	doc := func(allow string) string {
+		return "kind: AgentProfile\nmetadata: { name: u }\nspec:\n  mode: enforce\n  egress: { default: deny }\n  unix: { allow: " + allow + " }\n"
+	}
+	for _, bad := range []string{`["relative.sock"]`, `["/a/*/b"]`, `["/run/{gid}/x"]`, `["/` + strings.Repeat("x", 120) + `"]`} {
+		p, err := Parse([]byte(doc(bad)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, diags := Compile(Options{Linux: true}, p); len(diags) == 0 {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	p, _ := Parse([]byte(doc(`["/run/user/{uid}/ssh-agent.sock", "/tmp/ssh-*", "@myapp", "/var/run/docker.sock"]`)))
+	c, diags := Compile(Options{Mode: Transparent, Linux: true, KernelLSM: true}, p)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	cp := c.Profiles[0]
+	if len(cp.UnixAllow) != 4 {
+		t.Fatalf("patterns: %v", cp.UnixAllow)
+	}
+	var root []string
+	for _, pl := range cp.Placements {
+		if strings.Contains(strings.Join(pl.Notes, ";"), "gives root") {
+			root = append(root, pl.Rule)
+		}
+	}
+	if strings.Join(root, ",") != "unix//var/run/docker.sock" {
+		t.Errorf("root-equivalent placements: %v", root)
+	}
+	for pat, want := range map[string]bool{"/var/run/*": true, "/run/user/{uid}/*": true, "/srv/x/docker.sock": true,
+		"/tmp/ssh-*": false, "@docker": false, "/run/user/{uid}/bus": false} {
+		if RootSocket(pat) != want {
+			t.Errorf("RootSocket(%s) = %v", pat, !want)
+		}
+	}
+	if got, enf := (&Effective{Layers: []Layer{{Profile: cp}}}).UnixAllow(1000); !enf || got[0] != "/run/user/1000/ssh-agent.sock" {
+		t.Errorf("uid substitution: %v %v", got, enf)
+	}
+}
+
+func TestUnixAllowIntersection(t *testing.T) {
+	mk := func(name, mode, allow string) *CompiledProfile {
+		p, err := Parse([]byte("kind: AgentProfile\nmetadata: { name: " + name + " }\nspec:\n  mode: " + mode +
+			"\n  egress: { default: deny }\n  unix: { allow: " + allow + " }\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, diags := Compile(Options{Linux: true}, p)
+		if len(diags) > 0 {
+			t.Fatal(diags)
+		}
+		return c.Profiles[0]
+	}
+	wide := mk("wide", "enforce", `["/tmp/*", "/run/x.sock", "@a"]`)
+	narrow := mk("narrow", "enforce", `["/tmp/ssh-*", "/run/x.sock"]`)
+	audit := mk("aud", "audit", `[]`)
+	got, enf := (&Effective{Layers: []Layer{{Profile: wide}, {Profile: narrow}, {Profile: audit}}}).UnixAllow(0)
+	if !enf || strings.Join(got, ",") != "/tmp/ssh-*,/run/x.sock" {
+		t.Errorf("intersection: %v %v", got, enf)
+	}
+	if got, _ := (&Effective{Layers: []Layer{{Profile: wide}, {Profile: RevokedProfile()}}}).UnixAllow(0); len(got) != 0 {
+		t.Errorf("after revoke: %v", got)
+	}
+	if _, enf := (&Effective{Layers: []Layer{{Profile: audit}}}).UnixAllow(0); enf {
+		t.Error("an audit-only run enforces unix")
+	}
+}
+
+func TestCeilingRootSockets(t *testing.T) {
+	p, _ := Parse([]byte("kind: AgentProfile\nmetadata: { name: d }\nspec:\n  mode: enforce\n  egress: { default: deny }\n  unix: { allow: [\"/var/run/docker.sock\"] }\n"))
+	ceiling := func(allowRoot bool) *ProfileCeiling {
+		return &ProfileCeiling{Kind: "ProfileCeiling", Metadata: Metadata{Name: "c"},
+			Spec: CeilingSpec{AppliesTo: AppliesTo{Any: true}, Allow: []string{"d"}, AllowRootSockets: allowRoot}}
+	}
+	none := func(string) (int, error) { return 0, nil }
+	if _, diags := NewSet(Options{Linux: true}, []*AgentProfile{p}, []*ProfileCeiling{ceiling(false)}, none, none); len(diags) == 0 ||
+		!strings.Contains(diags[0].Msg, "gives root") {
+		t.Errorf("Docker socket granted without allowRootSockets: %v", diags)
+	}
+	if _, diags := NewSet(Options{Linux: true}, []*AgentProfile{p}, []*ProfileCeiling{ceiling(true)}, none, none); len(diags) != 0 {
+		t.Errorf("with allowRootSockets: %v", diags)
+	}
+}

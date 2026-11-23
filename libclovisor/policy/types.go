@@ -40,6 +40,7 @@ type Spec struct {
 	Egress  Egress        `yaml:"egress" json:"egress"`
 	Exec    *Exec         `yaml:"exec,omitempty" json:"exec,omitempty"`
 	MCP     *MCP          `yaml:"mcp,omitempty" json:"mcp,omitempty"`
+	Unix    *Unix         `yaml:"unix,omitempty" json:"unix,omitempty"`
 	Content []ContentRule `yaml:"content,omitempty" json:"content,omitempty"`
 	Limits  *Limits       `yaml:"limits,omitempty" json:"limits,omitempty"`
 }
@@ -116,6 +117,18 @@ type ExecAllow struct {
 	Path string `yaml:"path" json:"path"`
 	Hash string `yaml:"hash,omitempty" json:"hash,omitempty"`
 	Note string `yaml:"note,omitempty" json:"note,omitempty"`
+}
+
+// Unix is the unix block (milestone 4.2): the Unix sockets outside the run
+// that the run may connect or send to. A run always reaches sockets it
+// created itself, and the node agent's run API; everything else is
+// refused under transparent enforce, where BPF LSM is active.
+//
+// Each entry is an absolute path, or an abstract name written @name. A
+// trailing * matches any rest; {uid} stands for the run's uid. The path is
+// the address the listening socket was bound to.
+type Unix struct {
+	Allow []string `yaml:"allow" json:"allow"`
 }
 
 // MCP is the mcp block (design §8.5).

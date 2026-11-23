@@ -90,6 +90,8 @@ type Draft struct {
 	dnsBlocked map[string]bool // names the node's resolver refused
 	mismatch   map[string]int  // host -> connections to an address it does not resolve to
 	byAddress  []string        // refused tunnels to an address the run had looked up by name
+
+	unixSeen map[string]map[string]bool // unix.allow entry -> runs (milestone 4.2)
 }
 
 // LearnProfile drafts an AgentProfile that would allow exactly the
@@ -111,6 +113,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		udpNames:   map[destKey][]string{},
 		dnsBlocked: map[string]bool{},
 		mismatch:   map[string]int{},
+		unixSeen:   map[string]map[string]bool{},
 	}
 	d.Profile.Kind = "AgentProfile"
 	d.Profile.Metadata.Name = name
@@ -135,6 +138,18 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		}
 		for _, n := range tl.Summary.DNSBlocked {
 			d.dnsBlocked[n] = true
+		}
+		for _, u := range tl.Summary.Unix {
+			// The run's own uid becomes {uid}, so one entry serves every
+			// user's socket (/run/user/1000/bus -> /run/user/{uid}/bus).
+			pat := u.Path
+			if tl.UID != nil {
+				pat = strings.ReplaceAll(pat, "/"+strconv.Itoa(*tl.UID)+"/", "/{uid}/")
+			}
+			if d.unixSeen[pat] == nil {
+				d.unixSeen[pat] = map[string]bool{}
+			}
+			d.unixSeen[pat][tl.RunID] = true
 		}
 		ipName := map[string]string{}
 		for _, e := range tl.Events {
@@ -574,6 +589,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		}
 	}
 	d.writeMCP(p, total)
+	d.writeUnix(p, total)
 
 	_, err := io.WriteString(w, b.String())
 	return err
@@ -644,4 +660,47 @@ func setOf(ss []string) map[string]bool {
 		m[s] = true
 	}
 	return m
+}
+
+// writeUnix drafts the unix block: every Unix socket outside the run that
+// the runs used. Root-equivalent ones are left commented out, since a
+// ceiling must permit them.
+func (d *Draft) writeUnix(p func(string, ...interface{}), total int) {
+	if len(d.unixSeen) == 0 {
+		return
+	}
+	pats := make([]string, 0, len(d.unixSeen))
+	for k := range d.unixSeen {
+		pats = append(pats, k)
+	}
+	sort.Strings(pats)
+	if len(pats) > 8 {
+		p("")
+		p("  # More than 8 Unix sockets were used; a profile allows at most 8 entries.")
+		p("  # Merge some into prefixes (a trailing *).")
+	}
+	p("")
+	p("  # Unix sockets outside the run that the run used. Transparent enforce refuses")
+	p("  # all others where BPF LSM is active; the run's own sockets always work.")
+	p("  unix:")
+	p("    allow:")
+	for _, pat := range pats {
+		note := strings.TrimPrefix(runsNote(d.unixSeen[pat], total), ", ")
+		if policy.RootSocket(pat) {
+			p("      # - %s  # gives root: needs allowRootSockets in the ceiling", q(pat))
+			continue
+		}
+		if b := policy.UnixBypass(pat); strings.Contains(b, "bypassing") {
+			p("      # - %s  # %s", q(pat), commentSafe(b))
+			continue
+		}
+		if b := policy.UnixBypass(pat); b != "" {
+			p("      # %s:", commentSafe(b))
+		}
+		if note != "" {
+			p("      - %s  # %s", q(pat), note)
+		} else {
+			p("      - %s", q(pat))
+		}
+	}
 }

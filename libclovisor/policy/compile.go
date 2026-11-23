@@ -116,6 +116,8 @@ type CompiledProfile struct {
 
 	exec *compiledExec
 	mcp  *MCP
+	// UnixAllow is the unix block's patterns, validated.
+	UnixAllow []string
 }
 
 // DestPosture is the TLS posture derived for one destination. Posture is
@@ -252,6 +254,7 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 	c.egress(p, cp)
 	c.exec(p, cp)
 	c.mcp(p, cp)
+	c.unix(p, cp)
 	if len(p.Spec.Content) > 0 {
 		c.unsupported("spec.content", "content")
 	}
@@ -695,4 +698,101 @@ func overlaps(a, b string) bool {
 		return pa.match(pb.exact)
 	}
 	return false
+}
+
+// maxUnixPatterns matches MAX_UNIX_PATTERNS in agent_audit.c; a sun_path
+// holds 108 bytes.
+const (
+	maxUnixPatterns = 8
+	maxUnixPath     = 107
+)
+
+func (c *compiler) unix(p *AgentProfile, cp *CompiledProfile) {
+	u := p.Spec.Unix
+	if u == nil {
+		return
+	}
+	if len(u.Allow) > maxUnixPatterns {
+		c.errf("unix.allow", "at most %d entries", maxUnixPatterns)
+	}
+	for i, pat := range u.Allow {
+		where := fmt.Sprintf("unix.allow[%d]", i)
+		body := strings.TrimSuffix(pat, "*")
+		switch {
+		case !strings.HasPrefix(pat, "/") && !strings.HasPrefix(pat, "@"):
+			c.errf(where, "%q must be an absolute path or an abstract name (@name)", pat)
+			continue
+		case strings.Contains(body, "*"):
+			c.errf(where, "%q: * is allowed only at the end", pat)
+			continue
+		case len(strings.ReplaceAll(body, "{uid}", "4294967295")) > maxUnixPath:
+			c.errf(where, "%q is longer than a Unix socket address", pat)
+			continue
+		case strings.ContainsAny(strings.ReplaceAll(body, "{uid}", ""), "{}"):
+			c.errf(where, "%q: the only placeholder is {uid}", pat)
+			continue
+		}
+		cp.UnixAllow = append(cp.UnixAllow, pat)
+		pl := Placement{Rule: "unix/" + pat, Tier: "1", EnforcedBy: "BPF LSM (unix_stream_connect, unix_may_send)"}
+		if !c.opts.KernelLSM || (c.opts.Mode != Transparent && c.opts.Mode != TransparentAudit) {
+			pl.EnforcedBy = "not enforced: needs transparent mode with BPF LSM"
+		}
+		if RootSocket(pat) {
+			pl.Notes = append(pl.Notes, "gives root: the ceiling must set allowRootSockets")
+		}
+		if n := UnixBypass(pat); n != "" {
+			pl.Notes = append(pl.Notes, n)
+		}
+		if strings.HasSuffix(pat, "*") {
+			pl.Notes = append(pl.Notes, "prefix")
+		}
+		cp.Placements = append(cp.Placements, pl)
+	}
+}
+
+// rootSockets are the well-known sockets whose daemons run anything they
+// are asked to as root.
+var rootSockets = []string{
+	"/var/run/docker.sock", "/run/docker.sock",
+	"/run/podman/podman.sock", "/var/run/podman/podman.sock",
+	"/run/user/{uid}/podman/podman.sock", "/run/user/{uid}/docker.sock",
+	"/run/containerd/containerd.sock", "/var/run/containerd/containerd.sock",
+	"/run/crio/crio.sock", "/var/run/crio/crio.sock",
+}
+
+// RootSocket reports whether a unix.allow pattern admits a socket that
+// gives root.
+func RootSocket(pat string) bool {
+	for _, r := range rootSockets {
+		if UnixCovers(pat, r) || UnixCovers(pat, strings.ReplaceAll(r, "{uid}", "0")) {
+			return true
+		}
+	}
+	for _, base := range []string{"docker.sock", "podman.sock", "containerd.sock", "crio.sock"} {
+		if strings.HasSuffix(pat, "/"+base) {
+			return true
+		}
+	}
+	return false
+}
+
+// UnixBypass explains how a unix.allow pattern reaches around other
+// controls, or returns "".
+func UnixBypass(pat string) string {
+	switch {
+	case UnixCovers(pat, "/run/systemd/resolve/io.systemd.Resolve"):
+		return "systemd-resolved resolves any name for the run, bypassing the node's resolver (DNS tunnelling)"
+	case UnixCovers(pat, "/run/dbus/system_bus_socket"), UnixCovers(pat, "/var/run/dbus/system_bus_socket"):
+		return "the system bus reaches system services, systemd-resolved's name resolution among them"
+	}
+	return ""
+}
+
+// UnixCovers reports whether pattern a admits everything pattern (or
+// path) b does.
+func UnixCovers(a, b string) bool {
+	if pa, ok := strings.CutSuffix(a, "*"); ok {
+		return strings.HasPrefix(strings.TrimSuffix(b, "*"), pa)
+	}
+	return a == b
 }

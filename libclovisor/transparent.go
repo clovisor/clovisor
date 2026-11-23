@@ -123,6 +123,8 @@ var connectVerdicts = map[uint32]string{
 	10: "would refuse: UDP",
 	11: "refused: socket",
 	12: "would refuse: socket",
+	13: "refused: unix",
+	14: "would refuse: unix",
 }
 
 // Connect verdicts a timeline treats specially.
