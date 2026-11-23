@@ -81,6 +81,8 @@ place:
 | Change | Where |
 |---|---|
 | Transparent mode tested end to end in a privileged container; kernel floor revised to 5.12; operator guide gains requirements and the test. Phase 3 complete. | [3.7 status](#37-status-2026-11-23), [operator guide](operator-guide.md) |
+| Phase 4 broken into milestones. Found: where glibc resolves through systemd-resolved's Unix socket, forced DNS is bypassed until Unix-socket gating. | [Phase 4 plan](#phase-4-plan-2026-11-23) |
+| 4.0 spikes: global BPF LSM hooks gate exec (trusted path, IMA hash without policy), raw and packet sockets, Unix sockets with the peer's cgroup, and foreign sockets; `lsm_cgroup` works in the kernel but not through cilium/ebpf. Exec gating conflicts with coding agents running what they build. | [4.0 spike results](#40-spike-results-2026-11-23) |
 
 ---
 
@@ -2414,6 +2416,10 @@ Findings:
   Revisit if a validating client appears.
 - The resolver has no cache; the host resolver behind it (systemd-resolved
   here) caches.
+- *Found 2026-11-23:* where `/etc/nsswitch.conf` lists `resolve` before
+  `dns`, glibc resolves through systemd-resolved's Unix socket, bypassing
+  the resolver. Closed by Unix-socket gating in Phase 4
+  ([finding 1](#phase-4-plan-2026-11-23)).
 
 #### 3.3 status (2026-11-22)
 
@@ -2696,6 +2702,109 @@ exec gating, and host daemons acting for a run.
   mode. Phase 3 is Linux with cgroup identity only.
 - **The explicit proxy stays.** Harnesses that honour `HTTPS_PROXY` keep
   connecting to it directly, as an exception, and skip the transparent hop.
+
+### Phase 4 plan (2026-11-23)
+
+Goal, from the table above: on Linux, govern the run's process tree fully.
+That covers which binaries it may exec, every socket family rather than TCP
+and UDP alone, attribution finer than the run, and safe sub-agents. Each
+milestone must be useful if the later ones never ship.
+
+#### Findings that shape the plan
+
+1. **A hole on some distributions.** Where `/etc/nsswitch.conf` puts
+   `resolve` before `dns` (Fedora-style systems), glibc resolves through
+   systemd-resolved's Unix socket `/run/systemd/resolve/io.systemd.Resolve`.
+   systemd-resolved then queries upstream itself. That bypasses forced DNS
+   and its name decisions, so DNS tunnelling reopens there. The operator guide
+   warns of it; Unix-socket gating (4.2) closes it. The development host uses
+   `files dns` and is unaffected.
+2. **BPF LSM is often not enabled.** It is active on the development kernel,
+   with `bpf_d_path` available. Many distributions leave `bpf` out of the
+   default LSM list, so it needs a boot parameter. Without it, exec and
+   socket-family rules stay audit-only, and the receipt says so.
+3. **A read-only-origin test refuses everything on most hosts.** The
+   development root filesystem is read-write. A test that works there is a
+   *trusted path*: the file and every directory above it are owned by root
+   and not writable by group or others. The spike must show the walk up the
+   directory chain fits the verifier.
+4. **Run identity assumes depth.** Phase 3 takes the cgroup one level below
+   `agents/` as the run. Tool-call cgroups and sub-agents nest deeper, so
+   `ext_proc`, the resolver and the recorder must resolve the nearest
+   registered run instead. Built once, for 4.5 and 4.6.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **4.0** | Spikes | Per-cgroup LSM attachment (6.0 and later) against global hooks filtered by cgroup. `bprm_check_security` with `bpf_d_path`, inode and superblock flags, a bounded walk up the directory chain, and IMA hashes when present. For Unix sockets: the path and abstract name at connect, the peer socket's cgroup, and datagram sends. Refusing `sendmsg` on network sockets created outside the run. The cost added to each exec. | Settles what the kernel allows before product code depends on it. |
+| **4.1** | Socket families | `socket_create` refuses raw IP, `AF_PACKET` and families outside an allowlist (IPv4, IPv6, Unix, netlink) for run cgroups. Audit records what enforce would refuse; timelines get events. | Closes raw and packet sockets, and unusual families (vsock, Bluetooth, CAN). |
+| **4.2** | Unix sockets | `socket_connect` and datagram sends on Unix sockets: allowed to sockets the same run created and to the node agent's run API. A new `unix:` block allows paths (globs, abstract names); everything else is refused. Docker and Podman sockets are flagged in the receipt as root-equivalent. Learn drafts the paths seen in audit; check replays them. | Closes host daemons acting for a run: Docker, the SSH agent, D-Bus, systemd-resolved (finding 1). |
+| **4.3** | Foreign sockets | Connects and sends on network sockets created outside the run are refused: inherited sockets, and sockets passed in by another process. The check at run start stays as a first line. | Closes the last way traffic skips the cgroup hooks. |
+| **4.4** | Exec gating | A per-run exec policy in a kernel map: absolute-path allowlist plus the trusted-path test (finding 3), with hash matching through IMA as an opt-in high-assurance mode. Audit records would-deny. A refused exec gets `EPERM`, with the reason in the timeline. The receipt moves exec rules from audit to enforced where BPF LSM is present, and `exec.audit_only` stops being required. | Catches "downloaded a binary and ran it": the supply-chain control of [§7.6](#76-exec-matching-path-hash-or-provenance). |
+| **4.5** | Tool-call cgroups | A run API `call` op and an `agentctl call -- cmd` wrapper put a tool call in `run-<id>/call-<n>`. Events, proxy decisions and DNS are attributed to the call. Nearest-run resolution (finding 4). The MCP gateway's per-server cgroups move onto the same scheme. | Exact attribution for tool calls that shell out ([§5.3](#53-attribution-identity-the-async-problem)). |
+| **4.6** | Sub-agent attenuation | A run may start a nested run, which gets the intersection of its parent's effective policy and what it requested within the ceiling. Clamp and revoke cascade to children. The sub-agent's timeline is its own, linked to its parent. The receipt shows the chain. | Bounds a poisoned agent's sub-agents by the parent's profile ([§7.8](#78-sub-agent-delegation-monotonic-attenuation)). |
+| **4.7** | Per-run kernel policy | With per-run policy maps in place (4.4): UDP exceptions granted per user through the ceiling, not node-wide only. Optionally an ICMP class, so `ping` works where allowed. | Removes the node-wide UDP limitation of 3.3. |
+| **4.8** | Tests and docs | Privileged integration tests: a raw socket refused; `docker.sock` and ssh-agent refused, an allowed Unix path reached; systemd-resolved's socket refused; an inherited socket refused at connect; a binary in `/tmp` refused and a system binary allowed; call attribution; a sub-agent unable to exceed its parent. Operator guide: enabling BPF LSM, the new blocks. | Phase 4 ships. |
+
+Order: 4.0; 4.1 and 4.3 together (the same hooks, small); 4.2; 4.4; 4.5
+before 4.6, which needs nearest-run resolution; then 4.7 and 4.8.
+
+#### 4.0 spike results (2026-11-23)
+
+Kernel 7.0 (aarch64) with BPF LSM active and no IMA policy loaded. Code in
+`spikes/phase4/`, on cilium/ebpf v0.22.
+
+| Question | Result |
+|---|---|
+| Per-cgroup LSM (`lsm_cgroup`) | The kernel supports it. Attached to the agents cgroup it fires for sockets made inside, not outside. **cilium/ebpf cannot load it**, in v0.17 or v0.22: it resolves the hook's BTF id only for global LSM programs. Loaded through libbpf (`bpftool prog loadall`), it works. |
+| Global LSM hooks filtered by cgroup | Work: exec, `socket_create`, `socket_connect`, `socket_sendmsg`, `unix_stream_connect`, `unix_may_send`. The verifier demands two things. Return values must provably lie in [-4095, 0], so a decision is a constant, not a value read back from a map. `bpf_d_path` needs a trusted pointer: `bprm->file` by direct access, not through `BPF_CORE_READ`. |
+| Exec: path | `bpf_d_path` works in `bprm_check_security` and gives the **resolved** path: `/bin/true` runs `/usr/bin/gnutrue`, `/usr/bin/env` runs `/usr/lib/cargo/bin/coreutils/env` (Rust coreutils). Phase 1 records the path as requested. Allowlists must match the resolved path, so learn must record it. |
+| Exec: scripts | The hook runs twice for a script, once for the script file and once for its interpreter (`/usr/bin/dash`, requested as `/bin/sh`), so a script in `/tmp` is gated like a binary. `python3 /tmp/x.py` is not an exec of `x.py` and runs, as [§7.6](#76-exec-matching-path-hash-or-provenance) says. |
+| Exec: trusted path | The walk up the directory chain, crossing mount points through `struct mount`, fits the verifier at a depth of 24. System binaries pass. A copy in `/tmp` fails: user-owned, under the world-writable `/tmp`. In enforce, `/tmp` binaries and scripts got `EPERM` while system binaries ran. |
+| Exec: IMA hash | `bpf_ima_file_hash` in a sleepable hook returns a SHA-256 **without any IMA policy**, so hash mode needs no IMA set-up. It is recomputed on every exec: about 3.5 ms more per exec of the 7.5 MB `python3`. |
+| Exec cost | The path, owner, flag and trusted-path checks showed no cost above the host's noise (bare `/bin/true` varied from 180 to 1,200 µs per exec with no hooks). |
+| Raw and packet sockets | `socket_create` sees and refuses `SOCK_RAW` and `AF_PACKET` (`EPERM`), tested as root inside the run so capabilities did not hide the hook. |
+| Unix sockets | `socket_connect` sees the path or abstract name (`@spike-abstract`). `unix_stream_connect` and `unix_may_send` give the peer socket's cgroup. That told a same-run listener apart from systemd-resolved's varlink socket, D-Bus and `/dev/log`, all in system cgroups. `cgroup/connect_unix` (6.7) sees the same paths without BPF LSM, scoped to the cgroup, but not the peer. |
+| Foreign sockets | `socket_sendmsg` and `socket_connect` see the socket's creating cgroup. A send on a connected socket inherited from outside the run, and a connect on a socket made before joining it, were detected and refused. The run's own sockets were untouched. |
+
+Findings that change the plan:
+
+- **Exec gating meets coding agents head on.** A coding agent builds and runs
+  code: `go test` runs binaries from `/tmp/go-build…`; `cargo run`,
+  `node_modules/.bin` and `~/.nvm` run from the workspace or home. All fail
+  the trusted-path test. For coding-agent profiles the test must be off, or
+  paired with allowed globs for the workspace and build cache, which allows
+  "ran a binary it built". The supply-chain value holds for agents that only
+  run installed tools. 4.4 makes the trusted-path test a per-profile choice,
+  and the receipt states what is left.
+- **Multicall binaries.** Where coreutils is one binary behind many names,
+  allowing `env` by resolved path allows the multicall binary, which acts as
+  any of its tools given another `argv[0]`. The receipt should name it.
+- **Use global LSM hooks with an in-program cgroup check** in production;
+  every task on the node pays a cheap cgroup comparison. `lsm_cgroup` would
+  scope it in the kernel, but needs a loader change or libbpf. Revisit if
+  cilium/ebpf adds it.
+- **Unix gating:** `cgroup/connect_unix` and `sendmsg_unix` decide by path,
+  scoped like `connect4`, on 6.7 without BPF LSM. The LSM peer hooks add the
+  same-run check where BPF LSM is present. Both need cilium/ebpf upgraded
+  past v0.17.
+- **Hash mode** caches per file (inode and change counter) in a map instead
+  of hashing every exec, or hashes only files that fail the trusted-path test.
+
+#### Decisions
+
+- **Without BPF LSM, degrade rather than refuse.** Exec and socket-family
+  rules stay audit-only, labelled as such; transparent enforce keeps working.
+- **Unix sockets are refused by default under enforce,** apart from the run's
+  own sockets and the node agent. Tools that use D-Bus, ssh-agent or Docker
+  break until their paths are allowed, which is why audit comes first.
+- **The Docker socket is root.** A profile may allow it only where the
+  ceiling permits it, and the receipt says so.
+- **Trusted path instead of read-only mounts,** so exec gating works on
+  ordinary hosts.
+- **Hash matching only through IMA, opt-in.** No userspace hash cache, whose
+  modification-time key a run can reset.
 
 ---
 

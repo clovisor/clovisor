@@ -476,6 +476,14 @@ from that server. The resolver:
   `dns_blocked`;
 - answers only runs: anything else gets REFUSED.
 
+**Check `/etc/nsswitch.conf`.** If its `hosts:` line lists `resolve`
+before `dns` (Fedora and others), glibc resolves through systemd-resolved's
+Unix socket instead of sending DNS, and the node's resolver never sees those
+lookups: runs can resolve any name, which reopens DNS tunnelling. Until
+Unix-socket gating (Phase 4), put `dns` before `resolve` on transparent
+nodes, or point `/etc/resolv.conf` at systemd-resolved's stub and drop
+`resolve` from the line.
+
 A `cidr` rule does not make names resolvable, since deciding a name by what
 it resolves to would mean forwarding it first. Give internal hosts `fqdn`
 rules, or have the agent use addresses. DNS over HTTPS and over TLS are
