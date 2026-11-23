@@ -11,6 +11,7 @@
 package clovisor
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -380,15 +381,29 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if err := r.SetUnixNode([]string{opts.SocketPath}); err != nil {
 			fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
 		}
-		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective) {
+		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective, nested bool) error {
+			var errs []error
 			pats, enforce := eff.UnixAllow(uid)
 			if err := r.SetUnixPolicy(runCg, pats, enforce); err != nil {
-				fmt.Fprintf(os.Stderr, "node agent: run cgroup %d: unix policy: %v\n", runCg, err)
+				errs = append(errs, fmt.Errorf("unix policy: %w", err))
 			}
 			if err := r.SetExecPolicy(runCg, eff.ExecLayers()); err != nil {
-				fmt.Fprintf(os.Stderr, "node agent: run cgroup %d: exec policy: %v\n", runCg, err)
+				errs = append(errs, fmt.Errorf("exec policy: %w", err))
 			}
+			// Marked only once its policy is in place: the mark is what
+			// makes the kernel stop using the parent's (milestone 4.6).
+			if nested && len(errs) == 0 {
+				if err := r.SetNestedRun(runCg); err != nil {
+					errs = append(errs, fmt.Errorf("nested run: %w", err))
+				}
+			}
+			err := errors.Join(errs...)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "node agent: run cgroup %d: %v\n", runCg, err)
+			}
+			return err
 		}
+		api.OnNestedEnd = r.ForgetNestedRun
 	}
 	if xp != nil && resolver != nil {
 		xp.Names = resolver.NamesFor
@@ -802,6 +817,7 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		if na.audit != nil && na.audit.reader != nil {
 			na.audit.reader.ForgetUnixPolicy(event.RunCgroupID)
 			na.audit.reader.ForgetExecPolicy(event.RunCgroupID)
+			na.audit.reader.ForgetNestedRun(event.RunCgroupID)
 		}
 		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}

@@ -87,6 +87,7 @@ place:
 | Unix sockets outside the run refused unless `unix.allow` names them; root-equivalent sockets need the ceiling's consent; closes the nss-resolve bypass. | [4.2 status](#42-status-2026-11-23) |
 | Exec gating by resolved path through BPF LSM, with the trusted-path test as a per-profile option (`require_trusted_path`) and `dir/*` entries for build output. | [4.4 status](#44-status-2026-11-23) |
 | Tool calls in cgroups of their own (`agentctl call`), with events, proxy decisions and DNS attributed per call; MCP servers recorded as calls. | [4.5 status](#45-status-2026-11-23) |
+| Sub-agents: a run started inside a run is nested below it, with its parent's layers plus its own, in the proxy, the resolver and the kernel; clamps cascade; each nested run has its own timeline, linked to its parent. | [4.6 status](#46-status-2026-11-23) |
 
 ---
 
@@ -2996,6 +2997,72 @@ host, and a curl to an unlisted one.
 - A call from outside a run was refused.
 - `make integration-transparent` gained a tool-call check (fifteen in all):
   two attributed calls, and the third running in `/call-3`.
+
+#### 4.6 status (2026-11-23)
+
+Implemented:
+
+- **Nested runs.** `agentctl run` from inside a run no longer fails. The run
+  API finds the nearest run from the caller's cgroup, never the request,
+  and creates `run-<parent>/run-<id>` below it.
+  - The caller must be the parent's user.
+  - Runs nest at most 3 deep.
+  - The process attached must already be in the parent, so a nested run
+    only subdivides it.
+- **Attenuation by layering.** The nested run requests a profile against
+  the user's ceiling as any run does. Its effective policy is then
+  `policy.Nested(parent, own)`: every layer of the parent's, then the layers
+  of its own grant the parent lacks. Every decision point already
+  intersects layers (egress, DNS names, `UnixAllow`, exec layers), so an
+  escalating request is not expressible. There is no separate
+  intersection to get wrong.
+- **Nearest-run resolution** ([finding 4](#phase-4-plan-2026-11-23)):
+  - **Userspace.** `ext_proc` and the resolver look a socket's cgroup up
+    in the run API, which registers every cgroup it creates (runs, nested
+    runs, calls) under its nearest run.
+  - **Kernel.** Per-run policy (exec, Unix sockets) is looked up by the
+    deepest ancestor in a new `nested_run` map, else the top-level run. That
+    is three ancestor lookups per hook. The node agent marks a nested run
+    only after its policy is written, and refuses the run if that fails. A
+    mark without a policy would fall back to no policy.
+  - **Recorder.** It routes events from a nested run's cgroups to the nested
+    run's own timeline.
+- **What stays keyed by the top-level run:**
+  - the event budget, which the tree shares, so a sub-agent cannot buy
+    itself more;
+  - the "own socket" tests for Unix and network sockets, which cover the
+    whole tree. Everything in the tree is within the parent's authority.
+- **Exec layers** in the kernel went from 4 to 6, with the policy map no
+  longer preallocated. A nested run that would need more is refused. A clamp
+  that would overflow writes a layer refusing every exec, failing closed
+  instead of dropping a layer.
+- **Cascades.** Clamp and revoke apply to the run and every run nested in it,
+  in the proxy and the kernel. Ending a run ends its nested runs first, each
+  writing its own timeline. From inside a run, clamp and revoke reach only
+  that run's subtree, so a sub-agent cannot revoke its parent.
+- **Timelines and receipt.**
+  - The kernel reports `mkdir` and `rmdir` of nested `run-*` cgroups, so a
+    nested run's timeline starts and ends in order with its events.
+  - A nested timeline has `parent`, and the parent's lists `children`.
+  - The policy record lists the parent's layers first, sourced
+    `run <parent>: ...`.
+  - `agentctl run` prints `profile tp-sub@... within run <parent> (tp@...)`.
+
+Verified on kernel 7.0 in `make integration-transparent`, now sixteen checks.
+A `tp` run started a sub-agent requesting `tp-sub`. That profile allows
+`/secret`, `other.test` and any exec, which `tp` does not, and leaves out
+`/headers`, which `tp` allows. Nested, the sub-agent got:
+
+- `/allowed` 200;
+- `/headers` 403, refused by its own profile;
+- `/secret` 403, by its parent's;
+- `other.test` refused at the resolver;
+- the `/tmp` binary refused in the kernel;
+- its `revoke` of its parent refused;
+- a grandchild nested two deep.
+
+Revoking a parent cascaded to its running sub-agent, whose next CONNECT was
+denied by the `revoked` layer.
 
 #### Decisions
 

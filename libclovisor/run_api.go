@@ -87,6 +87,7 @@ type RunAPIResponse struct {
 	Error    string     `json:"error,omitempty"`
 	RunID    string     `json:"run_id,omitempty"`
 	CallID   string     `json:"call_id,omitempty"` // call
+	Parent   string     `json:"parent,omitempty"`  // create: the run this one is nested in
 	CgroupID uint64     `json:"cgroup_id,omitempty"`
 	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
 	Proxy    string     `json:"proxy,omitempty"`  // create: the node's proxy URL, if any
@@ -116,11 +117,17 @@ type RunRegistry struct {
 	mu    sync.Mutex
 	m     map[string]RunMeta
 	calls map[uint64]string // call cgroup id -> call id
+	// Nested runs (milestone 4.6): their cgroups and their calls' map to
+	// the nested run's cgroup, which kernel events (keyed by the top-level
+	// run) are recorded under instead.
+	nestedCg map[string]uint64
+	nested   map[uint64]uint64
 }
 
 // NewRunRegistry returns an empty registry.
 func NewRunRegistry() *RunRegistry {
-	return &RunRegistry{m: map[string]RunMeta{}, calls: map[uint64]string{}}
+	return &RunRegistry{m: map[string]RunMeta{}, calls: map[uint64]string{},
+		nestedCg: map[string]uint64{}, nested: map[uint64]uint64{}}
 }
 
 // AddCall records a tool call (or MCP server) of a known run.
@@ -131,7 +138,32 @@ func (r *RunRegistry) AddCall(runID string, c CallMeta) {
 		m.Calls = append(append([]CallMeta{}, m.Calls...), c)
 		r.m[runID] = m
 		r.calls[c.CgroupID] = c.ID
+		if ncg := r.nestedCg[runID]; ncg != 0 {
+			r.nested[c.CgroupID] = ncg
+		}
 	}
+}
+
+// PutNested records a nested run, started from inside parent, whose
+// cgroup is cg; the parent's record lists it as a child.
+func (r *RunRegistry) PutNested(m RunMeta, cg uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.m[m.RunID] = m
+	r.nestedCg[m.RunID] = cg
+	r.nested[cg] = cg
+	if p, ok := r.m[m.Parent]; ok {
+		p.Children = append(append([]string{}, p.Children...), m.RunID)
+		r.m[m.Parent] = p
+	}
+}
+
+// NestedRunFor returns the cgroup of the nested run cgroupID is in (the
+// nested run's own cgroup or one of its calls'), or 0.
+func (r *RunRegistry) NestedRunFor(cgroupID uint64) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nested[cgroupID]
 }
 
 // EndCall records how a call ended.
@@ -186,6 +218,11 @@ func (r *RunRegistry) Done(runID string) {
 	defer r.mu.Unlock()
 	for _, c := range r.m[runID].Calls {
 		delete(r.calls, c.CgroupID)
+		delete(r.nested, c.CgroupID)
+	}
+	if cg := r.nestedCg[runID]; cg != 0 {
+		delete(r.nested, cg)
+		delete(r.nestedCg, runID)
 	}
 	delete(r.m, runID)
 }
@@ -209,8 +246,12 @@ type RunAPIServer struct {
 	// Status reports the node's enforcement state (agentctl status).
 	Status func() NodeStatus
 	// OnPolicy, if set, hears a run's effective policy whenever it is
-	// bound or clamped, so kernel state can follow (milestone 4.2).
-	OnPolicy func(runCg uint64, uid int, eff *policy.Effective)
+	// bound or clamped, so kernel state can follow (milestone 4.2). For a
+	// nested run it also marks the cgroup, so the kernel looks its policy
+	// up by it (milestone 4.6); a nested run is refused if that fails.
+	OnPolicy func(runCg uint64, uid int, eff *policy.Effective, nested bool) error
+	// OnNestedEnd, if set, hears that a nested run's cgroup is gone.
+	OnNestedEnd func(runCg uint64)
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.
@@ -229,6 +270,10 @@ type RunAPIServer struct {
 	// how many are open.
 	callSeq   map[string]int
 	liveCalls map[string]int
+	// Nested runs (milestone 4.6): each live nested run's parent, and
+	// each live run's live children.
+	parentOf map[string]string
+	children map[string][]string
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
@@ -354,6 +399,8 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		tokOf:     map[string]string{},
 		callSeq:   map[string]int{},
 		liveCalls: map[string]int{},
+		parentOf:  map[string]string{},
+		children:  map[string][]string{},
 		nextCg:    credentialCgBase,
 		done:      make(chan struct{}),
 	}, nil
@@ -497,6 +544,9 @@ type apiConn struct {
 	cgID     uint64
 	cwd      string
 	attached bool
+	// parent is the run this connection's run is nested in, if any: its
+	// process must come from inside that run.
+	parent string
 
 	// A tool call (op call) instead of a run: the caller is inside the run.
 	callID   string
@@ -603,19 +653,42 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	if len(req.Command) == 0 {
 		return fail("command required")
 	}
-	// A run must not be able to start another run: that would let a
-	// confined process move its children out from under its own policy.
-	// Nested runs belong to sub-agent attenuation (design §7.8). With
-	// credential identity there is no cgroup to check, so a run can start
-	// another run within its user's ceiling, escaping its own clamps; the
-	// receipt says identity is a claim there.
+	// A run started from inside a run is nested in it (design §7.8,
+	// milestone 4.6): its cgroup is below the parent's and its effective
+	// policy is the parent's plus its own, so it can never have more.
+	// With credential identity there is no cgroup to check, so a run can
+	// start another run within its user's ceiling, escaping its own
+	// clamps; the receipt says identity is a claim there.
+	var parent string
+	var parentEff *policy.Effective
+	var parentRP *RunPolicy
 	if ac.s.cm != nil {
 		cg, err := procCgroup(int(ac.cred.Pid))
 		if err != nil {
 			return fail("cannot read caller's cgroup: %v", err)
 		}
 		if ac.s.inAgents(cg) {
-			return fail("caller is inside a run (%s); runs cannot create runs", cg)
+			parent = ac.s.runOfCgroupPath(cg)
+			if parent == "" {
+				return fail("caller is inside the agents cgroup but not in a run (%s)", cg)
+			}
+			if d := ac.s.runDepth(cg) + 1; d > maxNest {
+				return fail("a run in run %s would be nested %d deep; runs nest at most %d deep", parent, d, maxNest)
+			}
+			ac.s.mu.Lock()
+			live := ac.s.active[parent]
+			if b := ac.s.bound[parent]; b != nil {
+				parentEff = b.eff
+			}
+			ac.s.mu.Unlock()
+			pm, ok := ac.s.reg.Get(parent)
+			switch {
+			case !live || !ok:
+				return fail("run %s is not live", parent)
+			case pm.UID != int(ac.cred.Uid):
+				return fail("run %s belongs to another user", parent)
+			}
+			parentRP = pm.Policy
 		}
 	}
 
@@ -637,6 +710,17 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	} else if req.Profile != "" {
 		return fail("the node agent has no policy loaded, so it cannot grant profile %q", req.Profile)
 	}
+	var eff *policy.Effective
+	if binding != nil {
+		eff = binding.Effective
+	}
+	if parent != "" {
+		eff = policy.Nested(parentEff, eff)
+		if eff != nil && len(eff.ExecLayers()) > maxKernelExecLayers {
+			return fail("run %s and the profile requested have %d exec layers between them; the kernel holds %d",
+				parent, len(eff.ExecLayers()), maxKernelExecLayers)
+		}
+	}
 
 	runID, err := NewRunID()
 	if err != nil {
@@ -645,9 +729,14 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	ac.s.mu.Lock()
 	var path, token string
 	var id uint64
-	if ac.s.cm != nil {
+	switch {
+	case parent != "" && !ac.s.active[parent]:
+		err = fmt.Errorf("run %s ended", parent) // while this one was being bound
+	case parent != "":
+		path, id, err = ac.s.cm.CreateNestedRunCgroup(parent, runID)
+	case ac.s.cm != nil:
 		path, id, err = ac.s.cm.CreateRunCgroup(runID)
-	} else {
+	default:
 		ac.s.nextCg++
 		id = ac.s.nextCg
 		var t [16]byte
@@ -661,39 +750,61 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		ac.s.active[runID] = true
 		ac.s.runByCg[id] = runID
 		ac.s.runCg[runID] = id
-		if binding != nil {
-			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: binding.Effective}
+		if eff != nil {
+			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: eff}
 			ac.s.bound[runID] = b
 			ac.s.byCg[id] = b
+		}
+		if parent != "" {
+			ac.s.parentOf[runID] = parent
+			ac.s.children[parent] = append(ac.s.children[parent], runID)
 		}
 	}
 	ac.s.mu.Unlock()
 	if err != nil {
 		return fail("%v", err)
 	}
-	if binding != nil && ac.s.OnPolicy != nil {
-		ac.s.OnPolicy(id, int(ac.cred.Uid), binding.Effective)
+	ac.runID, ac.runPath, ac.cgID, ac.cwd, ac.parent = runID, path, id, req.Cwd, parent
+	if eff != nil && ac.s.OnPolicy != nil {
+		if err := ac.s.OnPolicy(id, int(ac.cred.Uid), eff, parent != ""); err != nil && parent != "" {
+			// The kernel would look the nested run's policy up by its
+			// parent's: refuse rather than run it with more.
+			ac.finish(nil)
+			return fail("cannot give nested run its kernel policy: %v", err)
+		}
 	}
-	ac.runID, ac.runPath, ac.cgID, ac.cwd = runID, path, id, req.Cwd
 	rp := runPolicyRecord(binding)
-	ac.s.reg.Put(RunMeta{
+	if parent != "" {
+		rp = nestedPolicyRecord(parent, parentRP, binding, eff)
+	}
+	meta := RunMeta{
 		RunID:     runID,
 		Command:   req.Command,
 		Cwd:       req.Cwd,
 		UID:       int(ac.cred.Uid),
 		StartedAt: time.Now().UTC(),
 		Policy:    rp,
-	})
+		Parent:    parent,
+	}
+	if parent != "" {
+		ac.s.reg.PutNested(meta, id)
+	} else {
+		ac.s.reg.Put(meta)
+	}
 	if ac.s.cm == nil {
 		ac.s.emit(EventRunStart, runID, id)
 	}
 	granted := "unprofiled"
-	if rp != nil {
-		granted = rp.Layers[0].Profile + "@" + rp.Layers[0].Version + " (" + rp.Reason + ")"
+	if binding != nil {
+		g := binding.Effective.Layers[0]
+		granted = g.Profile.Name + "@" + g.Profile.Profile.ShortVersion() + " (" + binding.Reason + ")"
+	}
+	if parent != "" {
+		granted += ", nested in run " + parent
 	}
 	log.Printf("run api: run %s created for uid %d pid %d: %s", runID, ac.cred.Uid, ac.cred.Pid, granted)
 	resp := RunAPIResponse{OK: true, RunID: runID, CgroupID: id, Policy: rp, Proxy: ac.s.ProxyURL,
-		TrustBundle: ac.s.TrustBundle, NodeCACert: ac.s.NodeCACert, Identity: "cgroup"}
+		TrustBundle: ac.s.TrustBundle, NodeCACert: ac.s.NodeCACert, Identity: "cgroup", Parent: parent}
 	if ac.s.cm == nil {
 		resp.CgroupID, resp.Identity = 0, "credential"
 		if u, err := url.Parse(ac.s.ProxyURL); err == nil && ac.s.ProxyURL != "" {
@@ -724,6 +835,38 @@ func layerRecord(l policy.Layer, at time.Time) PolicyLayer {
 		Source:  l.Source,
 		At:      at,
 	}
+}
+
+// nestedPolicyRecord is a nested run's record: its parent's layers as
+// they stand, marked inherited, then the layers of its own binding that
+// the parent did not already have. The chain of runs is the receipt.
+func nestedPolicyRecord(parent string, prp *RunPolicy, b *policy.Binding, eff *policy.Effective) *RunPolicy {
+	if eff == nil {
+		return nil
+	}
+	rp := &RunPolicy{Parent: parent}
+	if b != nil {
+		rp.Requested, rp.Ceiling, rp.Reason = b.Requested, b.Ceiling, b.Reason
+	} else {
+		rp.Reason = "no ceiling covers the caller; bound by its parent only"
+	}
+	n := 0
+	if prp != nil {
+		for _, l := range prp.Layers {
+			l.Source = "run " + parent + ": " + l.Source
+			rp.Layers = append(rp.Layers, l)
+		}
+		n = len(prp.Layers)
+	}
+	now := time.Now().UTC()
+	// eff's layers past the parent's are this run's own.
+	if n > len(eff.Layers) {
+		n = len(eff.Layers)
+	}
+	for _, l := range eff.Layers[n:] {
+		rp.Layers = append(rp.Layers, layerRecord(l, now))
+	}
+	return rp
 }
 
 func runPolicyRecord(b *policy.Binding) *RunPolicy {
@@ -845,37 +988,82 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 		layer = policy.Layer{Profile: cp, Source: "clamped by " + who}
 	}
 
+	// From inside a run, only that run and the runs nested in it: a
+	// sub-agent must not be able to revoke its parent or its siblings.
+	var within string
+	if ac.s.cm != nil {
+		if cg, err := procCgroup(int(ac.cred.Pid)); err != nil {
+			return fail("cannot read caller's cgroup: %v", err)
+		} else if ac.s.inAgents(cg) {
+			if within = ac.s.runOfCgroupPath(cg); within == "" {
+				return fail("caller is inside the agents cgroup but not in a run")
+			}
+		}
+	}
+
+	type update struct {
+		b   *boundRun
+		eff *policy.Effective
+	}
+	var updates []update
 	ac.s.mu.Lock()
 	b, ok := ac.s.bound[runID]
 	if ok && ac.cred.Uid != 0 && int(ac.cred.Uid) != b.uid {
 		ac.s.mu.Unlock()
 		return fail("run %s belongs to another user", runID)
 	}
-	var eff *policy.Effective
+	if ok && within != "" && within != runID && !contains(ac.s.descendants(within), runID) {
+		ac.s.mu.Unlock()
+		return fail("from inside run %s, only it and the runs nested in it can be clamped", within)
+	}
+	var kids []string
 	if ok {
-		b.eff = b.eff.With(layer)
-		eff = b.eff
+		// The clamp cascades: a nested run's policy is its parent's and
+		// more, so it must stay at most its parent's (§7.8).
+		kids = ac.s.descendants(runID)
+		for _, r := range append([]string{runID}, kids...) {
+			if bb := ac.s.bound[r]; bb != nil {
+				bb.eff = bb.eff.With(layer)
+				updates = append(updates, update{bb, bb.eff})
+			}
+		}
 	}
 	ac.s.mu.Unlock()
-	if ok && ac.s.OnPolicy != nil {
-		ac.s.OnPolicy(b.cgroupID, b.uid, eff)
-	}
 	if !ok {
 		return fail("no live profiled run %s", runID)
+	}
+	if ac.s.OnPolicy != nil {
+		for _, u := range updates {
+			if err := ac.s.OnPolicy(u.b.cgroupID, u.b.uid, u.eff, ac.s.isNested(u.b.runID)); err != nil {
+				log.Printf("run api: run %s: kernel policy after %s: %v", u.b.runID, layer.Source, err)
+			}
+		}
 	}
 
 	at := time.Now().UTC()
 	var rp *RunPolicy
-	ac.s.reg.Update(runID, func(m *RunMeta) {
-		if m.Policy != nil {
-			// Copy on write: the recorder may hold the old record.
-			np := *m.Policy
-			np.Layers = append(append([]PolicyLayer{}, m.Policy.Layers...), layerRecord(layer, at))
-			m.Policy = &np
-			rp = &np
+	for _, r := range append([]string{runID}, kids...) {
+		lr := layerRecord(layer, at)
+		if r != runID {
+			lr.Source = "run " + runID + ": " + lr.Source
 		}
-	})
-	log.Printf("run api: run %s: %s %s", runID, layer.Source, layer.Profile.Name)
+		ac.s.reg.Update(r, func(m *RunMeta) {
+			if m.Policy != nil {
+				// Copy on write: the recorder may hold the old record.
+				np := *m.Policy
+				np.Layers = append(append([]PolicyLayer{}, m.Policy.Layers...), lr)
+				m.Policy = &np
+				if r == runID {
+					rp = &np
+				}
+			}
+		})
+	}
+	if len(kids) > 0 {
+		log.Printf("run api: run %s: %s %s, and its nested runs %s", runID, layer.Source, layer.Profile.Name, strings.Join(kids, ", "))
+	} else {
+		log.Printf("run api: run %s: %s %s", runID, layer.Source, layer.Profile.Name)
+	}
 	return RunAPIResponse{OK: true, RunID: runID, Policy: rp}
 }
 
@@ -909,49 +1097,114 @@ func (ac *apiConn) abandon() {
 	ac.finish(nil)
 }
 
-// finish records how the run ended, then kills what is left and removes
-// the cgroup. The metadata must be in place before the rmdir, which is
-// what makes the recorder write the timeline.
+// finish ends this connection's run.
 func (ac *apiConn) finish(exitCode *int) {
+	ac.s.endRun(ac.runID, exitCode)
+	ac.runID = ""
+}
+
+// endRun records how a run ended, then kills what is left and removes the
+// cgroup. The metadata must be in place before the rmdir, which is what
+// makes the recorder write the timeline. A run's live nested runs end
+// first, each with its own timeline. Ending a run that is not live does
+// nothing: a nested run ended with its parent is ended again when its own
+// client goes away.
+func (s *RunAPIServer) endRun(runID string, exitCode *int) {
+	s.mu.Lock()
+	if !s.active[runID] {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.active, runID) // from here on, this call owns the ending
+	kids := append([]string{}, s.children[runID]...)
+	cgID := s.runCg[runID]
+	s.mu.Unlock()
+	for _, k := range kids {
+		s.endRun(k, nil)
+	}
+
 	end := time.Now().UTC()
-	ac.s.reg.Update(ac.runID, func(m *RunMeta) {
+	s.reg.Update(runID, func(m *RunMeta) {
 		m.EndedAt = &end
 		m.ExitCode = exitCode
 	})
-	if ac.s.MCP != nil {
-		ac.s.MCP.EndRun(ac.runID)
+	if s.MCP != nil {
+		s.MCP.EndRun(runID)
 	}
-	if ac.s.cm != nil {
-		if err := ac.s.cm.DestroyRunCgroup(ac.runID); err != nil {
-			log.Printf("run api: run %s: %v", ac.runID, err)
+	if s.cm != nil {
+		if err := s.cm.DestroyRunCgroup(runID); err != nil {
+			log.Printf("run api: run %s: %v", runID, err)
 		}
 	} else {
 		// No rmdir will report the end: the metadata is in place, so
 		// the recorder can finish the timeline.
-		ac.s.emit(EventRunEnd, ac.runID, ac.cgID)
+		s.emit(EventRunEnd, runID, cgID)
 	}
-	ac.s.mu.Lock()
-	if t := ac.s.tokOf[ac.runID]; t != "" {
-		delete(ac.s.tokens, t)
-		delete(ac.s.tokOf, ac.runID)
+	s.mu.Lock()
+	if t := s.tokOf[runID]; t != "" {
+		delete(s.tokens, t)
+		delete(s.tokOf, runID)
 	}
-	delete(ac.s.active, ac.runID)
-	if b, ok := ac.s.bound[ac.runID]; ok {
-		for cg, bb := range ac.s.byCg {
+	if b, ok := s.bound[runID]; ok {
+		for cg, bb := range s.byCg {
 			if bb == b {
-				delete(ac.s.byCg, cg)
+				delete(s.byCg, cg)
 			}
 		}
-		delete(ac.s.bound, ac.runID)
+		delete(s.bound, runID)
 	}
-	for cg, r := range ac.s.runByCg {
-		if r == ac.runID {
-			delete(ac.s.runByCg, cg)
+	for cg, r := range s.runByCg {
+		if r == runID {
+			delete(s.runByCg, cg)
 		}
 	}
-	delete(ac.s.runCg, ac.runID)
-	ac.s.mu.Unlock()
-	ac.runID = ""
+	delete(s.runCg, runID)
+	delete(s.callSeq, runID)
+	delete(s.liveCalls, runID)
+	delete(s.children, runID)
+	nested := false
+	if p, ok := s.parentOf[runID]; ok {
+		nested = true
+		delete(s.parentOf, runID)
+		kids := s.children[p]
+		for i, k := range kids {
+			if k == runID {
+				s.children[p] = append(append([]string{}, kids[:i]...), kids[i+1:]...)
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	if nested && s.OnNestedEnd != nil {
+		s.OnNestedEnd(cgID)
+	}
+}
+
+func (s *RunAPIServer) isNested(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.parentOf[runID]
+	return ok
+}
+
+func contains(list []string, x string) bool {
+	for _, v := range list {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// descendants lists a run's live nested runs, at any depth. Called with
+// s.mu held.
+func (s *RunAPIServer) descendants(runID string) []string {
+	var out []string
+	for _, k := range s.children[runID] {
+		out = append(out, k)
+		out = append(out, s.descendants(k)...)
+	}
+	return out
 }
 
 // RunAPIClient is the client side of the run API.
@@ -1157,19 +1410,47 @@ func (ac *apiConn) callEnd(exitCode *int) RunAPIResponse {
 	return RunAPIResponse{OK: true, RunID: ac.callRun, CallID: ac.callID}
 }
 
-// runOfCgroupPath returns the live run a cgroup path (relative to the
-// cgroup root) is in, or "".
+// Nesting limits (milestone 4.6): how deep runs nest below a top-level
+// run (MAX_NEST in agent_audit.c), and the exec layers the kernel holds
+// for a run (MAX_EXEC_LAYERS).
+const (
+	maxNest             = 3
+	maxKernelExecLayers = 6
+)
+
+// runOfCgroupPath returns the nearest run a cgroup path (relative to the
+// cgroup root) is in: the deepest run-<id> along it, so a nested run's
+// processes and calls are its own, not its parent's. "" outside a run.
 func (s *RunAPIServer) runOfCgroupPath(cg string) string {
 	if !s.inAgents(cg) {
 		return ""
 	}
 	rest := strings.TrimPrefix(strings.TrimPrefix(cg, s.agentsRel), "/")
-	first, _, _ := strings.Cut(rest, "/")
-	runID, ok := strings.CutPrefix(first, RunPrefix)
-	if !ok {
-		return ""
+	runID := ""
+	for i, part := range strings.Split(rest, "/") {
+		id, ok := strings.CutPrefix(part, RunPrefix)
+		if !ok {
+			if i == 0 {
+				return "" // not in a run
+			}
+			continue
+		}
+		runID = id
 	}
 	return runID
+}
+
+// runDepth counts the runs a cgroup path is nested in below its
+// top-level run: 0 for a top-level run or its calls.
+func (s *RunAPIServer) runDepth(cg string) int {
+	rest := strings.TrimPrefix(strings.TrimPrefix(cg, s.agentsRel), "/")
+	n := 0
+	for _, part := range strings.Split(rest, "/") {
+		if strings.HasPrefix(part, RunPrefix) {
+			n++
+		}
+	}
+	return max(n-1, 0)
 }
 
 // Call opens a tool call in the caller's run; Attach then moves the

@@ -268,6 +268,40 @@ from inside a run, and only subdivides it. Calls end with their command, and
 anything left in their cgroup is killed. MCP servers started by the gateway
 are listed among the calls as `mcp-<name>`.
 
+**Sub-agents** (cgroup identity). `agentctl run` from inside a run starts a
+nested run in `run-<parent>/run-<id>`:
+
+```sh
+agentctl run --profile research -- ./subagent.sh   # inside a run
+```
+
+The profile is requested and granted as for any run, against the user's
+ceiling. The nested run's policy is then its parent's layers plus its own, so
+it can never be allowed what its parent is not. That holds for egress, DNS,
+Unix sockets and exec. The receipt and the timeline list the parent's layers
+first, each source marked `run <parent>:`. A clamp or revoke of a run also
+applies to every run nested in it, and a run that ends ends its nested runs
+first.
+
+Each nested run has a timeline of its own, with `parent` set. The parent's
+timeline lists its `children`. Rules:
+
+- The nested run's process must come from inside the parent.
+- A nested run must belong to the same user as its parent.
+- Runs nest at most 3 deep.
+- From inside a run, `agentctl clamp` and `revoke` reach only that run and the
+  runs nested in it.
+
+The whole tree shares the top-level run's event budget, so lost and
+suppressed counts appear on the top-level run's timeline. Two things are
+shared across the tree:
+
+- **Unix sockets** bound anywhere in the tree count as the run's own.
+- **Network sockets**: one a parent hands to a nested run after it starts
+  keeps the parent's identity at the proxy, which the parent could use
+  directly anyway. One the nested run's first process already holds is
+  refused at start, as for any run.
+
 Tested clients: curl, Python requests and urllib (3.11+), and git (smart and
 dumb HTTP; git authenticates to the proxy after a `407` challenge). Node's
 built-in `fetch` does not read proxy variables by default. Configure the

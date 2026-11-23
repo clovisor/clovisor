@@ -36,6 +36,10 @@ type RunTimeline struct {
 	EndedAt    *time.Time `json:"ended_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	Policy     *RunPolicy `json:"policy,omitempty"`
+	// Parent is the run this one was nested in (milestone 4.6), whose
+	// timeline is separate; Children are the runs nested in this one.
+	Parent   string   `json:"parent,omitempty"`
+	Children []string `json:"children,omitempty"`
 
 	// Complete is true only if the node agent saw the run from cgroup
 	// creation to removal without interruption. Otherwise events may be
@@ -358,27 +362,49 @@ func NewCredentialRunRecorder(outDir string, meta *RunRegistry) (*RunRecorder, e
 // findRunCgroupPath returns the cgroup-root-relative path of the run
 // cgroup under agentsDir with the given id, or "".
 func findRunCgroupPath(agentsDir string, id uint64) string {
-	entries, err := os.ReadDir(agentsDir)
+	return findRunCgroupIn(agentsDir, id, 0)
+}
+
+// findRunCgroupIn looks at dir's child cgroups, then inside those named
+// run-<id> for nested runs (milestone 4.6).
+func findRunCgroupIn(dir string, id uint64, depth int) string {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return ""
 	}
+	var runs []string
 	for _, e := range entries {
-		p := filepath.Join(agentsDir, e.Name())
-		if e.IsDir() {
-			if got, err := GetCgroupID(p); err == nil && got == id {
-				rel, _ := filepath.Rel(CgroupV2Root, p)
-				return "/" + rel
-			}
+		p := filepath.Join(dir, e.Name())
+		if !e.IsDir() || (depth > 0 && !strings.HasPrefix(e.Name(), RunPrefix)) {
+			continue
+		}
+		if got, err := GetCgroupID(p); err == nil && got == id {
+			rel, _ := filepath.Rel(CgroupV2Root, p)
+			return "/" + rel
+		}
+		if strings.HasPrefix(e.Name(), RunPrefix) {
+			runs = append(runs, p)
+		}
+	}
+	if depth >= maxNest {
+		return ""
+	}
+	for _, p := range runs {
+		if got := findRunCgroupIn(p, id, depth+1); got != "" {
+			return got
 		}
 	}
 	return ""
 }
 
-// runIDFor derives the run id from a run cgroup path. Cgroups under agents/
-// that agentctl did not name run-<id> are identified by cgroup id.
+// runIDFor derives the run id from a run cgroup path: agents/run-<id>, or
+// for a nested run (milestone 4.6) .../run-<parent>/run-<id>. Cgroups
+// under agents/ that agentctl did not name run-<id> are identified by
+// cgroup id.
 func (r *RunRecorder) runIDFor(path string, cgroupID uint64) string {
 	if strings.HasPrefix(path, r.agentsRel+"/"+RunPrefix) {
-		if id := strings.TrimPrefix(path, r.agentsRel+"/"+RunPrefix); id != "" && !strings.Contains(id, "/") {
+		if id := strings.TrimPrefix(path[strings.LastIndex(path, "/")+1:], RunPrefix); id != "" &&
+			strings.HasPrefix(path[strings.LastIndex(path, "/")+1:], RunPrefix) {
 			return id
 		}
 	}
@@ -511,6 +537,13 @@ func (st *runState) add(te TimelineEvent, max int) {
 // Handle records ev. When ev ends a run, the run's timeline is written and
 // returned.
 func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
+	// The kernel keys events by the top-level run, whose budget a nested
+	// run shares; a nested run's events belong in its own timeline.
+	if r.Meta != nil && ev.CgroupID != 0 && ev.Type != EventRunStart && ev.Type != EventRunEnd {
+		if n := r.Meta.NestedRunFor(ev.CgroupID); n != 0 {
+			ev.RunCgroupID = n
+		}
+	}
 	switch ev.Type {
 	case EventRunStart:
 		d := ev.Data.(RunData)
@@ -820,6 +853,10 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	}
 	if m.Policy != nil {
 		tl.Policy = m.Policy
+	}
+	tl.Parent = m.Parent
+	if len(m.Children) > 0 {
+		tl.Children = m.Children
 	}
 	if len(m.Calls) > 0 {
 		tl.Calls = make([]CallSummary, 0, len(m.Calls))

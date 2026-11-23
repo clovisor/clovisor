@@ -1,0 +1,17 @@
+# What a sub-agent asks for (milestone 4.6): more than tp in some ways
+# (/secret, other.test, any exec), less in one (/headers). Nested in a tp
+# run it gets only what both allow.
+kind: AgentProfile
+metadata: { name: tp-sub }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-some
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed", "/secret"] }
+        action: allow
+      - { name: other, to: { fqdn: ["other.test"] }, action: allow }
+  exec:
+    default: allow

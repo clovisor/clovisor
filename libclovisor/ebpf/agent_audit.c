@@ -106,6 +106,7 @@
 #define MAX_ARGS_LEN   512  /* power of two: used as a mask */
 #define MAX_CGPATH_LEN 128
 #define MAX_DNS_LEN    1024 /* power of two: used as a mask */
+#define MAX_NEST       3    /* nested runs below a run (milestone 4.6) */
 
 #define ETH_P_IP     0x0800
 #define ETH_P_IPV6   0x86DD
@@ -183,6 +184,7 @@ struct task_struct {
 } __attribute__((preserve_access_index));
 
 struct kernfs_node {
+    const char *name;
     __u64 id;
 } __attribute__((preserve_access_index));
 
@@ -722,8 +724,17 @@ static __always_inline void emit_cgroup(struct cgroup *cgrp, const char *path, _
     struct audit_config *cfg = bpf_map_lookup_elem(&config, &zero);
     if (!cfg || cfg->agents_cgroup_id == 0)
         return;
-    if (BPF_CORE_READ(cgrp, level) != cfg->agents_level + 1)
-        return; /* the node agent checks the path is under agents/ */
+    __u32 level = BPF_CORE_READ(cgrp, level);
+    if (level != cfg->agents_level + 1) {
+        /* A nested run (milestone 4.6), run-<id> below a run, starts and
+         * ends a timeline too; calls and MCP servers do not. */
+        if (level < cfg->agents_level + 2 || level > cfg->agents_level + 1 + MAX_NEST)
+            return;
+        char name[4] = {};
+        bpf_probe_read_kernel(name, sizeof(name), BPF_CORE_READ(cgrp, kn, name));
+        if (name[0] != 'r' || name[1] != 'u' || name[2] != 'n' || name[3] != '-')
+            return;
+    } /* the node agent checks the path is under agents/ */
 
     __u64 id = BPF_CORE_READ(cgrp, kn, id);
     struct cgroup_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -862,6 +873,30 @@ static __always_inline __u64 current_run(struct audit_config *cfg)
     if (bpf_get_current_ancestor_cgroup_id(cfg->agents_level) != cfg->agents_cgroup_id)
         return 0;
     return bpf_get_current_ancestor_cgroup_id(cfg->agents_level + 1);
+}
+
+/* Nested runs (milestone 4.6): a run started from inside a run, in a
+ * cgroup below it, with its own entries in the per-run policy maps.
+ * Written by the node agent before any process enters the cgroup. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, __u8);
+} nested_run SEC(".maps");
+
+/* The nearest run of the current task, for per-run policy: the deepest
+ * nested run it is in, else its run. Events stay keyed by the run, whose
+ * budget the whole tree shares. */
+static __always_inline __u64 policy_run(struct audit_config *cfg, __u64 run)
+{
+#pragma unroll
+    for (int i = MAX_NEST; i >= 1; i--) {
+        __u64 id = bpf_get_current_ancestor_cgroup_id(cfg->agents_level + 1 + i);
+        if (id && bpf_map_lookup_elem(&nested_run, &id))
+            return id;
+    }
+    return run;
 }
 
 static __always_inline int healthy(struct audit_config *cfg)
@@ -1602,7 +1637,7 @@ static __always_inline int foreign_socket(struct socket *sock, __u32 op)
 
 #define EXEC_PATH      256
 #define EXEC_WORDS     32
-#define MAX_EXEC_LAYERS   4
+#define MAX_EXEC_LAYERS   6
 #define MAX_EXEC_PREFIXES 4
 #define TRUST_DEPTH    24
 
@@ -1631,6 +1666,7 @@ struct exec_policy {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, __u64);
     __type(value, struct exec_policy);
 } exec_policy SEC(".maps");
@@ -1761,6 +1797,7 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
     __u64 run = current_run(cfg);
     if (run == 0)
         return 0;
+    run = policy_run(cfg, run);
     struct exec_policy *pol = bpf_map_lookup_elem(&exec_policy, &run);
 
     __u32 zero = 0;
@@ -1858,7 +1895,8 @@ static __always_inline int unix_decide(struct sock *peer, __u32 dgram)
         return 0;
     struct cgroup *pcg = BPF_CORE_READ(peer, sk_cgrp_data.cgroup);
     if (cgroup_ancestor_id(pcg, cfg->agents_level + 1) == run)
-        return 0; /* the run's own socket */
+        return 0; /* the run's own socket: its tree's, nested runs included */
+    run = policy_run(cfg, run);
     struct unix_address *addr = BPF_CORE_READ((struct unix_sock *)peer, addr);
     if (!addr)
         return 0; /* unbound: a socketpair or similar, handed over by its owner */

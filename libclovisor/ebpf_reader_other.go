@@ -40,6 +40,8 @@ func (r *EBPFReader) ForgetUnixPolicy(uint64)                        {}
 func (r *EBPFReader) SetUnixNode([]string) error                     { return nil }
 func (r *EBPFReader) SetExecPolicy(uint64, []policy.ExecLayer) error { return nil }
 func (r *EBPFReader) ForgetExecPolicy(uint64)                        {}
+func (r *EBPFReader) SetNestedRun(uint64) error                      { return nil }
+func (r *EBPFReader) ForgetNestedRun(uint64)                         {}
 
 // BPFLSMActive is false off Linux.
 func BPFLSMActive() bool { return false }

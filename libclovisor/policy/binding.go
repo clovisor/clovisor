@@ -344,6 +344,36 @@ func (e *Effective) With(l Layer) *Effective {
 	return &Effective{Layers: layers}
 }
 
+// Nested is the effective policy of a run started from inside parent
+// (design §7.8, milestone 4.6): every layer of the parent's, then the
+// child's own, so it can only ever allow less than the parent. A child
+// layer the parent already has adds nothing and is left out. parent nil:
+// an unprofiled parent, which bounds nothing.
+func Nested(parent, child *Effective) *Effective {
+	if parent == nil {
+		return child
+	}
+	if child == nil {
+		return parent
+	}
+	layers := append([]Layer{}, parent.Layers...)
+	for _, l := range child.Layers {
+		if !parent.has(l.Profile) {
+			layers = append(layers, l)
+		}
+	}
+	return &Effective{Layers: layers}
+}
+
+func (e *Effective) has(cp *CompiledProfile) bool {
+	for _, l := range e.Layers {
+		if l.Profile == cp {
+			return true
+		}
+	}
+	return false
+}
+
 // EffectiveDecision is a decision across all layers.
 type EffectiveDecision struct {
 	Decision
@@ -456,7 +486,12 @@ func (e *Effective) UnixAllow(uid int) ([]string, bool) {
 // one per layer that has an exec block. Each must allow an exec.
 func (e *Effective) ExecLayers() []ExecLayer {
 	var out []ExecLayer
+	seen := map[*CompiledProfile]bool{}
 	for _, l := range e.Layers {
+		if seen[l.Profile] {
+			continue // the same profile twice decides the same
+		}
+		seen[l.Profile] = true
 		if el, ok := l.Profile.ExecLayer(); ok {
 			out = append(out, el)
 		}

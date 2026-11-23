@@ -235,3 +235,50 @@ func TestCeilingErrors(t *testing.T) {
 		t.Error("misspelt ceiling field accepted")
 	}
 }
+
+// A nested run (design §7.8) gets its parent's layers and its own: it
+// can never allow what its parent does not, whatever it requests.
+func TestNested(t *testing.T) {
+	broad := prof("broad", "enforce", `
+      - { name: any, to: { fqdn: ["*"] }, action: allow }
+`)
+	s := mustSet(t, research, light, broad, baseline,
+		ceilingDoc("c", "{ any: true }", "[research, light, broad]", "light", "baseline"))
+	pb, err := s.Resolve(Caller{UID: 1}, "light")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The child asks for more than its parent has.
+	cb, err := s.Resolve(Caller{UID: 1}, "broad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := Nested(pb.Effective, cb.Effective)
+	// light, baseline, then broad; the child's baseline clamp is the
+	// parent's and is not repeated.
+	var names []string
+	for _, l := range e.Layers {
+		names = append(names, l.Profile.Name)
+	}
+	if strings.Join(names, ",") != "light,baseline,broad" {
+		t.Fatalf("layers: %v", names)
+	}
+	if d := e.Decide(Request{Host: "example.com", Port: 443}); d.Allowed() || d.Layer != "light" {
+		t.Errorf("escalation through a nested run: %+v", d)
+	}
+	if d := e.Decide(Request{Host: "github.com", Port: 443}); !d.Allowed() {
+		t.Errorf("allowed by both: %+v", d)
+	}
+	// A narrower child narrows.
+	rb, _ := s.Resolve(Caller{UID: 1}, "research")
+	e2 := Nested(Nested(pb.Effective, cb.Effective), rb.Effective)
+	if d := e2.Decide(Request{Host: "api.github.com", Port: 443}); d.Allowed() {
+		t.Errorf("light allows only github.com: %+v", d)
+	}
+	if Nested(nil, cb.Effective) != cb.Effective || Nested(pb.Effective, nil) != pb.Effective {
+		t.Error("an unprofiled side should bound nothing")
+	}
+	if len(pb.Effective.Layers) != 2 {
+		t.Error("Nested mutated the parent")
+	}
+}

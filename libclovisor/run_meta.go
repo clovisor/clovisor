@@ -10,6 +10,7 @@ package clovisor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,10 @@ type RunMeta struct {
 	// Calls are the run's tool calls with cgroups of their own (milestone
 	// 4.5), and its MCP servers.
 	Calls []CallMeta `json:"calls,omitempty"`
+	// Parent is the run this one was started from inside, for a nested
+	// run (milestone 4.6); Children are the runs started from inside it.
+	Parent   string   `json:"parent,omitempty"`
+	Children []string `json:"children,omitempty"`
 }
 
 // CallMeta is one tool call in a cgroup of its own below its run
@@ -49,10 +54,25 @@ type CallMeta struct {
 // RunPolicy records which policy governed a run, by version (design
 // §5.6): the granted profile, then any clamps, in the order applied.
 type RunPolicy struct {
+	// Parent is the run a nested run's policy is bounded by (milestone
+	// 4.6); its layers come first, their sources naming the run.
+	Parent    string        `json:"parent,omitempty"`
 	Requested string        `json:"requested,omitempty"`
 	Ceiling   string        `json:"ceiling"`
 	Reason    string        `json:"reason"`
 	Layers    []PolicyLayer `json:"layers"`
+}
+
+// Granted is the layer the run was granted itself: the first, or for a
+// nested run, the first not inherited from its parent. nil if there is
+// none (a nested run bound by its parent's layers only).
+func (rp *RunPolicy) Granted() *PolicyLayer {
+	for i := range rp.Layers {
+		if rp.Parent == "" || !strings.HasPrefix(rp.Layers[i].Source, "run ") {
+			return &rp.Layers[i]
+		}
+	}
+	return nil
 }
 
 // PolicyLayer is one profile in a run's effective policy.

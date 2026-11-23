@@ -137,7 +137,7 @@ func procGroups(pid int) ([]int, error) {
 
 // attach moves the process behind pidfd into the run. The process must be
 // a direct child of the caller, have the caller's real uid, and not
-// already be in a run.
+// already be in a run, or, for a nested run, be in its parent.
 func (ac *apiConn) attach(pidfd int) RunAPIResponse {
 	if ac.runID == "" {
 		return fail("no run: send create first")
@@ -159,8 +159,16 @@ func (ac *apiConn) attach(pidfd int) RunAPIResponse {
 	if uid != int(ac.cred.Uid) {
 		return fail("pid %d does not belong to uid %d", pid, ac.cred.Uid)
 	}
-	if cg, err := procCgroup(pid); err != nil || ac.s.inAgents(cg) {
-		return fail("pid %d is already in a run, or its cgroup is unreadable", pid)
+	cg, err := procCgroup(pid)
+	switch {
+	case err != nil:
+		return fail("pid %d: cannot read its cgroup: %v", pid, err)
+	case ac.parent == "" && ac.s.inAgents(cg):
+		return fail("pid %d is already in a run", pid)
+	case ac.parent != "" && ac.s.runOfCgroupPath(cg) != ac.parent:
+		// A nested run only subdivides its parent: nothing from outside
+		// the parent gets in through it.
+		return fail("pid %d is not in run %s", pid, ac.parent)
 	}
 
 	if err := os.WriteFile(filepath.Join(ac.runPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {

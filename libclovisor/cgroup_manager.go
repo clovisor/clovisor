@@ -119,6 +119,31 @@ func (cm *CgroupManager) CreateRunCgroup(runID string) (string, uint64, error) {
 	return cgroupPath, cgroupID, nil
 }
 
+// CreateNestedRunCgroup creates run-<runID> inside the cgroup of the
+// live run parentID (milestone 4.6): a sub-agent's run, below its parent
+// so that the kernel's hooks for the parent's tree govern it too.
+func (cm *CgroupManager) CreateNestedRunCgroup(parentID, runID string) (string, uint64, error) {
+	cm.mu.Lock()
+	parent, ok := cm.runMap[parentID]
+	cm.mu.Unlock()
+	if !ok {
+		return "", 0, fmt.Errorf("run cgroup not found for %s", parentID)
+	}
+	cgroupPath := filepath.Join(parent, RunPrefix+runID)
+	if err := os.Mkdir(cgroupPath, 0755); err != nil {
+		return "", 0, fmt.Errorf("failed to create cgroup: %w", err)
+	}
+	cgroupID, err := GetCgroupID(cgroupPath)
+	if err != nil {
+		unix.Rmdir(cgroupPath)
+		return "", 0, fmt.Errorf("failed to get cgroup id: %w", err)
+	}
+	cm.mu.Lock()
+	cm.runMap[runID] = cgroupPath
+	cm.mu.Unlock()
+	return cgroupPath, cgroupID, nil
+}
+
 // DestroyRunCgroup ends a run: it kills anything still left in the run
 // cgroup (daemonized children, stragglers), waits for the cgroup to empty,
 // then removes it. cgroupfs only allows rmdir on an empty cgroup; its

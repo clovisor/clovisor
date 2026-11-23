@@ -383,10 +383,15 @@ func TestRunOfCgroupPath(t *testing.T) {
 		"/agents/run-abc":        "abc",
 		"/agents/run-abc/call-3": "abc",
 		"/agents/run-abc/mcp-fs": "abc",
-		"/agents":                "",
-		"/agents/other":          "",
-		"/user.slice/run-abc":    "",
-		"/agentsX/run-abc":       "",
+		// Nested runs (4.6): the nearest run.
+		"/agents/run-abc/run-def":               "def",
+		"/agents/run-abc/run-def/call-2":        "def",
+		"/agents/run-abc/run-def/run-ghi/mcp-x": "ghi",
+		"/agents/run-abc/call-1/run-def":        "def",
+		"/agents":                               "",
+		"/agents/other":                         "",
+		"/user.slice/run-abc":                   "",
+		"/agentsX/run-abc":                      "",
 	} {
 		if got := s.runOfCgroupPath(path); got != want {
 			t.Errorf("%s: %q, want %q", path, got, want)
@@ -428,5 +433,78 @@ func TestRunRecorderCalls(t *testing.T) {
 	r.Meta.Done("abc")
 	if r.Meta.CallFor(callCg) != "" {
 		t.Error("call kept after the run was written")
+	}
+}
+
+func TestRunDepth(t *testing.T) {
+	s := &RunAPIServer{agentsRel: "/agents"}
+	for path, want := range map[string]int{
+		"/agents/run-a":                     0,
+		"/agents/run-a/call-1":              0,
+		"/agents/run-a/run-b":               1,
+		"/agents/run-a/run-b/call-3":        1,
+		"/agents/run-a/run-b/run-c/run-d":   3,
+		"/agents/run-a/run-b/run-c/mcp-git": 2,
+	} {
+		if got := s.runDepth(path); got != want {
+			t.Errorf("%s: %d, want %d", path, got, want)
+		}
+	}
+}
+
+// A nested run's kernel events, keyed by its top-level run, are recorded
+// in its own timeline, linked to its parent's (milestone 4.6).
+func TestRunRecorderNested(t *testing.T) {
+	r := newTestRecorder(t)
+	r.Meta = NewRunRegistry()
+	r.Meta.Put(RunMeta{RunID: "abc", StartedAt: t0, UID: os.Getuid()})
+	const subCg, subCallCg = 888, 889
+	r.Meta.PutNested(RunMeta{RunID: "def", Parent: "abc", StartedAt: t0, UID: os.Getuid(),
+		Policy: &RunPolicy{Parent: "abc", Layers: []PolicyLayer{{Profile: "p", Source: "run abc: granted"}, {Profile: "q", Source: "granted"}}}}, subCg)
+	r.Meta.AddCall("def", CallMeta{ID: "call-1", CgroupID: subCallCg, StartedAt: t0})
+	if r.Meta.NestedRunFor(subCallCg) != subCg || r.Meta.NestedRunFor(testRunCg) != 0 {
+		t.Fatal("nested lookup")
+	}
+	subStart := AuditEvent{Type: EventRunStart, Timestamp: at(1), CgroupID: subCg, RunCgroupID: subCg,
+		Data: RunData{CgroupPath: "/agents/run-abc/run-def"}}
+	subEnd := subStart
+	subEnd.Type, subEnd.Timestamp = EventRunEnd, at(5)
+	var sub, top *RunTimeline
+	for _, ev := range []AuditEvent{
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		execEv(1, testRunCg, 10, 1, "/usr/bin/agent"),
+		subStart,
+		execEv(2, subCg, 20, 10, "/usr/bin/subagent"),
+		execEv(3, subCallCg, 21, 20, "/usr/bin/curl"),
+		subEnd,
+		runEv(EventRunEnd, 6, "/agents/run-abc"),
+	} {
+		tl, err := r.Handle(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case tl == nil:
+		case tl.RunID == "def":
+			sub = tl
+		case tl.RunID == "abc":
+			top = tl
+		}
+	}
+	if sub == nil || top == nil {
+		t.Fatalf("timelines: sub %v top %v", sub, top)
+	}
+	if sub.Parent != "abc" || sub.CgroupID != subCg || sub.Summary.Execs != 2 || len(sub.Calls) != 1 || sub.Calls[0].Events["exec"] != 1 {
+		t.Fatalf("nested timeline: %+v", sub)
+	}
+	if g := sub.Policy.Granted(); g == nil || g.Profile != "q" {
+		t.Fatalf("granted: %+v", g)
+	}
+	if top.Summary.Execs != 1 || len(top.Children) != 1 || top.Children[0] != "def" {
+		t.Fatalf("parent timeline: execs %d children %v", top.Summary.Execs, top.Children)
+	}
+	r.Meta.Done("def")
+	if r.Meta.NestedRunFor(subCallCg) != 0 || r.Meta.NestedRunFor(subCg) != 0 {
+		t.Error("nested run kept after its timeline was written")
 	}
 }

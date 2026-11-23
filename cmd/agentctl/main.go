@@ -308,8 +308,14 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 	} else {
 		fmt.Fprintf(os.Stderr, "agentctl: run %s (cgroup id %d), %s\n", run.RunID, run.CgroupID, describePolicy(run.Policy))
 	}
-	if run.Policy != nil && profile != "" && run.Policy.Layers[0].Profile != profile {
-		fmt.Fprintf(os.Stderr, "agentctl: WARNING: %s\n", run.Policy.Reason)
+	if run.Parent != "" {
+		fmt.Fprintf(os.Stderr, "agentctl: nested in run %s: bounded by its policy, which every layer above includes\n", run.Parent)
+	}
+	if run.Policy != nil && profile != "" {
+		// Nested, a profile the parent already has is no layer of its own.
+		if g := run.Policy.Granted(); (g == nil && !hasLayer(run.Policy, profile)) || (g != nil && g.Profile != profile) {
+			fmt.Fprintf(os.Stderr, "agentctl: WARNING: %s\n", run.Policy.Reason)
+		}
 	}
 
 	env := os.Environ()
@@ -390,22 +396,42 @@ func redactProxy(p string) string {
 }
 
 // describePolicy renders a run's policy layers on one line.
+func hasLayer(rp *clovisor.RunPolicy, profile string) bool {
+	for _, l := range rp.Layers {
+		if l.Profile == profile {
+			return true
+		}
+	}
+	return false
+}
+
 func describePolicy(rp *clovisor.RunPolicy) string {
 	if rp == nil {
 		return "unprofiled (audit only)"
 	}
-	var parts []string
-	for i, l := range rp.Layers {
+	var parts, inherited []string
+	for _, l := range rp.Layers {
 		s := l.Profile + "@" + l.Version
 		if l.Mode == "audit" {
 			s += " (audit)"
 		}
-		if i > 0 {
+		if rp.Parent != "" && strings.HasPrefix(l.Source, "run ") {
+			inherited = append(inherited, s)
+			continue
+		}
+		if len(parts) > 0 {
 			s = l.Source + " " + s
 		}
 		parts = append(parts, s)
 	}
-	return "profile " + strings.Join(parts, " + ")
+	out := "profile " + strings.Join(parts, " + ")
+	if rp.Parent != "" {
+		if len(parts) == 0 {
+			out = "no profile of its own,"
+		}
+		out += fmt.Sprintf(" within run %s (%s)", rp.Parent, strings.Join(inherited, " + "))
+	}
+	return out
 }
 
 // runArgs are agentctl run's options.
@@ -665,11 +691,17 @@ func listRuns(dir string) error {
 			exit = strconv.Itoa(*tl.ExitCode)
 		}
 		prof := "-"
-		if tl.Policy != nil {
+		if tl.Policy != nil && len(tl.Policy.Layers) > 0 {
 			prof = tl.Policy.Layers[0].Profile
+			if g := tl.Policy.Granted(); g != nil {
+				prof = g.Profile
+			}
 			if n := len(tl.Policy.Layers); n > 1 {
 				prof += fmt.Sprintf("+%d", n-1)
 			}
+		}
+		if tl.Parent != "" {
+			prof += " (in " + tl.Parent[:min(8, len(tl.Parent))] + ")"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%t\t%s\t%s\n",
 			tl.RunID, tl.StartedAt.Local().Format(time.DateTime), dur, exit,
@@ -686,6 +718,12 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	}
 	if len(tl.Command) > 0 {
 		fmt.Printf("Command   %s\n", strings.Join(tl.Command, " "))
+	}
+	if tl.Parent != "" {
+		fmt.Printf("Parent    run %s: its policy bounds this one (agentctl show %s)\n", tl.Parent, tl.Parent)
+	}
+	if len(tl.Children) > 0 {
+		fmt.Printf("Nested    %s\n", strings.Join(tl.Children, ", "))
 	}
 	if tl.Policy == nil {
 		fmt.Println("Policy    unprofiled (audit only)")

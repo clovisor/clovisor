@@ -134,11 +134,12 @@ type bpfLSMObjects struct {
 	UnixPolicy    *ebpf.Map     `ebpf:"unix_policy"`
 	UnixNode      *ebpf.Map     `ebpf:"unix_node"`
 	UnixSeen      *ebpf.Map     `ebpf:"unix_seen"`
+	NestedRun     *ebpf.Map     `ebpf:"nested_run"`
 }
 
 func (o *bpfLSMObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.SocketCreate, o.SocketConnect, o.SocketSendmsg,
-		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen} {
+		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen, o.NestedRun} {
 		if c != nil && !reflect.ValueOf(c).IsNil() {
 			c.Close()
 		}
@@ -147,7 +148,7 @@ func (o *bpfLSMObjects) Close() {
 
 // Wire formats of exec_policy and exec_allow (agent_audit.c).
 const (
-	maxExecLayers   = 4
+	maxExecLayers   = maxKernelExecLayers
 	maxExecPrefixes = 4
 	execPathBytes   = 256
 )
@@ -207,10 +208,20 @@ func (r *EBPFReader) SetExecPolicy(runCg uint64, layers []policy.ExecLayer) erro
 	if r.lsm.ExecPolicy == nil {
 		return nil // BPF LSM not in use
 	}
-	if len(layers) > maxExecLayers {
-		return fmt.Errorf("at most %d exec layers, got %d", maxExecLayers, len(layers))
-	}
 	r.ForgetExecPolicy(runCg)
+	if len(layers) > maxExecLayers {
+		// Fail closed: a layer the kernel cannot hold must not be dropped,
+		// so the run gets one that refuses every exec. The run API refuses
+		// nested runs that would get here; only clamps can.
+		err := fmt.Errorf("at most %d exec layers, got %d: every exec is refused", maxExecLayers, len(layers))
+		var p bpfExecPolicy
+		p.N = 1
+		p.L[0] = bpfExecLayer{Enforce: 1}
+		if perr := r.lsm.ExecPolicy.Put(runCg, p); perr != nil {
+			return perr
+		}
+		return err
+	}
 	if len(layers) == 0 {
 		return nil
 	}
@@ -344,6 +355,23 @@ func (r *EBPFReader) SetUnixPolicy(runCg uint64, patterns []string, enforce bool
 func (r *EBPFReader) ForgetUnixPolicy(runCg uint64) {
 	if r.lsm.UnixPolicy != nil {
 		r.lsm.UnixPolicy.Delete(runCg)
+	}
+}
+
+// SetNestedRun marks a nested run's cgroup (milestone 4.6), so the
+// kernel looks up per-run policy by it rather than by its top-level run.
+// Its policy must be written first.
+func (r *EBPFReader) SetNestedRun(cg uint64) error {
+	if r.lsm.NestedRun == nil {
+		return nil
+	}
+	return r.lsm.NestedRun.Put(cg, uint8(1))
+}
+
+// ForgetNestedRun drops a finished nested run's mark.
+func (r *EBPFReader) ForgetNestedRun(cg uint64) {
+	if r.lsm.NestedRun != nil {
+		r.lsm.NestedRun.Delete(cg)
 	}
 }
 

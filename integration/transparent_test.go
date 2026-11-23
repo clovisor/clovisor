@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("unix-sockets", e.testUnixSockets)
 	t.Run("exec", e.testExec)
 	t.Run("tool-calls", e.testToolCalls)
+	t.Run("sub-agents", e.testSubAgents)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -415,6 +417,61 @@ func (e *env) testToolCalls(t *testing.T) {
 	expect(t, out, "fetch 200", "lookup failed", "/call-3")
 	tl := e.timeline(id)
 	expect(t, tl, `"id": "call-1"`, `"name": "fetch"`, `"id": "call-2"`, `"name": "lookup"`, `"call": "call-1"`, `"call": "call-2"`)
+}
+
+// script writes a shell script into the bin directory the containers
+// mount, and returns the command that runs it (see py).
+func (e *env) script(name, src string) string {
+	e.t.Helper()
+	if err := os.WriteFile(filepath.Join(e.dir, "bin", name+".sh"), []byte(src), 0o644); err != nil {
+		e.t.Fatal(err)
+	}
+	return "sh /it/bin/" + name + ".sh"
+}
+
+func (e *env) testSubAgents(t *testing.T) {
+	// A tp run starts a sub-agent asking for tp-sub, which allows more
+	// than tp in places: nested, it gets only what both allow (§7.8).
+	e.needLSM(t)
+	curl := `curl -sS -o /dev/null -w "%s %%{http_code}\n" https://origin.test/%s`
+	sub := e.script("sub", strings.Join([]string{
+		fmt.Sprintf(curl, "sub allowed", "allowed"),
+		fmt.Sprintf(curl, "sub headers", "headers"), // tp-sub does not allow it
+		fmt.Sprintf(curl, "sub secret", "secret"),   // tp does not
+		`getent hosts other.test >/dev/null && echo "sub other: resolved" || echo "sub other: refused"`,
+		`/tmp/t && echo "sub tmp: ran" || echo "sub tmp: refused"`,
+		`P=$(sed -n "s|.*/run-\([0-9a-f]*\)/run-.*|\1|p" /proc/self/cgroup)`,
+		`/it/bin/agentctl revoke $P 2>&1 | grep -q "runs nested in it" && echo "sub revoke parent: refused"`,
+		`/it/bin/agentctl run --profile tp -- cat /proc/self/cgroup`,
+		"",
+	}, "\n"))
+	out, id := e.trun("/it/bin/agentctl run --profile tp-sub -- " + sub + " 2>/tmp/sub.err; cat /tmp/sub.err")
+	expect(t, out, "sub allowed 200", "sub headers 403", "sub secret 403", "sub other: refused", "sub tmp: refused",
+		"sub revoke parent: refused", "nested in run "+id, "/run-"+id+"/run-")
+	tl := e.timeline(id)
+	expect(t, tl, `"children": [`)
+	m := regexp.MustCompile(`agentctl: run ([0-9a-f]+) \(cgroup id \d+\), profile tp-sub@\S+ within run `).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no nested run reported:\n%s", out)
+	}
+	stl := e.timeline(m[1])
+	expect(t, stl, `"parent": "`+id+`"`, `"source": "run `+id+`: granted"`, `"profile": "tp-sub"`, `"verdict": "refused: exec"`)
+
+	// Revoking the parent revokes the sub-agent already running.
+	wait := e.script("wait", `while [ ! -f /tmp/go ]; do sleep 0.1; done
+`+fmt.Sprintf(curl, "after revoke", "allowed")+"\n")
+	out, _ = e.trun(`rm -f /tmp/go
+(/it/bin/agentctl run --profile tp-sub -- ` + wait + ` 2>/dev/null) &
+sleep 1
+P=$(sed -n "s|.*/run-\([0-9a-f]*\)$|\1|p" /proc/self/cgroup)
+/it/bin/agentctl revoke $P >/dev/null && echo revoked
+touch /tmp/go
+wait`)
+	// Refused at the tunnel (the CONNECT, so no HTTP status) or inside it.
+	expect(t, out, "revoked", "after revoke ")
+	if strings.Contains(out, "after revoke 200") {
+		t.Errorf("a revoked parent's sub-agent still reached the origin:\n%s", out)
+	}
 }
 
 func (e *env) testCheckTransparent(t *testing.T) {

@@ -2,5 +2,5 @@ kind: ProfileCeiling
 metadata: { name: everyone }
 spec:
   appliesTo: { any: true }
-  allow: [tp]
+  allow: [tp, tp-sub]
   default: tp
