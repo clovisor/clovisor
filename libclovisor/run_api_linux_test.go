@@ -11,12 +11,14 @@ package clovisor
 
 import (
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
 
+	"github.com/clovisor/clovisor/libclovisor/policy"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,5 +113,32 @@ func TestExecHashMatchesLayout(t *testing.T) {
 	h3, _ := execHash("/usr/bin/gix")
 	if h1 != h2 || h1 == h3 || string(b[:12]) != "/usr/bin/git" || b[12] != 0 {
 		t.Fatalf("%x %x %x", h1, h2, h3)
+	}
+}
+
+func TestNetPolicyOf(t *testing.T) {
+	g := policy.NetGrant{
+		UDP:  []netip.AddrPort{netip.MustParseAddrPort("10.0.0.5:5000"), netip.MustParseAddrPort("[fd00::1]:123")},
+		ICMP: []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("fd00::/60")},
+	}
+	p, err := netPolicyOf(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UDP[0].IP != netip.MustParseAddr("::ffff:10.0.0.5").As16() || p.UDP[0].Port != 5000 || p.UDP[1].Port != 123 || p.UDP[2].Port != 0 {
+		t.Errorf("udp: %+v", p.UDP[:3])
+	}
+	// IPv4 /16: the mapped prefix and the first two octets, 96+16 bits.
+	m := p.ICMP[0].Mask
+	if m[9] != 0xff || m[13] != 0xff || m[14] != 0 || p.ICMP[0].IP[12] != 10 || p.ICMP[0].IP[13] != 1 {
+		t.Errorf("icmp v4: %x %x", p.ICMP[0].IP, m)
+	}
+	// IPv6 /60: seven full bytes and a nibble.
+	m = p.ICMP[1].Mask
+	if m[6] != 0xff || m[7] != 0xf0 || m[8] != 0 {
+		t.Errorf("icmp v6 mask: %x", m)
+	}
+	if p.ICMP[2].Mask != ([16]byte{}) {
+		t.Error("unused entry has a mask")
 	}
 }

@@ -103,7 +103,7 @@ func TestLearnTransparentNotes(t *testing.T) {
 		`(seen: "20.0.0.1/32")`,
 		"2 connections sent to an address github.com does not resolve to",
 		"UDP the node refused",
-		"1.2.3.4:5000 game.example (9 attempts)",
+		`# udp:`, `#     - "1.2.3.4:5000"  # 9 attempts, game.example`,
 		"refused by the node's resolver",
 		"#   blocked.test",
 		"Refused TCP to addresses the run had looked up by name: no rule allowed",

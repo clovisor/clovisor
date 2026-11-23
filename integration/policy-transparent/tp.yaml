@@ -17,6 +17,9 @@ spec:
       # Raw TCP that speaks first, like SSH: known only by address in
       # transparent mode, and allowed through the run's own lookup.
       - { name: origin-raw, to: { fqdn: ["origin.test"], ports: [2222] }, action: allow }
+  # Milestone 4.7: also granted by the ceiling, so runs under tp get them.
+  udp: { allow: ["ORIGIN_IP:5002"] }
+  icmp: { allow: ["ORIGIN_IP"] }
   unix:
     # /tmp/fd.sock lets the passed-in-socket test reach the 4.3 check.
     allow: ["/run/it-allowed.sock", "/tmp/fd.sock"]

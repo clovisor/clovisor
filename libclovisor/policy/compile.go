@@ -128,6 +128,8 @@ type CompiledProfile struct {
 	mcp  *MCP
 	// UnixAllow is the unix block's patterns, validated.
 	UnixAllow []string
+	// Net is the udp and icmp blocks, validated (milestone 4.7).
+	Net NetGrant
 }
 
 // DestPosture is the TLS posture derived for one destination. Posture is
@@ -265,6 +267,7 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 	c.exec(p, cp)
 	c.mcp(p, cp)
 	c.unix(p, cp)
+	c.net(p, cp)
 	if len(p.Spec.Content) > 0 {
 		c.unsupported("spec.content", "content")
 	}

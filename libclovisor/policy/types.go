@@ -41,6 +41,8 @@ type Spec struct {
 	Exec    *Exec         `yaml:"exec,omitempty" json:"exec,omitempty"`
 	MCP     *MCP          `yaml:"mcp,omitempty" json:"mcp,omitempty"`
 	Unix    *Unix         `yaml:"unix,omitempty" json:"unix,omitempty"`
+	UDP     *UDP          `yaml:"udp,omitempty" json:"udp,omitempty"`
+	ICMP    *ICMP         `yaml:"icmp,omitempty" json:"icmp,omitempty"`
 	Content []ContentRule `yaml:"content,omitempty" json:"content,omitempty"`
 	Limits  *Limits       `yaml:"limits,omitempty" json:"limits,omitempty"`
 }

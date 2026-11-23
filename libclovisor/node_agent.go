@@ -381,8 +381,16 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if err := r.SetUnixNode([]string{opts.SocketPath}); err != nil {
 			fmt.Fprintf(os.Stderr, "node agent: %v\n", err)
 		}
+	}
+	// Per-run kernel policy: UDP and ICMP in transparent mode (milestone
+	// 4.7), and with BPF LSM, Unix sockets and exec. The LSM writers do
+	// nothing where it is not loaded.
+	if r := audit.reader; r != nil && !credential && t.Mode != TransparentOff {
 		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective, nested bool) error {
 			var errs []error
+			if err := r.SetNetPolicy(runCg, eff.Net()); err != nil {
+				errs = append(errs, fmt.Errorf("udp and icmp: %w", err))
+			}
 			pats, enforce := eff.UnixAllow(uid)
 			if err := r.SetUnixPolicy(runCg, pats, enforce); err != nil {
 				errs = append(errs, fmt.Errorf("unix policy: %w", err))
@@ -818,6 +826,7 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			na.audit.reader.ForgetUnixPolicy(event.RunCgroupID)
 			na.audit.reader.ForgetExecPolicy(event.RunCgroupID)
 			na.audit.reader.ForgetNestedRun(event.RunCgroupID)
+			na.audit.reader.ForgetNetPolicy(event.RunCgroupID)
 		}
 		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}

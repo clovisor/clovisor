@@ -42,6 +42,8 @@ func (r *EBPFReader) SetExecPolicy(uint64, []policy.ExecLayer) error { return ni
 func (r *EBPFReader) ForgetExecPolicy(uint64)                        {}
 func (r *EBPFReader) SetNestedRun(uint64) error                      { return nil }
 func (r *EBPFReader) ForgetNestedRun(uint64)                         {}
+func (r *EBPFReader) SetNetPolicy(uint64, policy.NetGrant) error     { return nil }
+func (r *EBPFReader) ForgetNetPolicy(uint64)                         {}
 
 // BPFLSMActive is false off Linux.
 func BPFLSMActive() bool { return false }

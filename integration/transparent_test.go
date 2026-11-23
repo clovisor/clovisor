@@ -79,6 +79,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("exec", e.testExec)
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
+	t.Run("run-udp-icmp", e.testRunNet)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -134,7 +135,7 @@ func (e *env) startTransparent() {
 	t.Cleanup(e.cleanup)
 	e.run("network", "create", e.name("net"))
 	e.run("volume", "create", e.name("run"))
-	e.startOrigin("-banner", ":2222", "-udp-echo", ":5000")
+	e.startOrigin("-banner", ":2222", "-udp-echo", ":5000,:5002")
 	e.originIP = strings.TrimSpace(e.run("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", e.name("origin")))
 	if e.originIP == "" {
 		t.Fatal("no origin address")
@@ -159,7 +160,11 @@ func (e *env) startTransparent() {
 		t.Fatalf("prepare: %v %s", err, errOut)
 	}
 	e.run("cp", "policy-transparent", e.name("agent")+":/etc/clovisor/policy")
+	// The policy names the origin by address (udp and icmp blocks); ping
+	// sockets are for everyone, as on most distributions.
 	if out, errOut, err := e.sh(`set -e
+sed -i "s/ORIGIN_IP/` + e.originIP + `/g" /etc/clovisor/policy/*.yaml
+echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range
 chown -R root:root /etc/clovisor && chmod 755 /etc/clovisor/policy && chmod 644 /etc/clovisor/policy/*
 cat /etc/ssl/certs/ca-certificates.crt /it/test-ca.crt > /run/clovisor/upstream.pem`); err != nil {
 		t.Fatalf("prepare agent: %v\n%s%s", err, out, errOut)
@@ -471,6 +476,41 @@ wait`)
 	expect(t, out, "revoked", "after revoke ")
 	if strings.Contains(out, "after revoke 200") {
 		t.Errorf("a revoked parent's sub-agent still reached the origin:\n%s", out)
+	}
+}
+
+func (e *env) testRunNet(t *testing.T) {
+	// tp and its ceiling both allow UDP to the origin's port 5002 and ping
+	// to the origin (milestone 4.7); tp-sub allows neither, so a sub-agent
+	// under tp gets neither.
+	probe := e.py("net", `import socket, sys
+ip = "`+e.originIP+`"
+def udp(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2)
+    try:
+        s.sendto(b"hi", (ip, port))
+        return "echo" if s.recvfrom(16)[0] == b"hi" else "?"
+    except OSError as err:
+        return "refused %s" % err.errno
+def ping(dst):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    s.settimeout(2)
+    try:
+        s.sendto(b"\x08\x00\x00\x00\x00\x00\x00\x01clovisor", (dst, 0))
+        return "reply" if s.recvfrom(64)[0][0] == 0 else "?"
+    except OSError as err:
+        return "refused %s" % (err.errno or "timeout")
+who = sys.argv[1]
+print(who, "udp5002", udp(5002))
+print(who, "ping origin", ping(ip))
+print(who, "ping other", ping("192.0.2.1"))
+`)
+	out, id := e.trun(probe + " run; /it/bin/agentctl run --profile tp-sub -- " + probe + " sub")
+	expect(t, out, "run udp5002 echo", "run ping origin reply", "run ping other refused",
+		"sub udp5002 refused 1", "sub ping origin refused", "sub ping other refused")
+	if strings.Contains(e.timeline(id), `"udp_refused_to"`) {
+		t.Errorf("granted UDP reported as refused")
 	}
 }
 

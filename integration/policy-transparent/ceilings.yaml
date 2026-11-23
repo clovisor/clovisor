@@ -4,3 +4,5 @@ spec:
   appliesTo: { any: true }
   allow: [tp, tp-sub]
   default: tp
+  udp: { allow: ["ORIGIN_IP:5002"] }
+  icmp: { allow: ["ORIGIN_IP/32"] }

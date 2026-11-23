@@ -134,12 +134,11 @@ type bpfLSMObjects struct {
 	UnixPolicy    *ebpf.Map     `ebpf:"unix_policy"`
 	UnixNode      *ebpf.Map     `ebpf:"unix_node"`
 	UnixSeen      *ebpf.Map     `ebpf:"unix_seen"`
-	NestedRun     *ebpf.Map     `ebpf:"nested_run"`
 }
 
 func (o *bpfLSMObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.SocketCreate, o.SocketConnect, o.SocketSendmsg,
-		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen, o.NestedRun} {
+		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen} {
 		if c != nil && !reflect.ValueOf(c).IsNil() {
 			c.Close()
 		}
@@ -362,16 +361,80 @@ func (r *EBPFReader) ForgetUnixPolicy(runCg uint64) {
 // kernel looks up per-run policy by it rather than by its top-level run.
 // Its policy must be written first.
 func (r *EBPFReader) SetNestedRun(cg uint64) error {
-	if r.lsm.NestedRun == nil {
+	if r.objs.NestedRun == nil {
 		return nil
 	}
-	return r.lsm.NestedRun.Put(cg, uint8(1))
+	return r.objs.NestedRun.Put(cg, uint8(1))
 }
 
 // ForgetNestedRun drops a finished nested run's mark.
 func (r *EBPFReader) ForgetNestedRun(cg uint64) {
-	if r.lsm.NestedRun != nil {
-		r.lsm.NestedRun.Delete(cg)
+	if r.objs.NestedRun != nil {
+		r.objs.NestedRun.Delete(cg)
+	}
+}
+
+// Wire format of run_net (agent_audit.c).
+type bpfICMPPrefix struct {
+	IP   [16]byte
+	Mask [16]byte
+}
+
+type bpfNetPolicy struct {
+	UDP  [policy.MaxRunUDP]bpfException
+	ICMP [policy.MaxRunICMP]bpfICMPPrefix
+}
+
+// netPolicyOf encodes a run's UDP and ICMP grant for the kernel.
+func netPolicyOf(g policy.NetGrant) (bpfNetPolicy, error) {
+	var p bpfNetPolicy
+	if len(g.UDP) > len(p.UDP) || len(g.ICMP) > len(p.ICMP) {
+		return p, fmt.Errorf("at most %d UDP and %d ICMP entries", len(p.UDP), len(p.ICMP))
+	}
+	for i, a := range g.UDP {
+		p.UDP[i].IP = a.Addr().As16()
+		p.UDP[i].Port = a.Port()
+	}
+	for i, pre := range g.ICMP {
+		bits := pre.Bits()
+		if pre.Addr().Is4() {
+			bits += 96
+		}
+		ip := pre.Addr().As16()
+		for b := 0; b < 16; b++ {
+			n := min(max(bits-8*b, 0), 8)
+			m := byte(0xff << (8 - n))
+			if n == 0 {
+				m = 0
+			}
+			p.ICMP[i].Mask[b] = m
+			p.ICMP[i].IP[b] = ip[b] & m
+		}
+	}
+	return p, nil
+}
+
+// SetNetPolicy gives a run its UDP and ICMP grant (milestone 4.7). An
+// empty grant removes the entry: only the node's exceptions apply.
+func (r *EBPFReader) SetNetPolicy(runCg uint64, g policy.NetGrant) error {
+	if r.objs.RunNet == nil {
+		return nil
+	}
+	if g.Empty() {
+		r.ForgetNetPolicy(runCg)
+		return nil
+	}
+	p, err := netPolicyOf(g)
+	if err != nil {
+		return err
+	}
+	return r.objs.RunNet.Put(runCg, p)
+}
+
+// ForgetNetPolicy drops a run's UDP and ICMP grant.
+func (r *EBPFReader) ForgetNetPolicy(runCg uint64) {
+	if r.objs.RunNet != nil {
+		r.objs.RunNet.Delete(runCg)
 	}
 }
 
@@ -434,12 +497,14 @@ type bpfObjects struct {
 	OrigBySk     *ebpf.Map     `ebpf:"orig_by_sk"`
 	RunBySk      *ebpf.Map     `ebpf:"run_by_sk"`
 	OrigByTuple  *ebpf.Map     `ebpf:"orig_by_tuple"`
+	NestedRun    *ebpf.Map     `ebpf:"nested_run"`
+	RunNet       *ebpf.Map     `ebpf:"run_net"`
 }
 
 func (o *bpfObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
 		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate, o.ProxyConn4, o.ProxyConn6, o.Lost, o.Suppressed, o.RunBudget, o.ProxyRefused,
-		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple} {
+		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple, o.NestedRun, o.RunNet} {
 		if c != nil {
 			c.Close()
 		}
@@ -830,7 +895,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 	// The programs share the main object's maps: config, events and the
 	// per-run budget.
 	replace := map[string]*ebpf.Map{"config": r.objs.Config, "events": r.objs.Events, "lost": r.objs.Lost,
-		"suppressed": r.objs.Suppressed, "run_budget": r.objs.RunBudget}
+		"suppressed": r.objs.Suppressed, "run_budget": r.objs.RunBudget, "nested_run": r.objs.NestedRun}
 	if err := spec.LoadAndAssign(&r.lsm, &ebpf.CollectionOptions{MapReplacements: replace}); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

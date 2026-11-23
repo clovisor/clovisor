@@ -513,15 +513,11 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			return ks[i].port < ks[j].port
 		})
 		p("")
-		p("      # UDP the node refused. Profiles cannot allow UDP; if the agent needs one of")
-		p("      # these, the operator adds it to the node's -udp-allow:")
+		p("      # UDP the node refused: drafted in the udp block below, which the ceiling")
+		p("      # must also grant (or the operator adds it to the node's -udp-allow):")
 		for _, k := range ks {
 			li := d.udpRefused[k]
-			names := ""
-			if ns := sortedSet(setOf(d.udpNames[k])); len(ns) > 0 {
-				names = " " + commentSafe(strings.Join(ns, ", "))
-			}
-			p("      #   %s%s (%s)%s", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), names, plural(li.conns, "attempt"), runsNote(li.runs, total))
+			p("      #   %s (%s)", net.JoinHostPort(li.ip, strconv.Itoa(int(li.port))), plural(li.conns, "attempt"))
 		}
 	}
 	if len(d.local) > 0 {
@@ -624,6 +620,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	}
 	d.writeMCP(p, total)
 	d.writeUnix(p, total)
+	d.writeUDP(p, total)
 
 	_, err := io.WriteString(w, b.String())
 	return err
@@ -697,6 +694,43 @@ func setOf(ss []string) map[string]bool {
 }
 
 // writeUnix drafts the unix block: every Unix socket outside the run that
+// writeUDP drafts the udp block (milestone 4.7) from the UDP the node
+// refused, commented out: a profile's udp.allow works only where the
+// ceiling grants the same destination, and UDP carries no name to check.
+func (d *Draft) writeUDP(p func(string, ...interface{}), total int) {
+	if len(d.udpRefused) == 0 {
+		return
+	}
+	var ks []destKey
+	for k := range d.udpRefused {
+		if k.port != 53 {
+			ks = append(ks, k)
+		}
+	}
+	if len(ks) == 0 {
+		return
+	}
+	sort.Slice(ks, func(i, j int) bool {
+		if ks[i].ip != ks[j].ip {
+			return ks[i].ip < ks[j].ip
+		}
+		return ks[i].port < ks[j].port
+	})
+	p("")
+	p("  # UDP the node refused. Uncomment what the agent needs; the ceiling's udp.allow")
+	p("  # must grant it too. QUIC (UDP 443) is better left to fall back to TCP.")
+	p("  # udp:")
+	p("  #   allow:")
+	for _, k := range ks {
+		li := d.udpRefused[k]
+		names := ""
+		if ns := sortedSet(setOf(d.udpNames[k])); len(ns) > 0 {
+			names = ", " + commentSafe(strings.Join(ns, ", "))
+		}
+		p("  #     - %s  # %s%s%s", q(net.JoinHostPort(li.ip, strconv.Itoa(int(li.port)))), plural(li.conns, "attempt"), names, runsNote(li.runs, total))
+	}
+}
+
 // the runs used. Root-equivalent ones are left commented out, since a
 // ceiling must permit them.
 func (d *Draft) writeUnix(p func(string, ...interface{}), total int) {

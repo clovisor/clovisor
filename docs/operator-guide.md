@@ -42,7 +42,7 @@ The proxy must know which run each connection belongs to.
 | How a run is known | The cgroup of the client socket (socket diagnostics). A child of the run cannot leave it. | A per-run secret in the proxy URL (`http://run-<id>:<token>@…`). |
 | Strength | Enforcement-grade for anything that uses the proxy. | A claim: any process holding the secret speaks for the run. |
 | Kernel audit (exec, connect, DNS) | Yes (BPF) | No: timelines hold proxy and MCP events only. |
-| Runs cannot start runs | Enforced | Not enforced: a run may start another run within its user's ceiling, escaping its own clamps. |
+| A run started inside a run | Nested: bounded by its parent's policy, clamps cascade. | Not bounded: a run may start another run within its user's ceiling, escaping its own clamps. |
 | Needs | Linux 5.7+, cgroup v2, root, the BPF object | Nothing: macOS, containers, an unprivileged user. |
 
 In both modes the proxy is **explicit**. A process that ignores
@@ -461,10 +461,11 @@ relying on it.
 | TLS without a server name; other TCP (SSH, databases) | `CONNECT <ip>:<port>`. A `cidr` rule naming the address decides. Otherwise, a hostname rule decides if the node's resolver answered that name with this address for this run, so `ssh github.com` matches a `github.com` rule on port 22. A hard-coded address with no such lookup needs a `cidr` rule. |
 | Plain HTTP | Routed by `Host`, with method and path rules. |
 | DNS (port 53, UDP or TCP, to any server) | To the node's resolver (below). |
-| UDP to a `-udp-allow` destination | Direct. |
+| UDP to a `-udp-allow` destination, or one the run's ceiling and profile both allow (`udp.allow`) | Direct. |
 | UDP on loopback, socket bound by the same run, or nothing listening | Direct. |
 | Any other UDP, QUIC included | Refused with `EPERM`. Browsers and HTTP/3 clients fall back to TCP at once. Recorded once per connect, or once per unconnected socket. |
-| Any other packet leaving the node (an unconnected ICMP datagram, a raw socket) | Dropped by the packet backstop. Recorded at most once a second per run, with a count. |
+| ICMP echo from a ping socket to a destination the run's ceiling and profile both allow (`icmp.allow`) | Direct. |
+| Any other packet leaving the node (other ICMP, a raw socket) | Dropped by the packet backstop. Recorded at most once a second per run, with a count. |
 | Anything, while the node agent is down | Refused with `EPERM`. |
 
 **Fail closed.** In enforce mode the connect hooks are pinned in
@@ -549,8 +550,30 @@ is in the timeline and the node agent's log.
 In audit mode UDP and ICMP go through, and refusals are recorded as `would
 refuse: UDP`; the packet backstop is off.
 
-`ping` fails in enforce mode: it refuses to start when its probe UDP
-connect is refused.
+**UDP and ICMP per run** (milestone 4.7). A profile asks for UDP
+destinations and ping targets, and the ceiling bounds them:
+
+```yaml
+# in the profile
+spec:
+  udp:  { allow: ["10.0.0.5:5000"] }  # exact ip:port; at most 8
+  icmp: { allow: ["10.0.0.0/24"] }    # echo only; addresses or prefixes; at most 8
+# in the ceiling
+spec:
+  udp:  { allow: ["10.0.0.5:5000"] }
+  icmp: { allow: ["10.0.0.0/16"] }
+```
+
+A run gets what its ceiling and every enforcing layer of its policy all
+allow, and a nested run no more than its parent. A layer without the
+blocks allows none, so a clamp or revoke takes them away. `-udp-allow`
+still applies to every run. Ping must use ICMP datagram sockets, which
+needs `net.ipv4.ping_group_range` to cover the run's group (many
+distributions set it). Raw sockets stay refused, so a ping that cannot
+get a datagram socket and falls back to a raw one fails.
+`learn` drafts a commented `udp:` block from refused UDP. `check` counts a
+destination in the profile's `udp.allow` as allowed, provided the ceiling
+grants it too.
 
 **Sockets, where BPF LSM is active.** Runs may create IPv4, IPv6, Unix and
 netlink sockets only: raw IP, packet, vsock and other families get `EPERM`.
@@ -703,7 +726,7 @@ agentctl events --json <run-id>
 | A timeline has `suppressed_events` and `complete: false` | The run produced events faster than its budget (bursts of about 1,300 execs, then about 5,000 execs or 70,000 connects a second), so the excess was not reported, to keep it from crowding out other runs. Enforcement was unaffected. |
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination the run did not look up through the node (a hard-coded address) needs a `cidr` rule. |
-| UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS and `-udp-allow`. Check `udp_refused` and the connect events in the timeline. |
+| UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS, `-udp-allow`, and what both the ceiling's and the profile's `udp.allow` name. Check `udp_refused` and the connect events in the timeline. |
 | `Name or service not known` in a run (transparent) | The resolver refused the name: no rule allows a connection to it. Check `dns_blocked` in the timeline, or `dig` for the EDE reason. |
 | DNS in runs fails entirely (transparent) | The node agent is down (DNS is refused with it), or the resolver cannot reach `-dns-upstream`: see `server` and `reason` on the timeline's dns events. |
 

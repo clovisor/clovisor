@@ -68,6 +68,16 @@ var httpish = map[uint16]bool{80: true, 443: true, 8080: true, 8443: true}
 
 type findingKey struct{ kind, what string }
 
+// profileUDP reports whether cp's udp block names ip:port.
+func profileUDP(cp *policy.CompiledProfile, ip netip.Addr, port uint16) bool {
+	for _, a := range cp.Net.UDP {
+		if a.Port() == port && a.Addr() == ip.Unmap() {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckRuns replays the runs' destinations and execs against cp, for an
 // explicit-proxy deployment.
 func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
@@ -150,8 +160,10 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				what := d.Proto + " " + addr + namesSuffix(d.Names)
 				if udpAllowed(ip, d.Port) {
 					add("udp-allow", what, CheckFinding{Decision: policy.ActionAllow, Rule: "node -udp-allow"}, tl.RunID, d.Count)
+				} else if profileUDP(cp, ip, d.Port) {
+					add("udp-allow", what, CheckFinding{Decision: policy.ActionAllow, Rule: "udp.allow (where the ceiling grants it too)"}, tl.RunID, d.Count)
 				} else {
-					msg := "UDP is refused except DNS and the node's -udp-allow"
+					msg := "UDP is refused except DNS, the node's -udp-allow and udp.allow"
 					if d.Port == 443 {
 						msg += "; QUIC: clients fall back to TCP"
 					}

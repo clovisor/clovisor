@@ -112,6 +112,10 @@
 #define ETH_P_IPV6   0x86DD
 #define IPPROTO_UDP  17
 #define IPPROTO_TCP_ 6
+#define IPPROTO_ICMP_   1
+#define IPPROTO_ICMPV6_ 58
+#define ICMP_ECHO_      8
+#define ICMPV6_ECHO_    128
 #define DNS_PORT     53
 
 #define SOCK_STREAM 1
@@ -899,6 +903,71 @@ static __always_inline __u64 policy_run(struct audit_config *cfg, __u64 run)
     return run;
 }
 
+/* As policy_run, for a packet: by its socket's cgroup. */
+static __always_inline __u64 skb_policy_run(struct __sk_buff *skb, struct audit_config *cfg, __u64 run)
+{
+#pragma unroll
+    for (int i = MAX_NEST; i >= 1; i--) {
+        __u64 id = bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level + 1 + i);
+        if (id && bpf_map_lookup_elem(&nested_run, &id))
+            return id;
+    }
+    return run;
+}
+
+/* Per run (milestone 4.7): UDP destinations and ICMP echo prefixes the
+ * run's ceiling and profile both allow, beyond the node's exceptions. */
+#define MAX_RUN_UDP  8
+#define MAX_RUN_ICMP 8
+
+struct icmp_prefix {
+    struct addr ip;       /* masked, IPv4 as ::ffff:a.b.c.d */
+    struct addr mask;     /* all zero: unused */
+};
+
+struct net_policy {
+    struct exception udp[MAX_RUN_UDP];   /* port 0 ends the list */
+    struct icmp_prefix icmp[MAX_RUN_ICMP];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct net_policy);
+} run_net SEC(".maps");
+
+static __always_inline int run_udp_ok(struct net_policy *np, struct addr *ip, __u16 hport)
+{
+    if (!np)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < MAX_RUN_UDP; i++) {
+        struct exception *x = &np->udp[i];
+        if (x->port == 0)
+            break;
+        if (x->port == hport && x->ip.a[0] == ip->a[0] && x->ip.a[1] == ip->a[1] &&
+            x->ip.a[2] == ip->a[2] && x->ip.a[3] == ip->a[3])
+            return 1;
+    }
+    return 0;
+}
+
+static __always_inline int run_icmp_ok(struct net_policy *np, struct addr *ip)
+{
+    if (!np)
+        return 0;
+#pragma unroll
+    for (int i = 0; i < MAX_RUN_ICMP; i++) {
+        struct icmp_prefix *x = &np->icmp[i];
+        __u32 any = x->mask.a[0] | x->mask.a[1] | x->mask.a[2] | x->mask.a[3];
+        if (any && (ip->a[0] & x->mask.a[0]) == x->ip.a[0] && (ip->a[1] & x->mask.a[1]) == x->ip.a[1] &&
+            (ip->a[2] & x->mask.a[2]) == x->ip.a[2] && (ip->a[3] & x->mask.a[3]) == x->ip.a[3])
+            return 1;
+    }
+    return 0;
+}
+
 static __always_inline int healthy(struct audit_config *cfg)
 {
     __u32 zero = 0;
@@ -1007,7 +1076,13 @@ static __always_inline __u32 decide(struct bpf_sock_addr *ctx, struct audit_conf
         return V_DNS;
     }
     if (type == SOCK_DGRAM) {
+        __u32 proto = LOAD32(ctx, struct bpf_sock_addr, protocol);
+        if (proto == IPPROTO_ICMP_ || proto == IPPROTO_ICMPV6_)
+            return V_NONE; /* a ping socket: the egress backstop decides each echo */
         if (in_exceptions(cfg->udp_exc, ip, hport))
+            return V_EXCEPTION;
+        __u64 prun = policy_run(cfg, run);
+        if (run_udp_ok(bpf_map_lookup_elem(&run_net, &prun), ip, hport))
             return V_EXCEPTION;
         if (is_loopback(ip)) {
             if (hport == cfg->dns_port && cfg->dns_port != 0)
@@ -1423,6 +1498,20 @@ int on_egress(struct __sk_buff *skb)
     }
     if (backstop_exception(cfg, &ip, dport, proto))
         return 1;
+    if (proto == IPPROTO_UDP || proto == IPPROTO_ICMP_ || proto == IPPROTO_ICMPV6_) {
+        __u64 prun = skb_policy_run(skb, cfg, run);
+        struct net_policy *np = bpf_map_lookup_elem(&run_net, &prun);
+        if (proto == IPPROTO_UDP && run_udp_ok(np, &ip, dport))
+            return 1;
+        if (proto != IPPROTO_UDP) {
+            __u8 t;
+            int echo = bpf_skb_load_bytes(skb, l4off, &t, 1) == 0 &&
+                       ((proto == IPPROTO_ICMP_ && family == AF_INET && t == ICMP_ECHO_) ||
+                        (proto == IPPROTO_ICMPV6_ && family == AF_INET6 && t == ICMPV6_ECHO_));
+            if (echo && run_icmp_ok(np, &ip))
+                return 1;
+        }
+    }
 
     int enforce = 1;
     __u64 now = bpf_ktime_get_ns();

@@ -88,6 +88,7 @@ place:
 | Exec gating by resolved path through BPF LSM, with the trusted-path test as a per-profile option (`require_trusted_path`) and `dir/*` entries for build output. | [4.4 status](#44-status-2026-11-23) |
 | Tool calls in cgroups of their own (`agentctl call`), with events, proxy decisions and DNS attributed per call; MCP servers recorded as calls. | [4.5 status](#45-status-2026-11-23) |
 | Sub-agents: a run started inside a run is nested below it, with its parent's layers plus its own, in the proxy, the resolver and the kernel; clamps cascade; each nested run has its own timeline, linked to its parent. | [4.6 status](#46-status-2026-11-23) |
+| Per-run UDP and ICMP echo, asked for by the profile and bounded by the ceiling, in a per-run kernel map that needs no BPF LSM. | [4.7 status](#47-status-2026-11-23) |
 
 ---
 
@@ -3063,6 +3064,56 @@ A `tp` run started a sub-agent requesting `tp-sub`. That profile allows
 
 Revoking a parent cascaded to its running sub-agent, whose next CONNECT was
 denied by the `revoked` layer.
+
+#### 4.7 status (2026-11-23)
+
+Implemented:
+
+- **`udp` and `icmp` blocks**, in profiles and in ceilings. `udp.allow`
+  takes exact `ip:port` entries; DNS and unspecified addresses are refused at
+  compile. `icmp.allow` takes addresses or prefixes and allows echo
+  requests only. Each block holds at most 8 entries.
+- **The grant.** A run gets the ceiling's blocks intersected with each
+  enforce-mode layer's. A layer without the blocks contributes nothing, so
+  clamps and revoke remove UDP and ICMP like any permission. A nested run
+  also intersects with its parent's ceiling grant. A run with no enforce
+  layer gets none: nothing is refused there, only recorded.
+- **Kernel.** A per-run `run_net` map, keyed by the nearest run (the
+  `nested_run` map moved into the main object set for this), is checked:
+  - by the UDP connect and sendmsg hooks, after the node's `-udp-allow`;
+  - by the egress backstop, for UDP and for ICMP and ICMPv6 echo
+    requests.
+
+  Ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) are left to the backstop at
+  connect, which decides each echo. None of this needs BPF LSM: the node
+  agent writes per-run policy in transparent mode whether or not LSM is
+  active. Raw sockets stay refused (4.1), so ping needs
+  `net.ipv4.ping_group_range`.
+- **Tooling.**
+  - Learn drafts a commented `udp:` block from refused UDP.
+  - Check credits a profile's `udp.allow`, provided the ceiling grants it
+    too.
+  - The receipt lists `udp/` and `icmp/` placements, each noting that it
+    needs the ceiling.
+
+Decisions:
+
+- **Exact `ip:port` for UDP, not names.** UDP carries no name to check, and
+  matching by the run's own lookups (as for raw TCP) is weaker for
+  datagrams. A destination with a changing address belongs in TCP or the
+  node list.
+- **No ICMP beyond echo,** and none through raw sockets: those would admit
+  crafted packets that the backstop judges only by address.
+
+Verified on kernel 7.0 in `make integration-transparent`, now seventeen
+checks:
+
+- A `tp` run, which tp and its ceiling allow UDP to `origin:5002` and ping
+  to the origin, got the echo on 5002 and a ping reply. Its ping to
+  `192.0.2.1` got `EPERM`. Port 5001, granted by neither, stays refused in
+  the UDP check.
+- A sub-agent under it requesting `tp-sub`, which has neither block, was
+  refused both.
 
 #### Decisions
 

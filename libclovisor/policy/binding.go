@@ -40,6 +40,10 @@ type CeilingSpec struct {
 	// AllowRootSockets lets profiles under this ceiling allow Unix sockets
 	// that give root: Docker, Podman, containerd, CRI-O (milestone 4.2).
 	AllowRootSockets bool `yaml:"allowRootSockets,omitempty" json:"allowRootSockets,omitempty"`
+	// UDP and ICMP bound what profiles under this ceiling may have of
+	// their udp and icmp blocks (milestone 4.7): without them, none.
+	UDP  *UDP  `yaml:"udp,omitempty" json:"udp,omitempty"`
+	ICMP *ICMP `yaml:"icmp,omitempty" json:"icmp,omitempty"`
 }
 
 // AppliesTo selects callers by platform identity. On a host that is the
@@ -98,6 +102,7 @@ type ceiling struct {
 	uid   int
 	gid   int
 	spec  CeilingSpec
+	net   NetGrant
 }
 
 func (c *ceiling) matches(caller Caller) bool {
@@ -152,6 +157,9 @@ func NewSet(opts Options, profiles []*AgentProfile, ceilings []*ProfileCeiling,
 
 		a := c.Spec.AppliesTo
 		rc := &ceiling{name: name, spec: c.Spec}
+		rc.net = parseNet(c.Spec.UDP, c.Spec.ICMP, func(where, format string, a ...interface{}) {
+			errf("spec."+where, format, a...)
+		})
 		n := 0
 		if a.Namespace != "" || a.ServiceAccount != "" {
 			errf("spec.appliesTo", "namespace and serviceAccount need Kubernetes identity, which a host node agent does not have")
@@ -321,7 +329,7 @@ func (s *Set) Resolve(c Caller, requested string) (*Binding, error) {
 		granted = rc.spec.Default
 		b.Reason = fmt.Sprintf("requested %q is not allowed by ceiling %s; granted its default", requested, rc.name)
 	}
-	b.Effective = &Effective{Layers: []Layer{{Profile: s.Compiled.Profile(granted), Source: "granted"}}}
+	b.Effective = &Effective{Layers: []Layer{{Profile: s.Compiled.Profile(granted), Source: "granted"}}, Ceiling: rc.net}
 	if rc.spec.Clamp != "" && rc.spec.Clamp != granted {
 		b.Effective.Layers = append(b.Effective.Layers, Layer{Profile: s.Compiled.Profile(rc.spec.Clamp), Source: "ceiling clamp"})
 	}
@@ -335,13 +343,16 @@ func (s *Set) Profile(name string) *CompiledProfile { return s.Compiled.Profile(
 // It is immutable; clamping makes a new one.
 type Effective struct {
 	Layers []Layer
+	// Ceiling is the UDP and ICMP the run's ceiling permits (milestone
+	// 4.7); a nested run's is also bounded by its parent's.
+	Ceiling NetGrant
 }
 
 // With returns a copy with one more layer. Adding a layer can only
 // remove permissions, which is what makes clamping safe to delegate.
 func (e *Effective) With(l Layer) *Effective {
 	layers := append(append([]Layer{}, e.Layers...), l)
-	return &Effective{Layers: layers}
+	return &Effective{Layers: layers, Ceiling: e.Ceiling}
 }
 
 // Nested is the effective policy of a run started from inside parent
@@ -362,7 +373,7 @@ func Nested(parent, child *Effective) *Effective {
 			layers = append(layers, l)
 		}
 	}
-	return &Effective{Layers: layers}
+	return &Effective{Layers: layers, Ceiling: parent.Ceiling.Intersect(child.Ceiling)}
 }
 
 func (e *Effective) has(cp *CompiledProfile) bool {

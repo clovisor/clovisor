@@ -34,7 +34,7 @@ var (
 	repo   = flag.String("repo", "/origin/repo.git", "bare git repository, prepared with git update-server-info")
 	desc   = flag.String("desc-suffix", "", "appended to tool descriptions, to simulate a server changing its tools")
 	banner = flag.String("banner", "", "also serve raw TCP here that sends a banner first, like SSH")
-	echo   = flag.String("udp-echo", "", "also echo UDP datagrams here")
+	echo   = flag.String("udp-echo", "", "also echo UDP datagrams here (comma-separated)")
 )
 
 func main() {
@@ -55,8 +55,11 @@ func main() {
 			}
 		}()
 	}
-	if *echo != "" {
-		pc, err := net.ListenPacket("udp", *echo)
+	for _, addr := range strings.Split(*echo, ",") {
+		if addr == "" {
+			continue
+		}
+		pc, err := net.ListenPacket("udp", addr)
 		if err != nil {
 			log.Fatal(err)
 		}
