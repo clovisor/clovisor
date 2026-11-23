@@ -62,8 +62,11 @@ type NodeAgentOptions struct {
 	Dirs Dirs
 
 	BPFObjPath string
-	OutDir     string // finished timelines; DefaultRunOutDir if empty
-	SocketPath string // run API socket; DefaultRunAPISocket if empty
+	// AgentsCgroup names the cgroup runs live under, below the cgroup
+	// root; AgentsSubdir if empty.
+	AgentsCgroup string
+	OutDir       string // finished timelines; DefaultRunOutDir if empty
+	SocketPath   string // run API socket; DefaultRunAPISocket if empty
 	// PolicyDir holds profiles and ceilings. If it does not exist, runs
 	// are unprofiled, as in Phase 1.
 	PolicyDir string
@@ -214,7 +217,11 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			return nil, err
 		}
 	} else {
-		if cmgr, err = NewCgroupManager(); err != nil {
+		name := opts.AgentsCgroup
+		if name == "" {
+			name = AgentsSubdir
+		}
+		if cmgr, err = NewCgroupManagerNamed(name); err != nil {
 			return nil, fmt.Errorf("failed to create cgroup manager: %w", err)
 		}
 		agentsDir = cmgr.GetAgentsDir()

@@ -12,6 +12,9 @@
 //	             git's dumb HTTP protocol under /repo.git/
 //	mcp.test     a remote MCP server (streamable HTTP, JSON responses) at /mcp
 //	other.test   anything; the test profile does not allow it
+//
+// With -banner it also serves raw TCP that speaks first, like SSH, and
+// with -udp-echo a UDP echo, for the transparent-mode tests.
 package main
 
 import (
@@ -19,6 +22,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -29,10 +33,44 @@ var (
 	key    = flag.String("key", "/origin/tls.key", "key")
 	repo   = flag.String("repo", "/origin/repo.git", "bare git repository, prepared with git update-server-info")
 	desc   = flag.String("desc-suffix", "", "appended to tool descriptions, to simulate a server changing its tools")
+	banner = flag.String("banner", "", "also serve raw TCP here that sends a banner first, like SSH")
+	echo   = flag.String("udp-echo", "", "also echo UDP datagrams here")
 )
 
 func main() {
 	flag.Parse()
+	if *banner != "" {
+		ln, err := net.Listen("tcp", *banner)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				io.WriteString(c, "SSH-2.0-origin\r\n")
+				c.Close()
+			}
+		}()
+	}
+	if *echo != "" {
+		pc, err := net.ListenPacket("udp", *echo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, from, err := pc.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				pc.WriteTo(buf[:n], from)
+			}
+		}()
+	}
 	files := http.StripPrefix("/repo.git/", http.FileServer(http.Dir(*repo)))
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host

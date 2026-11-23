@@ -1,0 +1,6 @@
+kind: ProfileCeiling
+metadata: { name: everyone }
+spec:
+  appliesTo: { any: true }
+  allow: [tp]
+  default: tp

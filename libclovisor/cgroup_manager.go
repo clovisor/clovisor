@@ -37,13 +37,23 @@ type CgroupManager struct {
 
 // NewCgroupManager creates a new cgroup manager
 func NewCgroupManager() (*CgroupManager, error) {
+	return NewCgroupManagerNamed(AgentsSubdir)
+}
+
+// NewCgroupManagerNamed keeps runs under the cgroup named name, directly
+// below the cgroup v2 root: "agents" normally. Another name lets a second
+// node agent share a host, as the transparent integration tests do.
+func NewCgroupManagerNamed(name string) (*CgroupManager, error) {
 	root := CgroupV2Root
+	if name == "" || strings.Contains(name, "/") || name == "." || name == ".." {
+		return nil, fmt.Errorf("agents cgroup must be a plain name, not %q", name)
+	}
 
 	if _, err := os.Stat(filepath.Join(root, "cgroup.controllers")); err != nil {
 		return nil, fmt.Errorf("cgroup v2 not available at %s: %w", root, err)
 	}
 
-	agentsDir := filepath.Join(root, AgentsSubdir)
+	agentsDir := filepath.Join(root, name)
 	if err := os.MkdirAll(agentsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create agents dir: %w", err)
 	}

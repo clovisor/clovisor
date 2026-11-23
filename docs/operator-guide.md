@@ -357,9 +357,25 @@ timelines are the explicit proxy's, unchanged.
 
 **Requirements.** Linux with cgroup v2, root, cgroup identity,
 `-proxy-listen`, bpffs at `/sys/fs/bpf`, and Envoy on the host network
-(`--network host`), since the transparent listener is on loopback. Kernel 5.8
-or later, going by when the hooks and helpers appeared; only 7.0 has been
-tested.
+(`--network host`), since the transparent listener is on loopback. Run Envoy
+in a container or a systemd unit of its own, so its connects can be gated
+(see below).
+
+The kernel needs BTF (`/sys/kernel/btf/vmlinux`) and the features below. By
+the releases that introduced them, the floor is **5.12**. Only 7.0 (aarch64)
+has been tested; run `make integration-transparent` (§16) on a kernel before
+relying on it.
+
+| Feature | Used for | Since |
+|---|---|---|
+| `cgroup/connect4,6`, `sockops` | redirect-or-deny, original destination | 4.17, 4.13 |
+| `cgroup/sendmsg4,6` | unconnected UDP, DNS | 4.18 |
+| `cgroup/recvmsg4,6`, socket storage, socket lookup from cgroup hooks | DNS replies, stashes, same-run loopback | 5.2 |
+| `cgroup/getsockopt` | `SO_ORIGINAL_DST` for Envoy | 5.3 |
+| `tp_btf` tracing | exec and run events | 5.5 |
+| `bpf_get_current_ancestor_cgroup_id`, BPF links and link update, `INET_DIAG_CGROUP_ID` | run identity, fail-closed pins, socket lookup | 5.7 |
+| `cgroup/getpeername4,6`, ring buffer | original peer, events | 5.8 |
+| atomic exchange in BPF | backstop report counts | 5.12 |
 
 **Roll it out in three steps:**
 
@@ -563,6 +579,7 @@ agentctl events --json <run-id>
 ```sh
 make check                               # unit tests and the macOS cross-build
 DOCKER="sudo docker" make integration    # end to end in Docker
+DOCKER="sudo docker" make integration-transparent  # transparent mode; Linux, privileged
 ```
 
 The integration tests are self-contained once their images are built.
@@ -580,3 +597,25 @@ They check:
 - tool pin drift and its approval.
 
 Set `CLOVISOR_IT_KEEP=1` to leave the containers up for inspection.
+
+`make integration-transparent` runs transparent enforce mode end to end. It
+needs a privileged container and clang for the BPF object. The agent
+container shares the host's cgroup and PID namespaces, but keeps its runs
+under a cgroup of its own (`-agents-cgroup`) and its pins in a bpffs of its
+own, so a node agent already on the host is not disturbed. With clients that
+ignore the proxy, it checks:
+
+- the node's status: healthy, Envoy gated;
+- HTTPS through the transparent listener, with path rules and a narrated
+  denial;
+- TLS to a bare address refused;
+- SSH-like raw TCP allowed through the run's own lookup, and refused on a
+  port the rule does not name;
+- forced DNS: an allowed name resolved; an unlisted name and a
+  tunnelling-shaped name refused, from glibc and Python;
+- UDP refused, QUIC-shaped included, and a `-udp-allow` echo answered;
+- a same-run dev server reached and a host service on loopback refused;
+- a run with an inherited TCP socket refused at start;
+- `check --transparent` on the recorded runs;
+- fail closed: a run already going when the node agent stops gets `EPERM`
+  on its next connect and no answer to its next lookup.

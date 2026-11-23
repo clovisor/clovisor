@@ -25,6 +25,7 @@ var (
 	rtDir    = flag.String("runtime-dir", "", "Directory for sockets and generated files (default /run/clovisor as root, a per-user directory otherwise)")
 	stDir    = flag.String("state-dir", "", "Directory for timelines, the node CA and tool pins (default /var/lib/clovisor as root, a per-user directory otherwise)")
 	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object (cgroup identity)")
+	agentsCg = flag.String("agents-cgroup", clovisor.AgentsSubdir, "Name of the cgroup, below the cgroup v2 root, that runs live under (cgroup identity)")
 	outDir   = flag.String("out", "", "Directory for per-run timeline files (default <state-dir>/runs)")
 	socket   = flag.String("socket", "", "Unix socket for the run API used by agentctl (default <runtime-dir>/agent.sock)")
 	policies = flag.String("policy-dir", clovisor.DefaultPolicyDir, "Directory of profiles and ceilings, root-owned when run as root; reloaded on SIGHUP")
@@ -120,6 +121,7 @@ func main() {
 		Identity:        *identity,
 		Dirs:            dirs(),
 		BPFObjPath:      *bpfObj,
+		AgentsCgroup:    *agentsCg,
 		OutDir:          *outDir,
 		SocketPath:      *socket,
 		PolicyDir:       *policies,

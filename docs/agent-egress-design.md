@@ -1,12 +1,12 @@
 # Clovisor II — An Agent Egress Control & Audit Engine
 
-**Status:** Phase 1 (audit) and Phase 2 (explicit proxy and MCP) implemented;
-Phase 3 (transparent mode) in progress ·
-**Date:** 2026-11-14, revised 2026-11-22 · **Repo:** `clovisor` ·
+**Status:** Phases 1 (audit), 2 (explicit proxy and MCP) and 3 (transparent
+mode on Linux) implemented ·
+**Date:** 2026-11-14, revised 2026-11-23 · **Repo:** `clovisor` ·
 **Operating it:** [operator guide](operator-guide.md)
 
 > A design study on repointing Clovisor's architecture from Istio service-mesh
-> observability toward egress control and audit for AI agents. Phases 1 and 2
+> observability toward egress control and audit for AI agents. Phases 1 to 3
 > are implemented ([§10](#10-build-order)). Open questions are
 > collected in [§12](#12-open-questions). The 2026-11-19 design review and what
 > it changed are summarized under [Revision history](#revision-history).
@@ -75,6 +75,12 @@ place:
 | Heartbeat tied to Envoy's health; the proxy's own connects gated in the kernel (closing DNS rebinding); lost kernel events counted per run; `agentctl status`; overhead measured. | [3.5 status](#35-status-2026-11-22) |
 | Learn, check and receipt for transparent deployments: `check --transparent` replays DNS, UDP and by-address TCP as enforce decides; learn notes for each; `explain --transparent`. | [3.6 status](#36-status-2026-11-22) |
 | Raw TCP tunnels known only by address are decided by a name the node's resolver answered with that address for the run, when no rule names the address. | [Resolved-name matching](#resolved-name-matching-2026-11-22) |
+
+### 2026-11-23 — Phase 3 complete
+
+| Change | Where |
+|---|---|
+| Transparent mode tested end to end in a privileged container; kernel floor revised to 5.12; operator guide gains requirements and the test. Phase 3 complete. | [3.7 status](#37-status-2026-11-23), [operator guide](operator-guide.md) |
 
 ---
 
@@ -2228,7 +2234,7 @@ hand-made run cgroup (the node agent was not involved). Code and configs in
 | Forced resolver | glibc, `dig` and Python resolve allowed names. Others, including a tunnelling-shaped query, get NXDOMAIN. The run behind each query is identified by socket diagnostics, UDP included. `ech` was stripped from `crypto.cloudflare.com`'s HTTPS record, other parameters kept. |
 | Fail closed | Works. Within the stale interval (3 s) of the heartbeat stopping, TCP connects get `EPERM`; redirects resume when it restarts. |
 | `io_uring` | `IORING_OP_CONNECT` passes `connect4`: redirected when healthy, `EPERM` when not. |
-| Kernel floor | Every hook and helper loaded on 7.0. By the kernel versions in which they appeared, the floor is about 5.8 (`getpeername` hooks; socket diagnostics' cgroup id and `bpf_get_current_ancestor_cgroup_id` need 5.7). Not tested on an older kernel. |
+| Kernel floor | Every hook and helper loaded on 7.0. By the kernel versions in which they appeared, the floor is about 5.8 (`getpeername` hooks; socket diagnostics' cgroup id and `bpf_get_current_ancestor_cgroup_id` need 5.7). Not tested on an older kernel. *Revised in 3.7: 5.12, for the atomic exchange the 3.3 backstop uses.* |
 
 Findings for later milestones:
 
@@ -2645,6 +2651,41 @@ Verified live, with the 3.6 draft (a `github.com` rule on port 22) enforced:
   in the 3.6 round trip it had been refused;
 - the same address hard-coded, with no lookup through the node, was refused;
 - github.com on port 2222, which the rule does not name, was refused.
+
+#### 3.7 status (2026-11-23)
+
+Implemented:
+
+- **`make integration-transparent`** (`TestTransparent`, skipped unless
+  `CLOVISOR_IT_TRANSPARENT` is set). It runs a privileged agent container
+  sharing the host's cgroup and PID namespaces, with:
+  - the node agent in transparent enforce, its runs under a cgroup of its
+    own (the new `-agents-cgroup` flag) and its pins in a bpffs of its own;
+  - Envoy in its network namespace;
+  - a TLS origin that also serves a server-speaks-first banner and a UDP
+    echo.
+
+  Ten checks: status, HTTPS ignoring the proxy, TLS to a bare address,
+  SSH-like TCP by resolved name, forced DNS (including a tunnelling-shaped
+  name), UDP (QUIC-shaped, an exception), same-run and host loopback, an
+  inherited socket, `check --transparent`, and fail closed with a run in
+  progress. All pass in about 15 seconds, and the test removes everything it
+  created on the host.
+- **Operator guide.** Requirements with a kernel feature table, the
+  three-step rollout, and the test.
+- **Kernel floor revised to 5.12**: the 3.3 backstop uses BPF atomic
+  exchange. Not tested below 7.0.
+
+Not covered:
+
+- A real HTTP/3 client: Debian's curl has none. UDP 443 gets `EPERM`, which
+  the test checks.
+- Older kernels. The test is the way to qualify one.
+
+**Phase 3 is complete.** On Linux, every TCP and UDP packet a run sends
+reaches the proxy or the node's resolver, or is refused, including while the
+node agent is down. What remains is Phase 4's: Unix and raw sockets as such,
+exec gating, and host daemons acting for a run.
 
 #### Decisions
 

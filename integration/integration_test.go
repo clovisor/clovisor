@@ -18,9 +18,9 @@
 //	CLOVISOR_IT_KEEP=1 ...           # leave the containers up for debugging
 //
 // Credential identity needs no privileges, so this runs on any Docker
-// host, including Docker Desktop. Cgroup identity needs BPF and a
-// privileged container; it is covered by the live tests in the design
-// doc instead.
+// host, including Docker Desktop. Cgroup identity and transparent mode
+// need BPF and a privileged container: TestTransparent, which runs only
+// with CLOVISOR_IT_TRANSPARENT=1 (make integration-transparent).
 package integration
 
 import (
@@ -62,6 +62,8 @@ type env struct {
 	docker []string
 	tag    string // suffix of every Docker object, so runs do not collide
 	dir    string
+	// originIP is the origin's address (transparent tests).
+	originIP string
 }
 
 func (e *env) name(s string) string { return "clovisor-it-" + s + "-" + e.tag }

@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration format doc
+.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent format doc
 
 # Compiler and flags
 CC = clang
@@ -92,6 +92,12 @@ check: cross
 # DOCKER="sudo docker" where the docker CLI needs it.
 integration:
 	CLOVISOR_IT_ENVOY_IMAGE=$(ENVOY_IMAGE) $(GO) test -tags integration -count=1 -v ./integration/
+
+# Transparent enforce mode end to end (milestone 3.7): a privileged
+# container sharing the host's cgroup and PID namespaces, BPF, cgroup v2.
+# Linux only; needs clang for the BPF object.
+integration-transparent:
+	CLOVISOR_IT_TRANSPARENT=1 CLOVISOR_IT_ENVOY_IMAGE=$(ENVOY_IMAGE) $(GO) test -tags integration -count=1 -v -run TestTransparent ./integration/
 
 # The portable pieces (agentctl, the node agent with credential identity,
 # ext_proc, the MCP gateway) must keep building without Linux (design §4.3).

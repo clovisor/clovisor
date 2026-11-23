@@ -1,0 +1,19 @@
+kind: AgentProfile
+metadata: { name: tp }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-read
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed", "/headers"] }
+        action: allow
+      - name: no-secret
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "The secret endpoint is off limits for this agent."
+      # Raw TCP that speaks first, like SSH: known only by address in
+      # transparent mode, and allowed through the run's own lookup.
+      - { name: origin-raw, to: { fqdn: ["origin.test"], ports: [2222] }, action: allow }
