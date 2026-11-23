@@ -95,6 +95,8 @@ place:
 | Change | Where |
 |---|---|
 | Host daemons (Docker, a live ssh-agent, systemd-resolved's varlink socket) refused in the privileged test; operator guide gains enabling BPF LSM, a block reference and the new limits. Phase 4 complete. | [4.8 status](#48-status-2026-11-23), [operator guide](operator-guide.md) |
+| Phase 5 broken into milestones. Found: body reading generalizes the MCP mode override; counters can be node-local; ask holds `ext_proc` streams; nested runs charge their ancestors. | [Phase 5 plan](#phase-5-plan-2026-11-23) |
+| 5.0 spikes: request bodies must be streamed with `ext_proc`'s own cap (buffered stalls past 1 MiB, partial is fail-open); Envoy's default circuit breaker fails every request past 1,024 `ext_proc` streams; held asks work with a per-stream timeout override; QUIC names read in userspace; a BPF exec hash cache was never stale on ext4 and tmpfs. | [5.0 spike results](#50-spike-results-2026-11-23) |
 
 ---
 
@@ -3176,6 +3178,131 @@ Known gaps, carried forward:
   ordinary hosts.
 - **Hash matching only through IMA, opt-in.** No userspace hash cache, whose
   modification-time key a run can reset.
+
+### Phase 5 plan (2026-11-23)
+
+Goal, from the table above: the policy that needs state, content or a human.
+That means budgets and limits, content rules, model allow-lists, ask with
+human approval, MCP sampling control, and QUIC by name as an opt-in. Exec
+hash matching, deferred from 4.4, comes along. Each milestone must be useful
+if the later ones never ship.
+
+#### Findings that shape the plan
+
+1. **Most of Phase 5 reads bodies.** Content rules, model allow-lists and
+   token budgets all need the request or response body. `ext_proc` reads
+   bodies today only for remote MCP: it switches the stream to buffered
+   requests and streamed responses through a mode override. Every other
+   stream gets headers alone. 5.1 generalizes that override. Bodies exist only
+   on terminated destinations, so `content`, `model` and `budget` rules force
+   termination, as path rules do, and the receipt says so. A body above the
+   buffer cap must be refused, not passed unread.
+2. **The state is local.** §7.9 worried about counters shared across Envoy
+   replicas. Here there is one Envoy per node, and `ext_proc` runs inside the
+   node agent, so counters live in the node agent and are persisted under
+   `/var/lib/clovisor`. That answers open question 1 for host deployments:
+   eventually consistent, with an overrun bounded by the requests in flight.
+   Several replicas sharing one budget (Kubernetes) stays open.
+3. **Ask holds a request.** `ext_proc` holds its reply until a person
+   approves, denies or a timeout fires. That needs Envoy's message timeout
+   raised for that stream alone, a pending queue in the node agent, a way to
+   decide, and a cap on held streams, past which requests are refused (open
+   question 3). In transparent mode the resolver must answer names that ask
+   rules cover, and leave the decision to the request.
+4. **Nested runs charge their ancestors.** A sub-agent with a fresh budget
+   would break the attenuation of 4.6. Budgets and limits are checked along
+   the chain of runs up to the top-level one, and spending is charged to each.
+5. **Spend is read from the provider's responses.** Anthropic- and
+   OpenAI-shaped APIs report token use in the response, including streamed
+   ones. Prices go in node configuration, not profiles, since a profile is
+   the agent's request and must not set its own prices.
+6. **Exec hash needs a kernel-side cache.** The 4.0 spike measured about
+   3.5 ms per exec of `python3` hashed every time. The Phase 4 decision rules
+   out a userspace cache keyed by modification time, which a run can reset.
+   The cache must sit in a BPF map, keyed by inode and invalidated by the
+   kernel's own change counter.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **5.0** | Spikes | Envoy body handling: buffered request cost by size, behaviour above the buffer cap, replacing a body with one of another length, streamed SSE responses. Held `ext_proc` streams: raising the message timeout per stream, what a timeout does, how many held streams Envoy tolerates and whether other traffic suffers. Token usage in Anthropic and OpenAI responses, streamed and not. The server name from a QUIC Initial in userspace. An exec hash cache in BPF keyed by inode and change counter. | Settles what Envoy and the kernel allow before product code depends on it. |
+| **5.1** | Bodies and content policy | Envoy's `ext_proc` circuit breaker raised, with node-wide and per-run stream caps in `ext_proc` (see the 5.0 results). Body plumbing for any terminated stream that a rule needs, with a size cap that fails closed. `content:` rules (regex) that `deny` or `redact` request bodies. Content rules force termination; the receipt lists them; the timeline records matches, not the content. | Stops known secrets leaving in a request to an allowed host ([§11](#11-non-goals-and-honest-limits)). |
+| **5.2** | Limits | The node agent's counter store. `limits.duration` (the node agent ends the run), `connections_per_min`, `egress_bytes`, and `action: rate-limit`. Counters roll up to ancestor runs. | Bounds a runaway agent in time and volume. |
+| **5.3** | Model allow-lists | The `model` field of Anthropic- and OpenAI-shaped requests checked against a rule's list; others refused with a narrated denial. Learn drafts the models it saw; check replays them. | Keeps a run on the models the operator pays for or trusts. |
+| **5.4** | Budgets | `budget: {tokens, cost_usd}` per rule, charged from response usage, streamed or not; prices from node configuration; ancestors charged too; a request over budget refused before it is sent. Timelines and `agentctl show` report spend. | The cost control the design began with ([§7.9](#79-budgets-are-the-stateful-exception)). |
+| **5.5** | Ask | `action: ask`, `mode: ask` and MCP `sampling: ask`. A pending queue; `agentctl pending`, `approve` and `deny` over the run API; `ask.timeout` and `on_timeout`; a cap on held requests. The timeline records each decision and who made it. | A person in the loop for writes that policy cannot judge ([§12](#12-open-questions) question 6). |
+| **5.6** | QUIC by name (opt-in) | Only if 5.0 shows it is sound: UDP 443 relayed by the node agent, the server name read from the Initial and decided as SNI is, so HTTP/3 to allowed names works. QUIC stays refused by default. | Lets HTTP/3-only clients work without opening UDP. |
+| **5.7** | Exec hash | `exec.allow[].hash` through `bpf_ima_file_hash`, with the kernel-side cache (finding 6); opt-in per profile. | The high-assurance form of [§7.6](#76-exec-matching-path-hash-or-provenance). |
+| **5.8** | Tests and docs | Integration tests for each milestone, privileged where they need the kernel; operator guide on content rules, limits, budgets, prices, ask and approvals. | Phase 5 ships. |
+
+Order: 5.0; 5.1, whose body plumbing the others use; 5.2 and 5.3; 5.4, on
+both; 5.5. 5.6 and 5.7 are independent, and either moves to Phase 6 if its
+spike says no. 5.8 last.
+
+#### 5.0 spike results (2026-11-23)
+
+Kernel 7.0 (aarch64) with BPF LSM active and no IMA policy loaded, Envoy
+1.34.14, quic-go v0.65. Code in `spikes/phase5/`. Model API streams were
+synthetic, shaped like the providers' documented formats; no provider was
+called.
+
+| Question | Result |
+|---|---|
+| Buffered request bodies | Up to Envoy's 1 MiB connection buffer limit, buffering added about 0.1 ms at 64 KB, 0.35 ms at 512 KB and 0.6 ms at 1 MB (p50). Streaming cost the same. |
+| Bodies above the buffer limit | **Buffered mode stalls.** Envoy neither returns 413 nor sends `ext_proc` the body; the request hangs until the client gives up, with or without a `Content-Length`. **Partial mode is fail-open:** `ext_proc` got the first 1.18 MB of a 4 MB body and the rest went upstream unread. Streamed mode delivered every chunk, and `ext_proc` refused at its own cap, with or without a length. |
+| Replacing a body | A body of another length is refused by Envoy with a bare 500, "mismatch between content length and the length of the mutated body", unless the same response sets `content-length`. With it, redaction and JSON injection worked. In streamed mode, `ext_proc` removed `content-length` at headers, held each chunk back by answering it with an empty body, and released the whole body, redacted, with the last chunk. A 3 MB body arrived upstream chunked, byte for byte as expected, a match across a chunk boundary included. |
+| Streamed responses | SSE passes through a streamed `ext_proc` incrementally: first byte 4 ms instead of 1 ms, total unchanged over 0.48 s. Usage: Anthropic-shaped streams carry input tokens in `message_start` and cumulative output tokens in `message_delta`. OpenAI-shaped chat streams carry **no usage unless the request sets `stream_options.include_usage`**; `ext_proc` can add it to the request. |
+| Holding a request | With the 200 ms message timeout, a held reply gets 504. With `max_message_timeout` set, `ext_proc` sends `override_message_timeout` and holds: approved after 5 s → 200, denied after 3 s → the narrated 403. An override above the maximum is ignored (504 at 200 ms). A client that disconnects cancels the `ext_proc` stream, so the pending entry can be dropped. |
+| Held requests at scale | **Envoy's default circuit breaker allows 1,024 concurrent requests to the `ext_proc` cluster, and each stream is one.** Past it, every new request on the node got a 500, not only held ones. With the limit raised, 4,000 requests held for 15 s all completed, other requests kept a p50 near 1 ms, and each held request cost about 45 KB in Envoy and 20 KB in `ext_proc`. |
+| QUIC server name | A relay decrypted QUIC v1 Initial packets with keys from the destination connection id and read the ClientHello's server name, at about 5 µs per packet. With Go's default key shares (X25519MLKEM768) the ClientHello spans **two** datagrams; with X25519 alone, one. Holding datagrams until the ClientHello is complete, then forwarding them untouched, an allowed name completed its handshake through the relay; a refused one timed out. |
+| Exec hash cache | A BPF map keyed by (device, inode), validated by `i_generation`, `i_version` and ctime, with every exec also hashed fresh to check it. 9,644 execs on ext4 and tmpfs, including 1,000 rewrites in place and 300 through a shared mmap: 5,832 hits, **0 stale**. A hit cost about 0.26 µs; a fresh hash 1.6 ms on average, 4 ms for the 10.6 MB coreutils binary. Every rewrite changed `i_version` and ctime. Both filesystems set `SB_I_VERSION`. |
+
+Findings that change the plan:
+
+- **An existing hazard.** The node agent's Envoy has the default circuit
+  breaker. A long-lived MCP response stream holds an `ext_proc` stream, so
+  1,024 of them would fail every request on the node. 5.1 raises the limit
+  and has `ext_proc` enforce its own node-wide and per-run caps well below
+  it, refusing with a narrated denial: for held asks, for open response
+  streams, and for bodies held in memory.
+- **Bodies use streamed mode with the cap in `ext_proc`,** never buffered
+  (it stalls) or partial (fail-open). `ext_proc` holds the chunks itself and
+  releases the body once it is checked, so its memory is the cap times the
+  bodies in flight. That needs a node-wide bound too.
+- **Content patterns need bounds.** An unbounded `sk-[A-Za-z0-9]{20,}`
+  redacted 2 MB of a test body. Go's `regexp` is linear-time, so there is no
+  catastrophic backtracking, but the compiler should warn of unbounded
+  repetition in redact rules.
+- **OpenAI-style budgets need the request changed.** To count a streamed
+  response, `ext_proc` sets `stream_options.include_usage`. A stream with no
+  usage is charged an estimate and flagged in the timeline.
+- **QUIC by name is feasible in userspace,** but the relay must hold
+  datagrams until the ClientHello is complete, and refuse anything it
+  cannot parse (other versions, packets after a migration). That fails
+  closed, and clients fall back to TCP. Redirecting UDP 443 to the relay
+  reuses the `sendmsg4` path the resolver uses. The relay forwards to the
+  address the name resolves to, not to the one the client picked, as
+  transparent TCP does.
+- **The exec hash cache holds where the filesystem keeps `i_version`.**
+  It is cached only where the superblock sets `SB_I_VERSION` and the
+  filesystem is local (ext4, xfs, btrfs, tmpfs). FUSE and network
+  filesystems can change content behind an unchanged inode, so files there
+  are hashed on every exec. That revises the Phase 4 decision against a
+  cache: the objection was a userspace modification-time key a run can
+  reset, and none of these validators can be set by a run.
+- **IMA's own cache** (`bpf_ima_inode_hash`) needs an IMA policy, a
+  system-wide change that lasts until reboot. It was not tried here.
+
+#### Proposed decisions
+
+- **Budgets are eventually consistent.** A small overrun is acceptable;
+  stalling every request on a write is not. Counters live in a local file, not
+  a new datastore.
+- **Approvals from the command line first,** over the run API. A web UI can
+  follow.
+- **Who may approve:** root, or the run's user from outside the run. Never
+  from inside the run or its descendants, or an agent could approve itself.
 
 ---
 
