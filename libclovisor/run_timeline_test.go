@@ -251,3 +251,40 @@ func TestRunRecorderProxiedRequests(t *testing.T) {
 		t.Fatal("finished timeline overwritten")
 	}
 }
+
+func TestRunRecorderContent(t *testing.T) {
+	r := newTestRecorder(t)
+	cev := func(ms int, d ContentData) AuditEvent {
+		return AuditEvent{Type: EventContent, Timestamp: at(ms), CgroupID: testRunCg, RunCgroupID: testRunCg, Data: d}
+	}
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		cev(1, ContentData{Host: "api.example.com", Port: 443, Method: "POST", Path: "/v1", Where: "body", Decision: "deny", Enforced: true,
+			Rule: "aws-keys", Layer: "p", Hits: []ContentHitData{{Layer: "p", Rule: "aws-keys", Action: "deny", Enforced: true, Count: 1},
+				{Layer: "p", Rule: "tokens", Action: "redact", Enforced: true, Count: 2}}}),
+		cev(2, ContentData{Host: "api.example.com", Port: 443, Method: "POST", Path: "/v1", Where: "body", Decision: "redact", Enforced: true,
+			Hits: []ContentHitData{{Layer: "p", Rule: "tokens", Action: "redact", Enforced: true, Count: 1},
+				{Layer: "shadow", Rule: "pii", Action: "deny", Count: 3}}}),
+		cev(3, ContentData{Host: "api.example.com", Port: 443, Method: "POST", Path: "/v1", Where: "body", Decision: "deny", Enforced: true,
+			Reason: "body over the inspection limit"}),
+		runEv(EventRunEnd, 4, "/agents/run-abc"),
+	)
+	want := []ContentUse{
+		{Host: "api.example.com", Reason: "body over the inspection limit", Requests: 1, Refused: 1},
+		{Host: "api.example.com", Layer: "p", Rule: "aws-keys", Action: "deny", Requests: 1, Matches: 1, Refused: 1},
+		{Host: "api.example.com", Layer: "p", Rule: "tokens", Action: "redact", Requests: 2, Matches: 3, Redacted: 1},
+		{Host: "api.example.com", Layer: "shadow", Rule: "pii", Action: "deny", Requests: 1, Matches: 3, WouldHave: 1},
+	}
+	if !reflect.DeepEqual(tl.Summary.Content, want) {
+		t.Fatalf("content summary:\n%+v\nwant\n%+v", tl.Summary.Content, want)
+	}
+	var notes []string
+	for _, e := range tl.Events {
+		if e.Type == "content" {
+			notes = append(notes, e.Note)
+		}
+	}
+	if len(notes) != 3 || notes[1] != "body: redact p/tokens ×1; deny shadow/pii ×3 (audit)" {
+		t.Fatalf("notes: %q", notes)
+	}
+}

@@ -100,6 +100,9 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			"grpc_service": obj{"envoy_grpc": obj{"cluster_name": "ext_proc"}, "timeout": "2s"},
 			// Fail closed: without a decision, nothing passes.
 			"failure_mode_allow": false,
+			// ext_proc may extend the timer for one message: to check a
+			// large body (milestone 5.1).
+			"max_message_timeout": "30s",
 			// Lets ext_proc turn on body processing for the streams that
 			// need it (remote MCP) and only those.
 			"allow_mode_override": true,
@@ -379,7 +382,12 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 				"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typed(
 					"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions", obj{
 						"upstream_http_protocol_options": obj{"auto_sni": true, "auto_san_validation": true},
-						"auto_config":                    obj{"http2_protocol_options": obj{}},
+						// A body ext_proc held and released at once (milestone
+						// 5.1) draws a burst of WINDOW_UPDATEs from the origin,
+						// which the default limit of 10 per DATA frame sent
+						// takes for a flood, killing the connection and every
+						// request on it.
+						"auto_config": obj{"http2_protocol_options": obj{"max_inbound_window_update_frames_per_data_frame_sent": 100}},
 					}),
 			},
 			"transport_socket": obj{"name": "envoy.transport_sockets.tls", "typed_config": typed(
@@ -402,6 +410,11 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		obj{
 			"name": "ext_proc",
 			"type": "STATIC",
+			// Every inspected stream is a request on this cluster, and the
+			// default circuit breaker allows 1,024 at once: past it, every
+			// request on the node would fail (5.0 spikes). ext_proc keeps
+			// its own, lower limits (DefaultMaxInspected).
+			"circuit_breakers": obj{"thresholds": arr{obj{"max_requests": 1000000, "max_pending_requests": 1000000}}},
 			"typed_extension_protocol_options": obj{
 				"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": typed(
 					"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",

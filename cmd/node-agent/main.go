@@ -34,6 +34,7 @@ var (
 	envoyCfg = flag.String("envoy-config", "", "Where to write the generated Envoy bootstrap (default <runtime-dir>/envoy.json)")
 	envoyUID = flag.String("envoy-uids", defaultEnvoyUIDs(), "Comma-separated uids Envoy runs as, admitted to ext_proc (root and the node agent's uid always are)")
 	nonRun   = flag.Bool("proxy-non-run", false, "Let processes outside any run use the proxy")
+	maxBody  = flag.Int("inspect-max-body", clovisor.DefaultMaxBody, "Largest request body, in bytes, the proxy checks for content rules or remote MCP; larger ones are refused")
 	mcpAddr  = flag.String("mcp-listen", "", "Enable the local MCP gateway on this loopback address, e.g. 127.0.0.1:18100")
 	caDir    = flag.String("ca-dir", "", "Node CA for TLS termination, key readable only by the node agent (default <state-dir>/ca)")
 	upCA     = flag.String("envoy-upstream-ca", "", "System trust store as Envoy sees it, to verify origins behind termination (default: the host's)")
@@ -130,6 +131,7 @@ func main() {
 		EnvoyConfig:     *envoyCfg,
 		EnvoyUIDs:       uids(*envoyUID),
 		NonRunProxy:     *nonRun,
+		MaxInspectBody:  *maxBody,
 		MCPListen:       addrFlag("-mcp-listen", *mcpAddr),
 		CADir:           *caDir,
 		EnvoyUpstreamCA: *upCA,

@@ -180,11 +180,18 @@ type Sampling struct {
 	Message string `yaml:"message,omitempty" json:"message,omitempty"`
 }
 
-// ContentRule is a content pattern (Phase 5).
+// ContentRule is a content pattern (milestone 5.1), checked against
+// request bodies and query strings. Regex is RE2 syntax (Go regexp).
 type ContentRule struct {
 	Name   string `yaml:"name" json:"name"`
 	Regex  string `yaml:"regex" json:"regex"`
-	Action string `yaml:"action" json:"action"`
+	Action string `yaml:"action" json:"action"` // deny | redact | tag-and-log
+	// Message is what the agent is told when a deny refuses a request.
+	// Without it, one is generated; it never quotes the match.
+	Message string `yaml:"message,omitempty" json:"message,omitempty"`
+	// To limits the rule to some hosts; without it, every host the
+	// profile allows by name.
+	To *ContentScope `yaml:"to,omitempty" json:"to,omitempty"`
 }
 
 // Limits are per-run limits (Phase 5).

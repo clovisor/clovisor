@@ -26,6 +26,7 @@ const (
 	EventSocket   // a socket refused at creation, connect or send (milestones 4.1, 4.3)
 	EventUnix     // a Unix socket outside the run, first use (milestone 4.2)
 	EventExecPath // an exec's resolved path, first use per verdict (milestone 4.4)
+	EventContent  // content rules matched a request, or its body could not be checked (milestone 5.1)
 )
 
 // ExecPathData is what the exec hook saw: the resolved path the kernel ran,

@@ -85,6 +85,12 @@ func main() {
 			serveMCP(w, r)
 		case strings.HasPrefix(r.URL.Path, "/repo.git/"):
 			files.ServeHTTP(w, r)
+		case r.URL.Path == "/echo":
+			// What arrived: the body, and how it was framed.
+			b, _ := io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"len": len(b), "content_length": r.Header.Get("Content-Length"),
+				"chunked": len(r.TransferEncoding) > 0, "body": string(b[:min(len(b), 256)])})
 		case r.URL.Path == "/headers":
 			hs := map[string]string{}
 			for k, v := range r.Header {

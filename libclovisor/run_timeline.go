@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
 // DefaultMaxRunEvents bounds the events kept per run. Events past the cap
@@ -117,6 +119,25 @@ type RunSummary struct {
 	UDPRefusedTo []Destination `json:"udp_refused_to,omitempty"`
 	// MCP is what the run did through the local MCP gateway.
 	MCP []MCPUse `json:"mcp,omitempty"`
+	// Content is what content rules found in the run's requests, by host
+	// and rule (milestone 5.1). The matched text is never recorded.
+	Content []ContentUse `json:"content,omitempty"`
+}
+
+// ContentUse aggregates one content rule's matches on one host. Rule is
+// empty for requests refused for another reason (size, encoding, load),
+// which Reason gives.
+type ContentUse struct {
+	Host      string `json:"host"`
+	Layer     string `json:"layer,omitempty"`
+	Rule      string `json:"rule,omitempty"`
+	Action    string `json:"action,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Requests  int    `json:"requests"`
+	Matches   int    `json:"matches,omitempty"`
+	Refused   int    `json:"refused,omitempty"`
+	Redacted  int    `json:"redacted,omitempty"`
+	WouldHave int    `json:"would_have,omitempty"` // audit layers: what they would have done
 }
 
 // MCPUse aggregates gateway operations on one tool or resource.
@@ -226,7 +247,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, drop, socket, unix, gap
+	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -271,6 +292,8 @@ type TimelineEvent struct {
 	Note      string `json:"note,omitempty"`
 }
 
+type contentKey struct{ host, layer, rule, reason string }
+
 type destKey struct {
 	proto string
 	ip    string
@@ -291,6 +314,7 @@ type runState struct {
 	ipName  map[string]string
 	proxied map[proxKey]*ProxiedDest
 	mcp     map[mcpKey]*MCPUse
+	content map[contentKey]*ContentUse
 	// callFor names the call a cgroup belongs to; calls counts events
 	// per call.
 	callFor func(cgroupID uint64) string
@@ -448,6 +472,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		ipName:   make(map[string]string),
 		proxied:  make(map[proxKey]*ProxiedDest),
 		mcp:      make(map[mcpKey]*MCPUse),
+		content:  make(map[contentKey]*ContentUse),
 		calls:    make(map[string]*CallSummary),
 		callFor: func(cg uint64) string {
 			if r.Meta == nil {
@@ -471,6 +496,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for i := range prev.Summary.MCP {
 				u := prev.Summary.MCP[i]
 				st.mcp[mcpKey{u.Server, u.Method, u.Name}] = &u
+			}
+			for i := range prev.Summary.Content {
+				u := prev.Summary.Content[i]
+				st.content[contentKey{u.Host, u.Layer, u.Rule, u.Reason}] = &u
 			}
 			for i := range prev.Summary.Proxied {
 				p := prev.Summary.Proxied[i]
@@ -679,6 +708,60 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Layer:     d.Layer,
 			WouldDeny: d.WouldDeny,
 			Reason:    d.Reason,
+		}, r.MaxEvents)
+
+	case EventContent:
+		d := ev.Data.(ContentData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		use := func(layer, rule, action, reason string) *ContentUse {
+			k := contentKey{d.Host, layer, rule, reason}
+			u := st.content[k]
+			if u == nil {
+				u = &ContentUse{Host: d.Host, Layer: layer, Rule: rule, Action: action, Reason: reason}
+				st.content[k] = u
+			}
+			u.Requests++
+			return u
+		}
+		var notes []string
+		if d.Reason != "" {
+			use("", "", "", d.Reason).Refused++
+			notes = append(notes, d.Reason)
+		}
+		for _, h := range d.Hits {
+			u := use(h.Layer, h.Rule, h.Action, "")
+			u.Matches += h.Count
+			switch {
+			case !h.Enforced && h.Action != policy.ActionTagAndLog:
+				u.WouldHave++
+			case d.Decision == policy.ActionDeny && d.Rule == h.Rule && d.Layer == h.Layer:
+				u.Refused++
+			case d.Decision == policy.ContentActionRedact && h.Action == policy.ContentActionRedact:
+				u.Redacted++
+			}
+			n := fmt.Sprintf("%s %s/%s ×%d", h.Action, h.Layer, h.Rule, h.Count)
+			if !h.Enforced {
+				n += " (audit)"
+			}
+			notes = append(notes, n)
+		}
+		st.add(TimelineEvent{
+			Time:     ev.Timestamp,
+			Type:     "content",
+			CgroupID: ev.CgroupID,
+			Method:   d.Method,
+			DstName:  d.Host,
+			DstPort:  d.Port,
+			Path:     d.Path,
+			Decision: d.Decision,
+			Enforced: d.Enforced,
+			Rule:     d.Rule,
+			Layer:    d.Layer,
+			Reason:   d.Reason,
+			Note:     d.Where + ": " + strings.Join(notes, "; "),
 		}, r.MaxEvents)
 
 	case EventHTTP:
@@ -903,6 +986,21 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 			return a.Method < b.Method
 		}
 		return a.Name < b.Name
+	})
+
+	tl.Summary.Content = nil
+	for _, u := range st.content {
+		tl.Summary.Content = append(tl.Summary.Content, *u)
+	}
+	sort.Slice(tl.Summary.Content, func(i, j int) bool {
+		a, b := tl.Summary.Content[i], tl.Summary.Content[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Layer+"/"+a.Rule != b.Layer+"/"+b.Rule {
+			return a.Layer+"/"+a.Rule < b.Layer+"/"+b.Rule
+		}
+		return a.Reason < b.Reason
 	})
 
 	tl.Summary.Proxied = nil

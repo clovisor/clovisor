@@ -97,6 +97,7 @@ place:
 | Host daemons (Docker, a live ssh-agent, systemd-resolved's varlink socket) refused in the privileged test; operator guide gains enabling BPF LSM, a block reference and the new limits. Phase 4 complete. | [4.8 status](#48-status-2026-11-23), [operator guide](operator-guide.md) |
 | Phase 5 broken into milestones. Found: body reading generalizes the MCP mode override; counters can be node-local; ask holds `ext_proc` streams; nested runs charge their ancestors. | [Phase 5 plan](#phase-5-plan-2026-11-23) |
 | 5.0 spikes: request bodies must be streamed with `ext_proc`'s own cap (buffered stalls past 1 MiB, partial is fail-open); Envoy's default circuit breaker fails every request past 1,024 `ext_proc` streams; held asks work with a per-stream timeout override; QUIC names read in userspace; a BPF exec hash cache was never stale on ext4 and tmpfs. | [5.0 spike results](#50-spike-results-2026-11-23) |
+| Content rules: deny, redact (keeping the length) or record matches in request bodies and query strings, on every host the profile names unless scoped; bodies held and checked whole, with limits that fail closed; remote MCP bodies moved off buffered mode; Envoy's `ext_proc` circuit breaker raised. | [5.1 status](#51-status-2026-11-23) |
 
 ---
 
@@ -3293,6 +3294,122 @@ Findings that change the plan:
   reset, and none of these validators can be set by a run.
 - **IMA's own cache** (`bpf_ima_inode_hash`) needs an IMA policy, a
   system-wide change that lasts until reboot. It was not tried here.
+
+#### 5.1 status (2026-11-23)
+
+Implemented:
+
+- **`content:` rules.** Each has a `name`, an RE2 `regex` and an `action`:
+  - `deny` refuses the request, with an optional `message`;
+  - `redact` replaces each match with `*` of the same length, so the
+    request's Content-Length stays right;
+  - `tag-and-log` records the match and changes nothing.
+
+  At most 32 rules. A pattern that matches the empty string is a compile
+  error. The receipt notes unbounded repetition. `redact` in an egress
+  rule is an error pointing at `content:`.
+- **Scope.** An optional `to: { fqdn: […] }` names a rule's hosts. Without
+  it, the rule covers every host the profile allows by name, and its remote
+  MCP servers, but not:
+  - hosts marked `no_terminate` anywhere in the profile;
+  - hosts allowed only on ports that are not HTTP or TLS (SSH, say), since
+    a terminated route would break that traffic;
+  - destinations by address, and hosts reached only through `fqdn: "*"`
+    or the egress default.
+
+  The receipt lists what each rule leaves out. Covered hosts join the
+  posture as needing termination, or stay plaintext where their rules
+  are port 80 only. An explicit `to:` that conflicts with `no_terminate`,
+  or names `"*"`, fails to compile.
+- **What is checked.** The request body, and the query string (raw and
+  percent-decoded). The query string is checked at headers. A `redact`
+  match there refuses the request, since it cannot be rewritten in place.
+  Responses are not checked. Every layer's rules apply: an enforce layer's
+  deny refuses and its redact rewrites; an audit layer's hits are recorded
+  as what it would have done.
+- **Bodies.** For a covered request with a body, `ext_proc` turns on
+  streamed request bodies:
+  - it answers each chunk with an empty body, holding it back;
+  - once the body is complete, it checks it, then releases it whole,
+    redacted, or refuses the request;
+  - for a body over 1 MiB it first extends Envoy's timer, which
+    `max_message_timeout: 30s` now allows.
+
+  Bodies sent as gzip or deflate are decoded to check. A redact match in
+  one refuses the request, since the compressed body cannot be rewritten.
+  Any other encoding is refused with 415.
+- **Limits that fail closed.** These are refused with a narrated reply:
+  - a body over `-inspect-max-body` (default 8 MiB), with 413, when its
+    bytes reach the limit;
+  - more than 4,096 inspected streams on the node, or 256 for one run, with
+    503;
+  - more than 256 MiB of bodies held at once, with 503.
+
+  A CONNECT to a covered host that Envoy does not terminate (a bootstrap
+  older than the rule) is refused, as for path rules.
+- **MCP moved onto the same path.** Remote MCP request bodies were buffered.
+  Buffered mode stalls past 1 MiB (5.0 spikes), so they are now streamed
+  and held the same way, with content rules applied before MCP policy.
+- **Envoy.** The `ext_proc` cluster's circuit breaker goes from Envoy's
+  default of 1,024 concurrent requests to 1,000,000; `ext_proc`'s own
+  limits are lower. The upstream cluster allows 100 WINDOW_UPDATEs per
+  DATA frame sent, not 10 (see below).
+- **Records.** A content event, and a per-host, per-rule `content` summary,
+  hold:
+  - the rules that matched, with match counts;
+  - what was refused or redacted, and what an audit layer would have done;
+  - refusals for size, encoding or load.
+
+  The matched text is never recorded, nor quoted in a narration.
+  `agentctl show` and `events` list them. `check` names a profile's content
+  rules as not replayable, since runs do not record what was sent.
+
+Found on the way:
+
+- **A held body released at once tripped Envoy's flood protection.** The
+  origin answered the burst with WINDOW_UPDATE frames. Envoy's default
+  limit of 10 per DATA frame sent took that for a flood and killed the
+  upstream connection, failing every request on it with 502. It showed
+  under concurrency, mixed with refusals, on a fresh Envoy: 18 of 400
+  requests failed. With the limit at 100, none did, in three runs from a
+  cold start. The integration test now runs that mix, and fails with the
+  old limit.
+- **curl 7.88 over HTTP/2 loses a refusal sent before any of its body.**
+  It reports no response. So an oversized body is refused when its bytes
+  reach the limit, not at headers by its Content-Length. The same holds for
+  any refusal at headers of a POST over HTTP/2, path denies included. The
+  request is refused either way; only the narration is lost.
+- **Envoy honours one timer override per stream,** and ignores one sent
+  when no timer is running. Ask (5.5) must extend the timer once, for the
+  whole hold.
+
+Decisions:
+
+- **Redact keeps the length.** Matches become `*`, so no header changes, and
+  a JSON string stays valid. `[REDACTED]` would be more legible, but would
+  need Content-Length rewritten after the headers have gone upstream.
+- **Default scope is every host the profile names.** A rule written to
+  stop a key leaving should not depend on listing the hosts it might leave
+  for. Where the proxy cannot read a host, the receipt says so.
+- **Fail closed on what cannot be checked:** oversized bodies, unknown
+  encodings, compressed bodies that need redacting, and inspection over
+  its limits.
+
+Verified:
+
+- Unit tests for compile, scope and posture; scanning, redaction and
+  layers; chunked bodies with a match split across chunks; query strings;
+  gzip; limits and their release; MCP with content rules; timelines.
+- `make integration` against Envoy 1.34.14, as profile `it-content`:
+  - a clean body arrived unchanged with its Content-Length;
+  - a redacted one arrived with the same length, chunked ones too;
+  - a key in the body, the query string or a gzip body got the narrated
+    403; a Brotli body got 415;
+  - a 2 MB body arrived whole; 9 MB, sized or chunked, got 413;
+  - 160 concurrent requests, uploads mixed with refusals, gave no 502;
+  - `agentctl show` and `events` reported it all without the matches.
+
+  The transparent suite still passes all eighteen checks.
 
 #### Proposed decisions
 

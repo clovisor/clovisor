@@ -773,6 +773,18 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if e.DstName != "" {
 				detail += " (" + e.DstName + ")"
 			}
+		case "content":
+			detail = fmt.Sprintf("%s %s:%d%s -> %s", e.Method, e.DstName, e.DstPort, e.Path, e.Decision)
+			if e.Rule != "" {
+				detail += " rule " + e.Rule
+			}
+			if e.Layer != "" {
+				detail += " by " + e.Layer
+			}
+			if e.Reason != "" {
+				detail += " [" + e.Reason + "]"
+			}
+			detail += " (" + e.Note + ")"
 		case "mcp":
 			detail = fmt.Sprintf("%s %s %s -> %s", e.MCPServer, e.Method, e.MCPName, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -842,6 +854,29 @@ func printTimeline(tl *clovisor.RunTimeline) {
 				note += fmt.Sprintf(" would-deny %d", u.WouldDeny)
 			}
 			fmt.Printf("  %-12s %-16s %-28s x%-4d%s\n", u.Server, u.Method, u.Name, u.Calls, note)
+		}
+	}
+	if len(tl.Summary.Content) > 0 {
+		fmt.Printf("Content rules (%d)\n", len(tl.Summary.Content))
+		for _, u := range tl.Summary.Content {
+			what := u.Layer + "/" + u.Rule + " (" + u.Action + ")"
+			if u.Rule == "" {
+				what = "refused: " + u.Reason
+			}
+			note := ""
+			if u.Matches > 0 {
+				note += fmt.Sprintf(" matches %d", u.Matches)
+			}
+			if u.Refused > 0 {
+				note += fmt.Sprintf(" refused %d", u.Refused)
+			}
+			if u.Redacted > 0 {
+				note += fmt.Sprintf(" redacted %d", u.Redacted)
+			}
+			if u.WouldHave > 0 {
+				note += fmt.Sprintf(" audit-only %d", u.WouldHave)
+			}
+			fmt.Printf("  %-28s %-40s x%-4d%s\n", u.Host, what, u.Requests, note)
 		}
 	}
 	if len(tl.Summary.Proxied) > 0 {

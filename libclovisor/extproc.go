@@ -99,6 +99,16 @@ type ExtProcServer struct {
 	// Pins is the tool-definition pin store, shared with the gateway.
 	Pins  *PinStore
 	drift mcpDrift
+
+	// Inspection limits (milestone 5.1); zero means the default. MaxBody
+	// is the largest request body checked for content rules or MCP; a
+	// larger one is refused. MaxHeldBytes bounds the bodies held at once,
+	// MaxInspected and MaxInspectedPerRun the streams inspected at once.
+	MaxBody            int
+	MaxHeldBytes       int64
+	MaxInspected       int
+	MaxInspectedPerRun int
+	insp               inspectLimits
 }
 
 type resolved struct {
@@ -196,7 +206,8 @@ func (s *ExtProcServer) Close() {
 
 // Process handles one HTTP stream from Envoy.
 func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
-	var mcp *remoteMCP // set when this stream's JSON-RPC is inspected
+	var st *streamState // set when this stream's body or JSON-RPC is inspected
+	defer func() { st.done(s) }()
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -206,12 +217,20 @@ func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer
 			return err
 		}
 		var resp *extprocv3.ProcessingResponse
+		mcp := st.remoteMCP()
 		switch r := req.GetRequest().(type) {
 		case *extprocv3.ProcessingRequest_RequestHeaders:
-			resp, mcp = s.onHeaders(stream.Context(), req, r.RequestHeaders)
+			st.done(s)
+			resp, st = s.onHeaders(stream.Context(), req, r.RequestHeaders)
 		case *extprocv3.ProcessingRequest_RequestBody:
-			if mcp != nil {
-				resp = s.onMCPRequestBody(mcp, r.RequestBody.GetBody())
+			if st != nil && st.body != nil {
+				var pre *extprocv3.ProcessingResponse
+				pre, resp = s.onBody(st, r.RequestBody.GetBody(), r.RequestBody.GetEndOfStream())
+				if pre != nil {
+					if err := stream.Send(pre); err != nil {
+						return err
+					}
+				}
 			} else {
 				resp = continueBody()
 			}
@@ -357,19 +376,69 @@ func (s *ExtProcServer) resolvesTo(host string, a netip.Addr) bool {
 	return false
 }
 
-func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *remoteMCP) {
-	resp, decided := s.decideHeaders(ctx, req, h)
-	m := decided.mcp
-	if m != nil && resp.GetImmediateResponse() == nil {
-		resp.ModeOverride = mcpModes
-		return resp, m
+// onHeaders decides a request on its headers. The stream state it returns,
+// if any, is for a request whose body or MCP traffic ext_proc inspects.
+func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *streamState) {
+	resp, o := s.decideHeaders(ctx, req, h)
+	if resp.GetImmediateResponse() != nil || (o.mcp == nil && !o.content) {
+		return resp, nil
 	}
-	return resp, nil
+	hm := h.GetHeaders()
+	maxBody := orDefault(s.MaxBody, DefaultMaxBody)
+	d := o.d
+	refuse := func(code typev3.StatusCode, reason, msg string) (*extprocv3.ProcessingResponse, *streamState) {
+		cd := ContentData{Host: d.Host, Port: d.Port, Method: d.Method, Path: d.Path, Where: "body",
+			Decision: policy.ActionDeny, Enforced: true, Reason: reason, Message: msg}
+		s.recordContent(o.leaf, o.runCg, o.runID, cd)
+		d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, reason, msg
+		return s.denyStatus(d, o.runID, code), nil
+	}
+	hasBody := !h.GetEndOfStream()
+	enc := ""
+	if hasBody && o.content {
+		ce := headerValue(hm, "content-encoding")
+		e, ok := bodyEncoding(ce)
+		if !ok {
+			return refuse(typev3.StatusCode_UnsupportedMediaType, "body encoding not checkable",
+				fmt.Sprintf("The request body is encoded as %q, which this proxy cannot decode to check for content rules, so it was not sent. "+
+					"Send it uncompressed, or as gzip or deflate.", ce))
+		}
+		enc = e
+	}
+	// A body declared too large is refused as it arrives, at the limit,
+	// not here: an HTTP/2 client still sending (curl 7.88) loses a reply
+	// that comes before any of its body has gone.
+	release, why := s.acquire(o.runID)
+	if why != "" {
+		return refuse(typev3.StatusCode_ServiceUnavailable, "inspection limit", "The request was not sent: "+why+"; retry shortly.")
+	}
+	st := &streamState{mcp: o.mcp, release: release}
+	if hasBody {
+		st.body = &heldBody{d: d, runID: o.runID, runCg: o.runCg, leaf: o.leaf, eff: o.eff, content: o.content, encoding: enc, max: maxBody}
+	}
+	switch {
+	case o.mcp != nil:
+		resp.ModeOverride = mcpModes
+	case hasBody:
+		resp.ModeOverride = bodyModes
+	default:
+		// A content-checked request with no body: its query string was
+		// checked at headers, and there is nothing more to hold.
+		st.done(s)
+		return resp, nil
+	}
+	return resp, st
 }
 
 // headerOutcome carries what decideHeaders learned beyond the response.
 type headerOutcome struct {
-	mcp *remoteMCP
+	mcp     *remoteMCP
+	content bool // content rules cover the request: hold its body
+	d       HTTPData
+	runID   string
+	runCg   uint64
+	leaf    uint64
+	eff     *policy.Effective
 }
 
 func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, headerOutcome) {
@@ -377,8 +446,9 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	method := headerValue(hm, ":method")
 	authority := headerValue(hm, ":authority")
 	path := headerValue(hm, ":path")
+	rawQuery := ""
 	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
+		path, rawQuery = path[:i], path[i+1:]
 	}
 
 	d := HTTPData{Method: method}
@@ -551,6 +621,11 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
 			d.Message = fmt.Sprintf("Rule %s needs the request's method or path, which this proxy cannot see "+
 				"inside this TLS tunnel. An operator must restart Envoy with the current configuration.", ed.Rule)
+		case phase == policy.PhaseConnect && ed.Allowed() && !terminated && !ip.IsValid() && eff.InspectsContent(host):
+			// Likewise for content rules, which read what is sent inside.
+			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
+			d.Message = fmt.Sprintf("Content rules cover %s, but this proxy cannot read what is sent inside this TLS tunnel. "+
+				"An operator must restart Envoy with the current configuration.", host)
 		}
 	} else {
 		d.Reason = "unprofiled run"
@@ -559,7 +634,15 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	if d.Decision == policy.ActionDeny && d.Enforced {
 		return s.deny(d, runID), headerOutcome{}
 	}
-	var out headerOutcome
+	out := headerOutcome{d: d, runID: runID, runCg: runCg, leaf: cg, eff: eff}
+	if eff != nil && phase == policy.PhaseRequest && eff.InspectsContent(host) {
+		// Content rules cover this host (milestone 5.1): check the query
+		// string now, and hold the body.
+		if r := s.checkQuery(d, rawQuery, eff, runID, cg, runCg); r != nil {
+			return r, headerOutcome{}
+		}
+		out.content = true
+	}
 	if eff != nil && phase == policy.PhaseRequest && eff.GovernsRemoteMCP(host) {
 		// A remote MCP server for this run: inspect its JSON-RPC.
 		out.mcp = &remoteMCP{host: policy.NormalizeHost(host), runID: runID, runCg: runCg, eff: eff}
@@ -630,6 +713,12 @@ func proxyAuthRequired(r *extprocv3.ProcessingResponse) *extprocv3.ProcessingRes
 }
 
 func (s *ExtProcServer) deny(d HTTPData, runID string) *extprocv3.ProcessingResponse {
+	return s.denyStatus(d, runID, typev3.StatusCode_Forbidden)
+}
+
+// denyStatus is deny with another status: 413 for a body too large to
+// check, 503 when inspection is at its limit.
+func (s *ExtProcServer) denyStatus(d HTTPData, runID string, code typev3.StatusCode) *extprocv3.ProcessingResponse {
 	target := net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port)))
 	if d.Method != "CONNECT" {
 		target = d.Host + d.Path
@@ -651,7 +740,7 @@ func (s *ExtProcServer) deny(d HTTPData, runID string) *extprocv3.ProcessingResp
 	}
 	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ImmediateResponse{
 		ImmediateResponse: &extprocv3.ImmediateResponse{
-			Status:  &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+			Status:  &typev3.HttpStatus{Code: code},
 			Body:    body,
 			Headers: &extprocv3.HeaderMutation{SetHeaders: headers},
 			Details: "clovisor_policy_deny",

@@ -117,6 +117,7 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-envoy-uids 101` | Uids admitted to the `ext_proc` socket besides root and the node agent's own. Whoever can talk to `ext_proc` can write into any run's timeline. |
 | `-envoy-upstream-ca file` | The trust store Envoy verifies origins with, behind termination, as Envoy sees it (a path inside its container). |
 | `-proxy-non-run` | Let processes outside any run use the proxy (decided as unprofiled). Off by default. |
+| `-inspect-max-body 8388608` | The largest request body, in bytes, the proxy checks for content rules or remote MCP. Larger ones are refused with 413 (§10). |
 | `-transparent off\|audit\|enforce` | Transparent mode (§11). Needs `-proxy-listen` and cgroup identity. |
 | `-transparent-port 15001` | The transparent listener's port, on `127.0.0.1` and `::1`. |
 | `-transparent-stale 3s` | How long after the node agent stops its heartbeat connects are refused. |
@@ -215,6 +216,9 @@ spec:
         match: { fqdn: "mcp.example.com" }                         # remote, via the proxy
         tools: { allow: ["*"] }
     sampling: { action: deny, message: "MCP servers may not drive the model." }
+  content:                     # request bodies and query strings: see §10
+    - { name: aws-keys, regex: "AKIA[0-9A-Z]{16}", action: deny }
+    - { name: gh-tokens, regex: "ghp_[A-Za-z0-9]{36}", action: redact }
 ```
 
 **Profile blocks**, under `spec:`:
@@ -228,6 +232,7 @@ spec:
 | `unix` | Unix sockets outside the run | BPF LSM | §11 |
 | `udp` | UDP destinations besides DNS, exact `ip:port` | the kernel, transparent mode | §11 |
 | `icmp` | Ping (echo) destinations | the kernel, transparent mode | §11 |
+| `content` | Patterns in request bodies and query strings: deny, redact or record | the proxy, on hosts it terminates or that are plaintext | §10 |
 
 **Ceiling fields**, under `spec:`:
 - `appliesTo`;
@@ -398,7 +403,7 @@ root-only, because pins govern every run on the node.
 ## 10. TLS termination
 
 A host is terminated when some rule needs what is inside TLS: `http` method
-or path rules, or MCP server rules. Termination is node-wide; the receipt's
+or path rules, MCP server rules, or content rules. Termination is node-wide; the receipt's
 posture table lists each terminated host and the rules that caused it.
 Everything else is tunnelled untouched, with the origin's own certificate.
 
@@ -417,6 +422,65 @@ Everything else is tunnelled untouched, with the origin's own certificate.
 
 Terminating TLS makes the proxy a holder of plaintext. Terminate only the
 hosts whose rules need it, and treat the node as sensitive accordingly.
+
+### Content rules
+
+A content rule is a pattern (RE2, Go `regexp` syntax) checked against what
+a run sends: the request body, and the query string, raw and
+percent-decoded. Its action:
+- `deny` refuses the request with a narrated 403 (`message`, or one
+  generated), and nothing is sent;
+- `redact` replaces each match in the body with `*` of the same length, so
+  the request still fits its Content-Length;
+- `tag-and-log` records the match and changes nothing.
+
+```yaml
+  content:
+    - { name: aws-keys, regex: "AKIA[0-9A-Z]{16}", action: deny }
+    - name: internal-hosts
+      regex: "[a-z0-9-]{1,63}\\.corp\\.internal"
+      action: redact
+      to: { fqdn: ["api.openai.com"] }   # only these hosts
+```
+
+**Which hosts.** Without `to:`, a rule covers every host the profile allows
+by name, and its remote MCP servers. Those hosts are terminated for it (or
+stay plaintext, if allowed on port 80 only). Some hosts are left out, and
+the receipt lists them under each rule:
+- hosts marked `no_terminate`;
+- hosts allowed only on ports that are not HTTP or TLS;
+- destinations allowed by address (`cidr`);
+- anything reached only through `fqdn: "*"` or `egress.default: allow`.
+
+The proxy cannot read those requests. Check the receipt before relying on a
+rule.
+
+**How bodies are checked.** The proxy holds a covered request's body until
+it is complete, checks it whole (so a match split across packets is still
+found), then sends it on, redacted or not, or refuses it. What cannot be
+checked is refused:
+- a body over `-inspect-max-body` (default 8 MiB) gets 413;
+- a body compressed as anything but gzip or deflate gets 415. Gzip and
+  deflate bodies are decoded to check, but a `redact` match in one refuses
+  the request, since it cannot be rewritten compressed;
+- a `redact` match in the query string refuses the request;
+- 503 when the node holds as many inspected requests as it allows: 4,096,
+  256 per run, 256 MiB of bodies.
+
+**Limits.**
+- A rule sees bytes as sent. A secret split up, re-encoded (base64) or
+  hidden in an encoding the rule does not anticipate does not match.
+  Content rules narrow exfiltration through allowed hosts; they do not close
+  it (design §11).
+- Responses are not checked.
+- Prefer bounded repetition (`{20,40}`) to `+` and `*`: one match of an
+  unbounded pattern can run to the end of the body. The receipt flags it.
+
+**Records.** Each match lands in the run's timeline as a `content` event.
+The summary counts, per host and rule, the matches, refusals and
+redactions, and what an audit layer would have done. The matched text is
+never recorded. `agentctl check` cannot replay content rules, since
+timelines do not hold what was sent, and says so.
 
 ## 11. Transparent mode (Linux)
 
@@ -761,7 +825,8 @@ agentctl events --json <run-id>
   With credential identity, nothing below the proxy is observed at all. See
   design §6.8 and §11.
 - **Allowed destinations.** Exfiltration through allowed destinations is a
-  stated limit (design §11). Path rules narrow it; they do not close it.
+  stated limit (design §11). Path rules and content rules narrow it; they
+  do not close it.
 - **Nested runs share their tree.** A run and the runs nested in it share
   the top-level run's event budget, its Unix sockets, and network sockets
   passed between them. A nested run can never be allowed more than its
@@ -777,7 +842,11 @@ agentctl events --json <run-id>
 | Requests get `500` from the proxy | Envoy cannot reach `ext_proc`: socket path, `-envoy-uids`, or the volume mount. |
 | `unidentified client` (cgroup identity) | The client's socket is not in a run: started outside `agentctl run`, or through a proxy chain that hides the source port. |
 | `407` / `no run credential` (credential identity) | The request lacked the run's proxy URL credential: started outside `agentctl run`, or the tool dropped the credentials from the proxy URL. |
-| `needs termination` | A rule needs method or path on a host Envoy does not terminate yet. Restart Envoy after the reload message. |
+| `needs termination` | A rule needs method or path, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
+| `413` on a large upload | The body is over `-inspect-max-body`, and a content rule or remote MCP covers the host. Raise the limit, or scope the content rule with `to:`. |
+| `415` from the proxy | A content rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| `503` "inspected requests in flight" | The node or the run holds as many inspected requests as allowed. Transient. |
+| curl over HTTP/2 shows `000` for a refused upload | curl 7.88 loses a refusal sent before it has sent any of its body, as for a path deny on a POST. The timeline has the refusal. |
 | `426 Upgrade Required` | A bootstrap from before 2.7 with an HTTP/1.0 client (Python before 3.12). Regenerate it by restarting the node agent, then restart Envoy. |
 | curl ignores the proxy for `http://` URLs | curl reads only lower-case `http_proxy`. `agentctl run` sets both; check the environment of hand-started tools. |
 | TLS errors on a terminated host | The tool does not read the trust variables. Point it at `<runtime-dir>/ca-bundle.pem`, or mark the rule `no_terminate` (losing its path rules). |
@@ -812,6 +881,9 @@ They check:
 - the 407 challenge for missing credentials;
 - a git clone through termination;
 - remote MCP filtering and in-place denials;
+- content rules: bodies denied, redacted in place and passed unchanged,
+  including chunked, gzip, query strings, 2 MB bodies, the size limit, and
+  concurrent uploads mixed with refusals;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 

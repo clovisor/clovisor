@@ -148,6 +148,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("mcp", e.testMCP)
 	t.Run("no-credential", e.testNoCredential)
 	t.Run("timeline-and-learn", e.testTimeline)
+	t.Run("content", e.testContent)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -386,6 +387,61 @@ func (e *env) testTimeline(t *testing.T) {
 		t.Fatalf("learn/check: %v\n%s%s", err, out, errOut)
 	}
 	expect(t, out, "http   GET origin.test:443/allowed", "Would be denied (1)", "GET origin.test:443/secret")
+}
+
+func (e *env) testContent(t *testing.T) {
+	// The script goes in a file: agentRun quotes it in single quotes.
+	if _, errOut, err := e.sh(`cat > /tmp/content.sh <<'EOS'
+u=https://origin.test/echo
+echo "clean: $(curl -s --data-binary '{"a":"hello"}' $u)"
+echo "redact: $(curl -s --data-binary '{"t":"tok_abcd1234","n":1}' $u)"
+echo "chunked: $(curl -s -H 'Transfer-Encoding: chunked' --data-binary '{"t":"tok_zzzz9999"}' $u)"
+curl -s --data-binary '{"k":"AKIAABCDEFGHIJKLMNOP"}' $u > /tmp/deny; echo "deny: $(cat /tmp/deny)"
+echo "query: $(curl -s -o /dev/null -w '%{http_code}' "$u?k=AKIAABCDEFGHIJKLMNOP")"
+printf '{"k":"AKIAABCDEFGHIJKLMNOP"}' | gzip > /tmp/k.gz
+echo "gzip: $(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Encoding: gzip' --data-binary @/tmp/k.gz $u)"
+echo "brotli: $(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Encoding: br' --data-binary @/tmp/k.gz $u)"
+head -c 2000000 /dev/zero | tr '\0' a > /tmp/2m
+echo "2MB: $(curl -s --data-binary @/tmp/2m $u)"
+head -c 9000000 /dev/zero | tr '\0' a > /tmp/9m
+echo "9MB: $(curl -s -o /dev/null -w '%{http_code}' --data-binary @/tmp/9m $u)"
+echo "9MB chunked: $(curl -s -o /dev/null -w '%{http_code}' -H 'Transfer-Encoding: chunked' --data-binary @/tmp/9m $u)"
+# Held bodies released whole, mixed with refusals, on shared upstream
+# connections: Envoy once took the origin's window updates for a flood.
+for j in 1 2 3 4 5 6 7 8; do (for i in 1 2 3 4 5 6 7 8 9 10; do
+  curl -s -o /dev/null -w "%{http_code}\n" --data-binary @/tmp/2m $u
+  curl -s -o /dev/null -w "%{http_code}\n" --data-binary '{"k":"AKIAABCDEFGHIJKLMNOP"}' $u
+done) & done > /tmp/mixed; wait
+echo "mixed:$(sort /tmp/mixed | uniq -c | tr -s ' ' | tr '\n' ',')"
+EOS`); err != nil {
+		t.Fatal(errOut)
+	}
+	out, id := e.agentRun("it-content", `sh /tmp/content.sh`)
+	expect(t, out,
+		`clean: {"body":"{\"a\":\"hello\"}","chunked":false,"content_length":"13","len":13}`,
+		// Redacted in place, same length: Content-Length still right.
+		`redact: {"body":"{\"t\":\"************\",\"n\":1}","chunked":false,"content_length":"26","len":26}`,
+		// Envoy reaches the origin over HTTP/2: no framing to compare.
+		`chunked: {"body":"{\"t\":\"************\"}",`, `"len":20}`,
+		`its body matches content rule aws-keys of profile it-content`,
+		"query: 403", "gzip: 403", "brotli: 415",
+		`2MB: {"body":"aaaa`, "9MB: 413", "9MB chunked: 413", "mixed: 80 200, 80 403,")
+	if strings.Contains(out, "AKIAABCDEFGHIJKLMNOP\"") || strings.Contains(out, "tok_") {
+		t.Errorf("a match reached the origin or the narration:\n%s", out)
+	}
+	if !strings.Contains(out, `"len":2000000`) {
+		t.Errorf("2 MB body not delivered whole:\n%s", out)
+	}
+
+	shown, _, err := e.sh("/it/bin/agentctl show " + id + " && /it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Content rules", "it-content/aws-keys (deny)", "it-content/tokens (redact)", "refused: body over the inspection limit",
+		"-> redact (body: redact it-content/tokens ×1)", "-> deny rule aws-keys by it-content")
+	if strings.Contains(shown, "AKIA") || strings.Contains(shown, "tok_") {
+		t.Errorf("timeline records a match:\n%s", shown)
+	}
 }
 
 func (e *env) testPinDrift(t *testing.T) {

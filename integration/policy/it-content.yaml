@@ -1,0 +1,14 @@
+kind: AgentProfile
+metadata: { name: it-content }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: echo
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [POST, GET], paths: ["/echo"] }
+        action: allow
+  content:
+    - { name: aws-keys, regex: "AKIA[0-9A-Z]{16}", action: deny }
+    - { name: tokens, regex: "tok_[a-z0-9]{8}", action: redact }

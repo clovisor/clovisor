@@ -65,7 +65,8 @@ func innerReq(c testClient, host, method string) (*extprocv3.ProcessingRequest, 
 
 func innerHeaders(xp *ExtProcServer, c testClient, host, method string) (*extprocv3.ProcessingResponse, *remoteMCP) {
 	req, h := innerReq(c, host, method)
-	return xp.onHeaders(context.Background(), req, h)
+	resp, st := xp.onHeaders(context.Background(), req, h)
+	return resp, st.remoteMCP()
 }
 
 func respHeaders(ct string) *extprocv3.HttpHeaders {
@@ -93,7 +94,7 @@ func TestRemoteMCP(t *testing.T) {
 
 	// Only requests to a governed MCP host get body processing.
 	resp, m := innerHeaders(xp, c, "mcp.test.internal", "POST")
-	if m == nil || resp.GetModeOverride().GetRequestBodyMode().String() != "BUFFERED" || resp.GetModeOverride().GetResponseBodyMode().String() != "STREAMED" {
+	if m == nil || resp.GetModeOverride().GetRequestBodyMode().String() != "STREAMED" || resp.GetModeOverride().GetResponseBodyMode().String() != "STREAMED" {
 		t.Fatalf("no mode override for the MCP host: %v", resp.GetModeOverride())
 	}
 	if _, m2 := innerHeaders(xp, c, "api.example.com", "POST"); m2 != nil {

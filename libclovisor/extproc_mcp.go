@@ -66,12 +66,13 @@ func (d *mcpDrift) has(key, tool string) bool {
 	return d.m[key][tool]
 }
 
-// mcpModes is the processing mode for inspected MCP streams: buffered
-// request bodies (JSON-RPC requests are small), and streamed response
+// mcpModes is the processing mode for inspected MCP streams: streamed
+// request bodies, held by ext_proc until complete (buffered mode stalls a
+// body above Envoy's buffer limit, 5.0 spikes), and streamed response
 // bodies so SSE keeps flowing.
 var mcpModes = &filterv3.ProcessingMode{
 	RequestHeaderMode:  filterv3.ProcessingMode_SEND,
-	RequestBodyMode:    filterv3.ProcessingMode_BUFFERED,
+	RequestBodyMode:    filterv3.ProcessingMode_STREAMED,
 	ResponseHeaderMode: filterv3.ProcessingMode_SEND,
 	ResponseBodyMode:   filterv3.ProcessingMode_STREAMED,
 }

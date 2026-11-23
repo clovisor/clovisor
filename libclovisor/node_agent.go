@@ -83,6 +83,10 @@ type NodeAgentOptions struct {
 	EnvoyUIDs     []uint32 // uids Envoy runs as, admitted to ext_proc (root always is)
 	// NonRunProxy lets processes outside any run use the proxy.
 	NonRunProxy bool
+	// MaxInspectBody is the largest request body the proxy checks for
+	// content rules or remote MCP (milestone 5.1); larger ones are
+	// refused. Zero means DefaultMaxBody.
+	MaxInspectBody int
 
 	// CADir holds the node CA used for termination; /var/lib/clovisor/ca if empty.
 	CADir string
@@ -322,6 +326,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		}
 		api.Pins = xp.Pins
 		xp.NonRunAllowed = opts.NonRunProxy
+		xp.MaxBody = opts.MaxInspectBody
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
 			api.Close()
 			closeAudit()
@@ -787,6 +792,18 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			extra += " reason=" + strconv.Quote(d.Reason)
 		}
 		fmt.Printf("%s [MCP] run=%d %s %s %s decision=%s%s\n", ts, event.RunCgroupID, d.Server, d.Method, d.Name, d.Decision, extra)
+	case EventContent:
+		d := event.Data.(ContentData)
+		var hits []string
+		for _, h := range d.Hits {
+			hits = append(hits, fmt.Sprintf("%s/%s:%s×%d", h.Layer, h.Rule, h.Action, h.Count))
+		}
+		extra := ""
+		if d.Reason != "" {
+			extra = " reason=" + strconv.Quote(d.Reason)
+		}
+		fmt.Printf("%s [CONTENT] run=%d %s %s%s %s decision=%s hits=[%s]%s\n", ts, event.RunCgroupID, d.Method,
+			net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))), d.Path, d.Where, d.Decision, strings.Join(hits, " "), extra)
 	case EventHTTP:
 		d := event.Data.(HTTPData)
 		what := d.Method + " " + net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))) + d.Path

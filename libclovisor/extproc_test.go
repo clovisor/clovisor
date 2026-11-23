@@ -215,7 +215,7 @@ func TestExtProcIdentity(t *testing.T) {
 	}
 }
 
-func first(r *extprocv3.ProcessingResponse, _ *remoteMCP) *extprocv3.ProcessingResponse { return r }
+func first(r *extprocv3.ProcessingResponse, _ *streamState) *extprocv3.ProcessingResponse { return r }
 
 func TestEnvoyBootstrap(t *testing.T) {
 	b, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: netip.MustParseAddrPort("127.0.0.1:18000"),
@@ -229,7 +229,8 @@ func TestEnvoyBootstrap(t *testing.T) {
 	}
 	s := string(b)
 	for _, want := range []string{`"path": "/run/clovisor/envoy-admin.sock"`, `"path": "/run/clovisor/extproc.sock"`,
-		`"failure_mode_allow": false`, `"port_value": 18000`, `"connect_matcher"`} {
+		`"failure_mode_allow": false`, `"port_value": 18000`, `"connect_matcher"`,
+		`"max_message_timeout": "30s"`, `"max_requests": 1000000`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("bootstrap lacks %s", want)
 		}
@@ -376,6 +377,7 @@ func TestEnvoyBootstrapTermination(t *testing.T) {
 	}
 	s := string(b)
 	for _, want := range []string{`"name": "clovisor-terminate-0"`, `"server_listener_name": "mitm-0"`, `"envoy.bootstrap.internal_listener"`,
+		`"max_inbound_window_update_frames_per_data_frame_sent": 100`,
 		`"filename": "/t/0.crt"`, `"auto_san_validation": true`, `"xds.route_name"`, `"remove": "x-clovisor-client"`,
 		`%FILTER_STATE(clovisor.connect:PLAIN)%`} {
 		if !strings.Contains(s, want) {

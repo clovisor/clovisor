@@ -130,6 +130,8 @@ type CompiledProfile struct {
 	UnixAllow []string
 	// Net is the udp and icmp blocks, validated (milestone 4.7).
 	Net NetGrant
+
+	content []*compiledContent
 }
 
 // DestPosture is the TLS posture derived for one destination. Posture is
@@ -170,11 +172,9 @@ var notYet = map[string]string{
 	"mode ask":          "the approval UI (Phase 5)",
 	"action ask":        "the approval UI (Phase 5)",
 	"action rate-limit": "stateful limits (Phase 5)",
-	"action redact":     "content policy (Phase 5)",
 	"action redirect":   "transparent mode (Phase 3)",
 	"model":             "model allow-lists with budgets (Phase 5)",
 	"budget":            "budgets (Phase 5)",
-	"content":           "content policy (Phase 5)",
 	"limits":            "stateful limits (Phase 5)",
 	"exec hash":         "IMA hash verification (Phase 4)",
 	"sampling ask":      "the approval UI (Phase 5)",
@@ -268,9 +268,8 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 	c.mcp(p, cp)
 	c.unix(p, cp)
 	c.net(p, cp)
-	if len(p.Spec.Content) > 0 {
-		c.unsupported("spec.content", "content")
-	}
+	c.content(p, cp)
+	c.contentTerminates(p, cp)
 	if p.Spec.Limits != nil {
 		c.unsupported("spec.limits", "limits")
 	}
@@ -342,8 +341,10 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 
 		switch r.Action {
 		case ActionAllow, ActionDeny, ActionTagAndLog:
-		case "ask", "rate-limit", "redact", "redirect":
+		case "ask", "rate-limit", "redirect":
 			c.unsupported(where, "action "+r.Action)
+		case ContentActionRedact:
+			c.errf(where, "redact is an action for content rules (spec.content), not egress rules")
 		case "":
 			c.errf(where, "action is required")
 		default:
@@ -651,6 +652,20 @@ func (c *compiler) posture(profiles []*AgentProfile) []DestPosture {
 					}
 					d.why = append(d.why, fmt.Sprintf("%s (%s: http)", p.Metadata.Name, r.Name))
 				}
+			}
+		}
+		// Content rules read request bodies (milestone 5.1).
+		for _, cr := range p.Spec.Content {
+			hosts, plain := contentScope(p, cr)
+			for _, h := range hosts {
+				d := get(h)
+				d.users[p.Metadata.Name] = true
+				d.needs = true
+				d.needers[p.Metadata.Name] = true
+				if !plain[h] {
+					d.plain = false
+				}
+				d.why = append(d.why, fmt.Sprintf("%s (content %s)", p.Metadata.Name, cr.Name))
 			}
 		}
 		if p.Spec.MCP != nil {

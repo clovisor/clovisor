@@ -48,6 +48,9 @@ type CheckReport struct {
 	NotGoverned []CheckFinding
 	// Transparent: replayed as transparent enforce would decide.
 	Transparent bool
+	// ContentRules names the profile's content rules, which no replay can
+	// decide: runs record which rules matched, not what was sent.
+	ContentRules []string
 }
 
 // CheckOptions describe the deployment to replay against.
@@ -87,6 +90,9 @@ func CheckRuns(cp *policy.CompiledProfile, runs []*RunTimeline) *CheckReport {
 // CheckRunsWith is CheckRuns for the deployment o describes.
 func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptions) *CheckReport {
 	rep := &CheckReport{Profile: cp.Name, Version: cp.Profile.ShortVersion(), Transparent: o.Transparent}
+	for _, r := range cp.Profile.Spec.Content {
+		rep.ContentRules = append(rep.ContentRules, r.Name)
+	}
 	udpAllowed := func(ip netip.Addr, port uint16) bool {
 		for _, a := range o.UDPAllow {
 			if a.Port() == port && (a.Addr().Unmap() == ip.Unmap() || (a.Addr().IsUnspecified() && ip.IsLoopback())) {
@@ -349,6 +355,11 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 			title = "Not decided by policy"
 		}
 		section(title, rep.NotGoverned, func(f CheckFinding) string { return f.Decision + runs(f) })
+	}
+	if len(rep.ContentRules) > 0 {
+		p("")
+		p("Content rules (%d) not replayed: runs record which rules matched, not what was sent: %s",
+			len(rep.ContentRules), strings.Join(rep.ContentRules, ", "))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
