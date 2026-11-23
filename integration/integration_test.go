@@ -55,7 +55,7 @@ var EnvoyImage = func() string {
 	return DefaultEnvoyImage
 }()
 
-const agentImage = "clovisor-it-agent:bookworm-1"
+const agentImage = "clovisor-it-agent:bookworm-2"
 
 type env struct {
 	t      *testing.T

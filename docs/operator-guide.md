@@ -217,6 +217,27 @@ spec:
     sampling: { action: deny, message: "MCP servers may not drive the model." }
 ```
 
+**Profile blocks**, under `spec:`:
+
+| Block | What it governs | Enforced by | Section |
+|---|---|---|---|
+| `mode` | `enforce` refuses; `audit` records what enforce would refuse | | |
+| `egress` | Destinations by name, address, port, method and path, first match wins | the proxy; in transparent mode every TCP connect goes there | §10, §11 |
+| `mcp` | MCP servers and their tools, sampling | the gateway and the proxy | §9 |
+| `exec` | Which binaries a run may execute | BPF LSM | §11 |
+| `unix` | Unix sockets outside the run | BPF LSM | §11 |
+| `udp` | UDP destinations besides DNS, exact `ip:port` | the kernel, transparent mode | §11 |
+| `icmp` | Ping (echo) destinations | the kernel, transparent mode | §11 |
+
+**Ceiling fields**, under `spec:`:
+- `appliesTo`;
+- `allow`, `default` and `clamp`;
+- `allowRootSockets`, which lets profiles under the ceiling allow sockets
+  that give root;
+- `udp` and `icmp`, which bound those blocks.
+
+A profile's `udp` or `icmp` entry works only where its ceiling lists it too.
+
 - **Explain before you load.** `agentctl explain profile.yaml…` compiles
   profiles exactly as the node agent will. It prints the *enforcement
   receipt*: for each rule, what enforces it, and the TLS posture for each
@@ -428,6 +449,39 @@ relying on it.
 | `bpf_get_current_ancestor_cgroup_id`, BPF links and link update, `INET_DIAG_CGROUP_ID` | run identity, fail-closed pins, socket lookup | 5.7 |
 | `cgroup/getpeername4,6`, ring buffer | original peer, events | 5.8 |
 | atomic exchange in BPF | backstop report counts | 5.12 |
+| BPF LSM (`CONFIG_BPF_LSM`), active at boot | socket families, foreign sockets, Unix sockets, exec | 5.7 |
+| `bpf_d_path` | exec by resolved path | 5.10 |
+
+**Enabling BPF LSM.** Transparent mode works without it, but socket
+families, foreign sockets, Unix sockets and exec are then not governed. The
+receipt marks those rules "not enforced", and `agentctl status` shows
+`Sockets       not active: ...`. Per-run UDP and ICMP need no LSM. To enable it:
+
+1. Check the kernel was built with it:
+   `grep CONFIG_BPF_LSM /boot/config-$(uname -r)` should print `=y`. Most
+   distribution kernels are.
+2. Check whether it is active: `cat /sys/kernel/security/lsm` must list
+   `bpf`. If securityfs is not mounted, run
+   `mount -t securityfs none /sys/kernel/security`.
+3. If `bpf` is missing, add it to the `lsm=` boot parameter. Keep the
+   modules already listed, in their order, and put `bpf` last. Then reboot:
+
+   ```sh
+   cat /sys/kernel/security/lsm     # e.g. lockdown,capability,landlock,yama,apparmor
+   # Debian, Ubuntu: in /etc/default/grub
+   GRUB_CMDLINE_LINUX="... lsm=lockdown,capability,landlock,yama,apparmor,bpf"
+   sudo update-grub
+   # Fedora, RHEL: grubby adds it to every installed kernel
+   sudo grubby --update-kernel=ALL --args="lsm=lockdown,capability,yama,selinux,bpf"
+   ```
+
+4. After the reboot, start the node agent and check `agentctl status`. It
+   should show `Sockets       enforce` (or `audit`).
+
+Leaving out a module that was in the list turns that module off, so copy the
+list exactly. BPF LSM adds no enforcement until the node agent loads its
+programs. Those programs stand down for anything outside a run, and only
+deny.
 
 **Roll it out in three steps:**
 
@@ -579,9 +633,8 @@ grants it too.
 netlink sockets only: raw IP, packet, vsock and other families get `EPERM`.
 A network socket created outside the run (inherited, or passed in over a
 Unix socket) is refused at connect and send. Audit mode records these
-instead. `agentctl status` shows the `Sockets` line. Enable BPF LSM by adding
-`bpf` to the kernel's `lsm=` boot parameter (check
-`/sys/kernel/security/lsm`); without it these are not governed, and the
+instead. `agentctl status` shows the `Sockets` line. To turn BPF LSM on,
+see "Enabling BPF LSM" above; without it these are not governed, and the
 receipt says so.
 
 **Unix sockets, where BPF LSM is active.** A run reaches Unix sockets it
@@ -647,8 +700,12 @@ build directories with `dir/*`. Exec rules catch unknown binaries, not
 unknown behaviour: an allowed interpreter runs any code it is given (design
 §7.6).
 
-**Not covered yet:** a host daemon connecting on a run's behalf through a
-socket the profile allows; hash matching (`exec.allow[].hash`).
+**Not covered yet:**
+- a host daemon connecting on a run's behalf through a socket the profile
+  allows: what the daemon does is outside the run;
+- hash matching (`exec.allow[].hash`);
+- per-cgroup attachment of the LSM programs (`lsm_cgroup`). The hooks are
+  global and stand down outside runs.
 
 ## 12. Incident response
 
@@ -705,6 +762,12 @@ agentctl events --json <run-id>
   design §6.8 and §11.
 - **Allowed destinations.** Exfiltration through allowed destinations is a
   stated limit (design §11). Path rules narrow it; they do not close it.
+- **Nested runs share their tree.** A run and the runs nested in it share
+  the top-level run's event budget, its Unix sockets, and network sockets
+  passed between them. A nested run can never be allowed more than its
+  parent, but it can use what its parent hands it.
+- **Allowed interpreters run anything.** Exec rules gate binaries: `python3`
+  allowed means any Python the run writes (design §7.6).
 
 ## 15. Troubleshooting
 
@@ -778,6 +841,14 @@ ignore the proxy, it checks:
   refused, the run's own and the run API reached; a root-owned binary in
   `/tmp` refused by the trusted-path test and one under an allowed
   directory run;
+- also where BPF LSM is active: a Docker socket, a live ssh-agent and
+  systemd-resolved's varlink socket, all bound outside the run, refused;
+- tool calls attributed to their `call-<n>` cgroups;
+- a sub-agent nested in a `tp` run, requesting a broader profile, getting no
+  more than `tp` allows (HTTP, DNS, exec), unable to revoke its parent, and
+  revoked with it;
+- per-run UDP and ping granted by profile and ceiling, refused elsewhere and
+  to a sub-agent whose profile lacks them;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

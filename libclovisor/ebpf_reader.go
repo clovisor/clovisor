@@ -879,8 +879,8 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 	case t.Mode == TransparentOff:
 		r.lsmState = "off"
 	case !BPFLSMActive():
-		r.lsmState = "not active: socket families and foreign sockets are not governed (boot with bpf in lsm=)"
-		log.Printf("bpf: BPF LSM is not active; socket families and foreign sockets are not governed")
+		r.lsmState = "not active: socket families, foreign sockets, Unix sockets and exec are not governed (boot with bpf in lsm=)"
+		log.Printf("bpf: BPF LSM is not active; socket families, foreign sockets, Unix sockets and exec are not governed")
 	}
 	if r.lsmState != "" {
 		for _, n := range lsmNames {

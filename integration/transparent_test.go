@@ -76,6 +76,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("socket-families", e.testSocketFamilies)
 	t.Run("passed-in-socket", e.testPassedInSocket)
 	t.Run("unix-sockets", e.testUnixSockets)
+	t.Run("host-daemons", e.testHostDaemons)
 	t.Run("exec", e.testExec)
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
@@ -357,10 +358,8 @@ else:
 	expect(t, e.timeline(id), `"send inet socket created outside the run`)
 }
 
-func (e *env) testUnixSockets(t *testing.T) {
-	// Two sockets bound outside the run, one of them in unix.allow.
-	e.needLSM(t)
-	serve := e.py("unixserve", `import os, socket, sys
+// unixServe listens on the Unix socket path argv[1], open to everyone.
+const unixServe = `import os, socket, sys
 srv = socket.socket(socket.AF_UNIX)
 if os.path.exists(sys.argv[1]):
     os.unlink(sys.argv[1])
@@ -369,7 +368,12 @@ os.chmod(sys.argv[1], 0o777)
 srv.listen(8)
 while True:
     srv.accept()[0].close()
-`)
+`
+
+func (e *env) testUnixSockets(t *testing.T) {
+	// Two sockets bound outside the run, one of them in unix.allow.
+	e.needLSM(t)
+	serve := e.py("unixserve", unixServe)
 	for _, p := range []string{"/run/it-allowed.sock", "/run/it-denied.sock"} {
 		e.run("exec", "-d", e.name("agent"), "sh", "-c", serve+" "+p)
 	}
@@ -391,6 +395,41 @@ print("own", connect("\0it-own"))
 `) + "; /it/bin/agentctl status | grep -c Transparent")
 	expect(t, out, "allowed ok", "denied refused 1", "own ok", "\n1\n")
 	expect(t, e.timeline(id), `"path": "/run/it-denied.sock"`, `"verdict": "refused: unix"`)
+}
+
+// The host daemons the plan names (milestone 4.8): each acts for whoever
+// connects, so a run reaching one escapes its policy. Docker's socket is
+// root; ssh-agent signs with the user's keys; systemd-resolved resolves
+// names around the forced resolver (finding 1). None is in tp's
+// unix.allow, so all are refused.
+func (e *env) testHostDaemons(t *testing.T) {
+	e.needLSM(t)
+	serve := e.py("unixserve", unixServe)
+	for _, p := range []string{"/run/docker.sock", "/run/systemd/resolve/io.systemd.Resolve"} {
+		e.run("exec", "-d", e.name("agent"), "sh", "-c", "mkdir -p $(dirname "+p+") && "+serve+" "+p)
+	}
+	// A real ssh-agent, with a key in it, outside the run.
+	if _, errOut, err := e.sh(`rm -rf /tmp/ssh-it && mkdir -m 700 /tmp/ssh-it &&
+ssh-agent -a /tmp/ssh-it/agent.sock | sed -n "s/^SSH_AGENT_PID=\([0-9]*\);.*/\1/p" > /tmp/ssh-it/pid && chmod 777 /tmp/ssh-it /tmp/ssh-it/agent.sock &&
+ssh-keygen -q -t ed25519 -N "" -f /tmp/ssh-it/key && SSH_AUTH_SOCK=/tmp/ssh-it/agent.sock ssh-add -q /tmp/ssh-it/key &&
+SSH_AUTH_SOCK=/tmp/ssh-it/agent.sock ssh-add -l > /dev/null`); err != nil {
+		t.Fatalf("ssh-agent: %v %s", err, errOut)
+	}
+	time.Sleep(time.Second)
+	out, id := e.trun(`SSH_AUTH_SOCK=/tmp/ssh-it/agent.sock ssh-add -l >/dev/null 2>&1 && echo "ssh-agent: keys listed" || echo "ssh-agent: refused"
+` + e.py("unixuse2", `import socket
+for p in ["/run/docker.sock", "/run/systemd/resolve/io.systemd.Resolve"]:
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(p)
+        print(p, "ok")
+    except OSError as err:
+        print(p, "refused", err.errno)
+`))
+	expect(t, out, "ssh-agent: refused", "/run/docker.sock refused 1", "io.systemd.Resolve refused 1")
+	expect(t, e.timeline(id), `"path": "/tmp/ssh-it/agent.sock"`, `"path": "/run/docker.sock"`,
+		`"path": "/run/systemd/resolve/io.systemd.Resolve"`)
+	e.sh("kill $(cat /tmp/ssh-it/pid); rm -f /run/docker.sock /run/systemd/resolve/io.systemd.Resolve")
 }
 
 func (e *env) testExec(t *testing.T) {

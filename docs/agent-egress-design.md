@@ -90,6 +90,12 @@ place:
 | Sub-agents: a run started inside a run is nested below it, with its parent's layers plus its own, in the proxy, the resolver and the kernel; clamps cascade; each nested run has its own timeline, linked to its parent. | [4.6 status](#46-status-2026-11-23) |
 | Per-run UDP and ICMP echo, asked for by the profile and bounded by the ceiling, in a per-run kernel map that needs no BPF LSM. | [4.7 status](#47-status-2026-11-23) |
 
+### 2026-11-23 — Phase 4 complete
+
+| Change | Where |
+|---|---|
+| Host daemons (Docker, a live ssh-agent, systemd-resolved's varlink socket) refused in the privileged test; operator guide gains enabling BPF LSM, a block reference and the new limits. Phase 4 complete. | [4.8 status](#48-status-2026-11-23), [operator guide](operator-guide.md) |
+
 ---
 
 ## 1. Provenance: what Clovisor was
@@ -3114,6 +3120,48 @@ checks:
   the UDP check.
 - A sub-agent under it requesting `tp-sub`, which has neither block, was
   refused both.
+
+#### 4.8 status (2026-11-23)
+
+The plan's privileged tests, in `make integration-transparent` (eighteen
+checks), where BPF LSM is active:
+
+| Planned | Check |
+|---|---|
+| A raw socket refused | `socket-families`: raw, packet and vsock refused; netlink created |
+| `docker.sock` and ssh-agent refused, an allowed Unix path reached | `unix-sockets`, `host-daemons`. A live `ssh-agent` holding a key outside the run lists it from outside and is refused from inside, along with a Docker socket |
+| systemd-resolved's socket refused | `host-daemons`: `/run/systemd/resolve/io.systemd.Resolve` refused, closing [finding 1](#phase-4-plan-2026-11-23) |
+| An inherited socket refused at connect | `inherited-socket` at start; `passed-in-socket` for one handed over later |
+| A binary in `/tmp` refused, a system binary allowed | `exec` |
+| Call attribution | `tool-calls` |
+| A sub-agent unable to exceed its parent | `sub-agents` |
+| (4.7) | `run-udp-icmp` |
+
+The operator guide gains:
+
+- how to enable BPF LSM, and what is not governed without it;
+- a reference to every profile block and ceiling field;
+- nested runs and allowed interpreters among the limits;
+- the updated test list.
+
+The node's "LSM not active" status now names Unix sockets and exec too.
+
+**Phase 4 complete.** On Linux with BPF LSM, a run's whole process tree is
+governed:
+
+- which binaries it executes;
+- which socket families it creates, and which sockets from outside it uses;
+- which Unix sockets it reaches;
+- its TCP (redirect-or-deny), DNS, UDP and ICMP.
+
+Tool calls are attributed, and sub-agents are bounded by their parents.
+
+Known gaps, carried forward:
+
+- hash-based exec matching (IMA, with a cache);
+- `lsm_cgroup`, once cilium/ebpf can load it;
+- what an allowed host daemon does on a run's behalf;
+- nested runs sharing their tree's event budget and sockets.
 
 #### Decisions
 
