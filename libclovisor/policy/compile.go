@@ -98,7 +98,17 @@ type compiledRule struct {
 
 type compiledExec struct {
 	Exec
-	allow map[string]bool
+	allow    map[string]bool
+	prefixes []string // allow entries ending in /*, without the *
+}
+
+// MaxExecPrefixes matches MAX_EXEC_PREFIXES in agent_audit.c.
+const MaxExecPrefixes = 4
+
+// ExecEnforceable says whether this deployment refuses execs: transparent
+// mode with BPF LSM.
+func (o Options) ExecEnforceable() bool {
+	return o.KernelLSM && (o.Mode == Transparent || o.Mode == TransparentAudit)
 }
 
 // CompiledProfile is a profile ready for enforcement and explanation.
@@ -457,39 +467,68 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 	default:
 		c.errf("exec.default", "must be allow or deny, got %q", e.Default)
 	}
-	if p.Spec.Mode == ModeEnforce && !e.AuditOnly {
-		c.errf("exec", "exec rules cannot be enforced by this deployment: gating exec needs BPF LSM (Phase 4). "+
+	if e.RequireReadonlyOrigin {
+		e.RequireTrustedPath = true // the earlier name
+	}
+	enforceable := c.opts.ExecEnforceable()
+	if p.Spec.Mode == ModeEnforce && !e.AuditOnly && !enforceable {
+		c.errf("exec", "exec rules cannot be enforced by this deployment: gating exec needs transparent mode with BPF LSM. "+
 			"Set exec.audit_only: true to keep them as audit-only, or remove the exec block")
 	}
 	ce := &compiledExec{Exec: *e, allow: map[string]bool{}}
-	observed := "exec events from the node agent"
-	if !c.opts.Linux {
-		observed = "not observed: needs the Linux node agent"
+	tier, by := "1", "BPF LSM (bprm_check_security), by resolved path"
+	var notes []string
+	switch {
+	case !c.opts.Linux:
+		tier, by = "audit", "not observed: needs the Linux node agent"
+	case !enforceable:
+		tier, by = "audit", "exec events from the node agent"
+		notes = append(notes, "not enforced: needs transparent mode with BPF LSM")
+	case e.AuditOnly:
+		tier = "audit"
+		notes = append(notes, "audit_only: refusals recorded, not made")
 	}
 	cp.Placements = append(cp.Placements, Placement{
-		Rule: "exec (default " + e.Default + ")", Tier: "audit", EnforcedBy: observed,
-		Notes: []string{"not enforced until BPF LSM (Phase 4)"},
+		Rule: "exec (default " + e.Default + ")", Tier: tier, EnforcedBy: by, Notes: notes,
 	})
-	if e.RequireReadonlyOrigin {
+	if e.RequireTrustedPath {
 		cp.Placements = append(cp.Placements, Placement{
-			Rule: "exec/readonly-origin", Tier: "audit", EnforcedBy: "not observed",
-			Notes: []string{"needs BPF LSM (Phase 4)"},
+			Rule: "exec/trusted-path", Tier: tier, EnforcedBy: by,
+			Notes: append(append([]string{}, notes...), "execs not in exec.allow must come from root-owned paths no one else can write"),
 		})
 	}
 	for i, a := range e.Allow {
 		where := fmt.Sprintf("exec.allow[%d]", i)
-		if !path.IsAbs(a.Path) || path.Clean(a.Path) != a.Path {
-			c.errf(where, "path %q must be absolute and clean: a basename matches any file of that name (design §7.6)", a.Path)
+		dir, prefix := strings.CutSuffix(a.Path, "/*")
+		switch {
+		case prefix && (!path.IsAbs(dir) || path.Clean(dir) != dir || dir == "/"):
+			c.errf(where, "prefix %q must be an absolute, clean directory followed by /*", a.Path)
+			continue
+		case !prefix && (!path.IsAbs(a.Path) || path.Clean(a.Path) != a.Path || strings.Contains(a.Path, "*")):
+			c.errf(where, "path %q must be absolute and clean, or a directory followed by /*: a basename matches any file of that name (design §7.6)", a.Path)
+			continue
+		case len(a.Path) > 255:
+			c.errf(where, "path %q is longer than the kernel compares", a.Path)
+			continue
 		}
 		if a.Hash != "" {
 			c.unsupported(where, "exec hash")
 		}
-		ce.allow[a.Path] = true
-		pl := Placement{Rule: "exec/" + path.Base(a.Path), Tier: "audit", EnforcedBy: observed, Notes: []string{"path only"}}
+		pl := Placement{Rule: "exec/" + path.Base(a.Path), Tier: tier, EnforcedBy: by, Notes: append([]string{"path only"}, notes...)}
+		if prefix {
+			ce.prefixes = append(ce.prefixes, dir+"/")
+			pl.Rule = "exec/" + a.Path
+			pl.Notes = append(pl.Notes, "every file below the directory, including ones the run writes there")
+		} else {
+			ce.allow[a.Path] = true
+		}
 		if a.Note != "" {
 			pl.Notes = append(pl.Notes, a.Note)
 		}
 		cp.Placements = append(cp.Placements, pl)
+	}
+	if len(ce.prefixes) > MaxExecPrefixes {
+		c.errf("exec.allow", "at most %d directory prefixes (/*)", MaxExecPrefixes)
 	}
 	cp.exec = ce
 }

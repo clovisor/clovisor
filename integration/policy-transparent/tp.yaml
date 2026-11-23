@@ -20,3 +20,9 @@ spec:
   unix:
     # /tmp/fd.sock lets the passed-in-socket test reach the 4.3 check.
     allow: ["/run/it-allowed.sock", "/tmp/fd.sock"]
+  exec:
+    default: allow
+    require_trusted_path: true
+    allow:
+      - { path: "/it/bin/*" }   # the test's own tools
+      - { path: "/tmp/ok/*" }

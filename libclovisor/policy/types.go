@@ -103,8 +103,15 @@ type Ask struct {
 
 // Exec is the exec block (design §7.6).
 type Exec struct {
-	Default               string `yaml:"default" json:"default"`
-	RequireReadonlyOrigin bool   `yaml:"require_readonly_origin,omitempty" json:"require_readonly_origin,omitempty"`
+	Default string `yaml:"default" json:"default"`
+	// RequireTrustedPath refuses an exec not named in Allow unless the
+	// file, and every directory above it, is owned by root and not
+	// writable by group or others (milestone 4.4). Off for agents that run
+	// what they build; on for agents that only run installed tools.
+	RequireTrustedPath bool `yaml:"require_trusted_path,omitempty" json:"require_trusted_path,omitempty"`
+	// RequireReadonlyOrigin is the earlier name of RequireTrustedPath,
+	// from when the test was a read-only mount (design §7.6).
+	RequireReadonlyOrigin bool `yaml:"require_readonly_origin,omitempty" json:"require_readonly_origin,omitempty"`
 	// AuditOnly declares that exec rules are observed, not enforced. It is
 	// required in mode enforce until a deployment can gate exec (BPF LSM),
 	// so that non-enforcement is stated rather than silent (§7.1).

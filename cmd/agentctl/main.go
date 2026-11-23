@@ -981,7 +981,13 @@ func checkProfile(argv []string) error {
 		}
 		opts.UDPAllow = append(opts.UDPAllow, a)
 	}
-	c, err := compileFiles([]string{*profile}, *platform == "linux")
+	copts := policy.Options{Mode: policy.ExplicitProxy, Linux: *platform == "linux"}
+	if *transparent {
+		// As the transparent node would compile it; BPF LSM as on this
+		// machine.
+		copts.Mode, copts.KernelLSM = policy.Transparent, copts.Linux && clovisor.BPFLSMActive()
+	}
+	c, err := compileFilesFor([]string{*profile}, copts)
 	if err != nil {
 		return err
 	}

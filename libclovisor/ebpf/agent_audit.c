@@ -40,6 +40,13 @@
  *                            a network socket created outside the run
  *                            (inherited, or passed in): its traffic would
  *                            never meet the cgroup hooks above.
+ *            bprm_check_security (milestone 4.4)
+ *                            exec policy, per run and layer: a resolved
+ *                            path in exec.allow passes; else, under
+ *                            require_trusted_path, a file failing the
+ *                            trusted-path test is refused; else the
+ *                            layer's default decides. Scripts are checked
+ *                            again for their interpreter.
  *            unix_stream_connect, unix_may_send (milestone 4.2)
  *                            a Unix socket bound outside the run, unless
  *                            its address matches the node's patterns (the
@@ -93,6 +100,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_tracing.h>
 
 #define MAX_PATH_LEN   256
 #define MAX_ARGS_LEN   512  /* power of two: used as a mask */
@@ -119,10 +127,48 @@
 #define EVENT_DROP      5
 #define EVENT_SOCKET    6
 #define EVENT_UNIX      7
+#define EVENT_EXEC_PATH 8
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
+struct file;
+
 struct linux_binprm {
     const char *filename;
+    struct file *file;
+} __attribute__((preserve_access_index));
+
+typedef struct {
+    unsigned int val;
+} kuid_t___c;
+
+struct inode {
+    unsigned short i_mode;
+    kuid_t___c i_uid;
+} __attribute__((preserve_access_index));
+
+struct dentry {
+    struct dentry *d_parent;
+    struct inode *d_inode;
+} __attribute__((preserve_access_index));
+
+struct vfsmount {
+    struct dentry *mnt_root;
+} __attribute__((preserve_access_index));
+
+struct mount {
+    struct mount *mnt_parent;
+    struct dentry *mnt_mountpoint;
+    struct vfsmount mnt;
+} __attribute__((preserve_access_index));
+
+struct path {
+    struct vfsmount *mnt;
+    struct dentry *dentry;
+} __attribute__((preserve_access_index));
+
+struct file {
+    struct path f_path;
+    struct inode *f_inode;
 } __attribute__((preserve_access_index));
 
 struct mm_struct {
@@ -208,6 +254,9 @@ struct unix_sock {
 #define V_AUDIT_SOCK     12
 #define V_UNIX_DENY      13 /* a Unix socket outside the run */
 #define V_AUDIT_UNIX     14
+#define V_EXEC_OK        15 /* an exec, allowed (reported once per path) */
+#define V_EXEC_DENY      16
+#define V_AUDIT_EXEC     17
 
 /* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
 struct addr {
@@ -1547,6 +1596,234 @@ static __always_inline int foreign_socket(struct socket *sock, __u32 op)
     __u64 sk_cg = cg ? BPF_CORE_READ(cg, kn, id) : 0;
     emit_socket(cfg, run, family, 0, 0, op, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, sk_cg);
     return enforce ? -EPERM_ : 0;
+}
+
+/* ---- Exec (milestone 4.4) ---- */
+
+#define EXEC_PATH      256
+#define EXEC_WORDS     32
+#define MAX_EXEC_LAYERS   4
+#define MAX_EXEC_PREFIXES 4
+#define TRUST_DEPTH    24
+
+struct exec_prefix {
+    __u16 len;
+    __u8  _pad[6];
+    __u64 b[EXEC_WORDS];
+    __u64 m[EXEC_WORDS];  /* mask over len bytes, from the node agent */
+};
+
+struct exec_layer {
+    __u32 default_allow;
+    __u32 require_trusted;
+    __u32 enforce;        /* an enforcing layer refuses; an audit layer reports */
+    __u32 n_prefix;
+    struct exec_prefix pre[MAX_EXEC_PREFIXES];
+};
+
+struct exec_policy {
+    __u32 n;
+    __u32 _pad;
+    struct exec_layer l[MAX_EXEC_LAYERS];
+};
+
+/* Per run: its exec layers. Absent: no exec policy (nothing refused). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct exec_policy);
+} exec_policy SEC(".maps");
+
+struct exec_key {
+    __u64 run;
+    __u32 layer;
+    __u32 _pad;
+    __u64 hash;
+};
+
+/* Exact exec.allow paths, per run and layer, by hash; the value is the
+ * path, compared in full so a crafted collision gains nothing. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct exec_key);
+    __type(value, struct exec_path);
+} exec_allow SEC(".maps");
+
+struct exec_path {
+    __u64 b[EXEC_WORDS];
+};
+
+/* Per run, the resolved paths already reported (with their verdict). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct exec_key);
+    __type(value, __u8);
+} exec_seen SEC(".maps");
+
+struct exec_path_event {
+    struct event_hdr hdr;
+    __u8  path[EXEC_PATH];
+    __u32 len;
+    __u32 verdict;        /* V_EXEC_* */
+    __u32 trusted;
+    __u32 _pad;
+};
+
+/* Scratch for the resolved path: too large for the stack beside the rest. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct exec_path);
+} exec_scratch SEC(".maps");
+
+static __always_inline int trusted_inode(struct inode *ino)
+{
+    if (!ino)
+        return 0;
+    return BPF_CORE_READ(ino, i_uid.val) == 0 && !(BPF_CORE_READ(ino, i_mode) & 0022);
+}
+
+/* The file and every directory up to the root, across mounts, owned by
+ * root and not writable by group or others: nothing but root could have
+ * put this file here (4.0 spike). */
+static __always_inline int trusted_path(struct file *f)
+{
+    if (!trusted_inode(BPF_CORE_READ(f, f_inode)))
+        return 0;
+    struct vfsmount *vmnt = BPF_CORE_READ(f, f_path.mnt);
+    struct mount *m = (void *)vmnt - bpf_core_field_offset(struct mount, mnt);
+    struct dentry *d = BPF_CORE_READ(f, f_path.dentry, d_parent);
+    for (int i = 0; i < TRUST_DEPTH; i++) {
+        struct dentry *mroot = BPF_CORE_READ(m, mnt.mnt_root);
+        if (d == mroot) {
+            struct mount *parent = BPF_CORE_READ(m, mnt_parent);
+            if (parent == m)
+                return trusted_inode(BPF_CORE_READ(d, d_inode)); /* the global root */
+            d = BPF_CORE_READ(m, mnt_mountpoint);
+            m = parent;
+            continue;
+        }
+        if (!trusted_inode(BPF_CORE_READ(d, d_inode)))
+            return 0;
+        d = BPF_CORE_READ(d, d_parent);
+    }
+    return 0; /* deeper than TRUST_DEPTH: not shown trusted */
+}
+
+static __always_inline __u64 exec_hash(struct exec_path *p)
+{
+    __u64 h = 14695981039346656037ULL;
+#pragma unroll
+    for (int j = 0; j < EXEC_WORDS; j++)
+        h = (h ^ p->b[j]) * 1099511628211ULL;
+    return h;
+}
+
+static __always_inline int exec_listed(__u64 run, __u32 layer, struct exec_layer *l, struct exec_path *p, __u64 h, __u32 len)
+{
+    struct exec_key k = {.run = run, .layer = layer, .hash = h};
+    struct exec_path *v = bpf_map_lookup_elem(&exec_allow, &k);
+    if (v) {
+        __u64 diff = 0;
+#pragma unroll
+        for (int j = 0; j < EXEC_WORDS; j++)
+            diff |= v->b[j] ^ p->b[j];
+        if (diff == 0)
+            return 1;
+    }
+    __u32 n = l->n_prefix;
+#pragma unroll
+    for (int i = 0; i < MAX_EXEC_PREFIXES; i++) {
+        struct exec_prefix *x = &l->pre[i];
+        __u64 diff = 0;
+#pragma unroll
+        for (int j = 0; j < EXEC_WORDS; j++)
+            diff |= (p->b[j] ^ x->b[j]) & x->m[j];
+        if ((__u32)i < n && x->len <= len && diff == 0)
+            return 1;
+    }
+    return 0;
+}
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
+{
+    if (ret)
+        return lsm_prev(ret);
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->mode == MODE_OFF)
+        return 0;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 0;
+    struct exec_policy *pol = bpf_map_lookup_elem(&exec_policy, &run);
+
+    __u32 zero = 0;
+    struct exec_path *p = bpf_map_lookup_elem(&exec_scratch, &zero);
+    if (!p)
+        return 0;
+    __builtin_memset(p, 0, sizeof(*p));
+    /* Direct access keeps the pointer trusted, as bpf_d_path requires. */
+    struct file *f = bprm->file;
+    long n = bpf_d_path(&f->f_path, (char *)p->b, EXEC_PATH);
+    if (n <= 0)
+        return 0;
+    __u32 len = n - 1; /* n counts the NUL */
+    int trusted = trusted_path(f);
+    __u64 h = exec_hash(p);
+
+    int deny = 0, refuse = 0;
+    if (pol) {
+        __u32 nl = pol->n;
+#pragma unroll
+        for (int i = 0; i < MAX_EXEC_LAYERS; i++) {
+            if ((__u32)i >= nl)
+                break;
+            struct exec_layer *l = &pol->l[i];
+            int ok;
+            if (exec_listed(run, i, l, p, h, len))
+                ok = 1;
+            else if (l->require_trusted && !trusted)
+                ok = 0;
+            else
+                ok = l->default_allow;
+            if (!ok) {
+                deny = 1;
+                if (l->enforce)
+                    refuse = 1;
+            }
+        }
+    }
+    refuse = refuse && cfg->mode == MODE_ENFORCE;
+    __u32 verdict = refuse ? V_EXEC_DENY : (deny ? V_AUDIT_EXEC : V_EXEC_OK);
+
+    /* Each resolved path once per run and verdict: what learn and check
+     * need, without an event per exec of a hot binary. */
+    struct exec_key sk = {.run = run, .layer = verdict, .hash = h};
+    __u8 one = 1;
+    if (bpf_map_update_elem(&exec_seen, &sk, &one, BPF_NOEXIST) == 0) {
+        struct event_hdr hdr = {};
+        if (fill_hdr(&hdr, EVENT_EXEC_PATH) && within_budget(hdr.run_cgroup_id, sizeof(struct exec_path_event))) {
+            struct exec_path_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+            if (e) {
+                e->hdr = hdr;
+                __builtin_memcpy(e->path, p->b, EXEC_PATH);
+                e->len = len;
+                e->verdict = verdict;
+                e->trusted = trusted;
+                e->_pad = 0;
+                bpf_ringbuf_submit(e, 0);
+            } else {
+                note_lost(hdr.run_cgroup_id);
+            }
+        }
+    }
+    return refuse ? -EPERM_ : 0;
 }
 
 /* ---- Unix sockets (milestone 4.2) ---- */

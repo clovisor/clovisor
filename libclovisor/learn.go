@@ -92,6 +92,10 @@ type Draft struct {
 	byAddress  []string        // refused tunnels to an address the run had looked up by name
 
 	unixSeen map[string]map[string]bool // unix.allow entry -> runs (milestone 4.2)
+
+	// Resolved exec paths (milestone 4.4), where the kernel reported them.
+	resolved  bool
+	untrusted []string // ran from a path failing the trusted-path test
 }
 
 // LearnProfile drafts an AgentProfile that would allow exactly the
@@ -119,15 +123,30 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 	d.Profile.Metadata.Name = name
 	d.Profile.Spec.Mode = "audit"
 	d.Profile.Spec.Egress.Default = "deny"
-	d.Profile.Spec.Exec = &policy.Exec{Default: "deny", RequireReadonlyOrigin: true, Allow: []policy.ExecAllow{}}
+	d.Profile.Spec.Exec = &policy.Exec{Default: "deny", RequireTrustedPath: true, Allow: []policy.ExecAllow{}}
 
 	byHost := map[string]*learnedHost{}
 	ipDests := map[destKey]*learnedIP{}
 	connected := map[string]bool{}
 	looked := map[string]bool{}
 
+	untrusted := map[string]bool{}
 	for _, tl := range runs {
-		for _, b := range tl.Summary.Binaries {
+		// The kernel's resolved paths, where it reported them: what the
+		// exec hook compares (/bin/true runs /usr/bin/gnutrue on some
+		// hosts). Otherwise the requested paths.
+		bins := tl.Summary.Binaries
+		if len(tl.Summary.Exec) > 0 {
+			d.resolved = true
+			bins = nil
+			for _, e := range tl.Summary.Exec {
+				bins = append(bins, e.Path)
+				if !e.Trusted {
+					untrusted[e.Path] = true
+				}
+			}
+		}
+		for _, b := range bins {
 			if d.binaryRuns[b] == nil {
 				d.binaryRuns[b] = map[string]bool{}
 			}
@@ -284,6 +303,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 	}
 	sort.Strings(d.lookedUp)
 
+	d.untrusted = sortedSet(untrusted)
 	// Exec: every binary seen, absolute paths only.
 	bins := make([]string, 0, len(d.binaryRuns))
 	for b := range d.binaryRuns {
@@ -572,7 +592,21 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	p("")
 	p("  exec:")
 	p("    default: %s", d.Profile.Spec.Exec.Default)
-	p("    require_readonly_origin: %t  # design §7.6", d.Profile.Spec.Exec.RequireReadonlyOrigin)
+	p("    require_trusted_path: %t  # design §7.6; exec.allow entries pass regardless", d.Profile.Spec.Exec.RequireTrustedPath)
+	if !d.resolved {
+		p("    # Paths as requested: where BPF LSM is active, the node agent records the")
+		p("    # paths the kernel resolved, which exec policy compares.")
+	}
+	if len(d.untrusted) > 0 {
+		p("    # These ran from locations someone other than root can write (build output,")
+		p("    # downloads). They are listed below, so this draft allows them by exact path.")
+		p("    # If their names change from run to run (go test, cargo run), allow their")
+		p("    # directory instead (path: /dir/*), or, for an agent that runs what it builds,")
+		p("    # set default: allow and require_trusted_path: false.")
+		for _, u := range d.untrusted {
+			p("    #   %s", commentSafe(u))
+		}
+	}
 	if len(d.Profile.Spec.Exec.Allow) == 0 {
 		p("    allow: []")
 	} else {

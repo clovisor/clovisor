@@ -60,7 +60,7 @@ func TestLearnProfile(t *testing.T) {
 	}
 
 	if got.Kind != "AgentProfile" || got.Metadata.Name != "my-agent" || got.Spec.Mode != "audit" ||
-		got.Spec.Egress.Default != "deny" || got.Spec.Exec.Default != "deny" || !got.Spec.Exec.RequireReadonlyOrigin {
+		got.Spec.Egress.Default != "deny" || got.Spec.Exec.Default != "deny" || !got.Spec.Exec.RequireTrustedPath {
 		t.Fatalf("bad header: %+v", got)
 	}
 

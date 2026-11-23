@@ -25,7 +25,17 @@ const (
 	EventDrop     // packets from a run the backstop dropped (milestone 3.3)
 	EventSocket   // a socket refused at creation, connect or send (milestones 4.1, 4.3)
 	EventUnix     // a Unix socket outside the run, first use (milestone 4.2)
+	EventExecPath // an exec's resolved path, first use per verdict (milestone 4.4)
 )
+
+// ExecPathData is what the exec hook saw: the resolved path the kernel ran,
+// whether it passed the trusted-path test, and the verdict. Reported once
+// per run, path and verdict.
+type ExecPathData struct {
+	Path    string
+	Trusted bool
+	Verdict string
+}
 
 // UnixData reports a run's first connect or send to a Unix socket bound
 // outside the run that no pattern allowed: refused under an enforcing

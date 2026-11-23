@@ -90,6 +90,11 @@ type RunSummary struct {
 	// done (milestone 4.2): refused, or in audit would have been. Each is
 	// reported once per run.
 	Unix []UnixUse `json:"unix,omitempty"`
+	// Exec lists the resolved paths the kernel ran, with whether each
+	// passed the trusted-path test and what was done (milestone 4.4).
+	// Each path appears once per verdict. Where BPF LSM is not active it is
+	// empty, and Binaries is all there is.
+	Exec []ExecUse `json:"exec,omitempty"`
 	// UDPRefusedTo is where refused UDP was sent, by destination: what a
 	// reviewer weighs against the node's -udp-allow (milestone 3.6).
 	UDPRefusedTo []Destination `json:"udp_refused_to,omitempty"`
@@ -204,7 +209,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, connect, dns, http, mcp, drop, socket, unix, gap
+	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -637,6 +642,22 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			ResolvedName: d.ResolvedName,
 		}, r.MaxEvents)
 
+	case EventExecPath:
+		d := ev.Data.(ExecPathData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		st.tl.Summary.Exec = append(st.tl.Summary.Exec, ExecUse{Path: d.Path, Trusted: d.Trusted, Verdict: d.Verdict})
+		if d.Verdict != "allowed" {
+			note := "untrusted path"
+			if d.Trusted {
+				note = "trusted path"
+			}
+			st.add(TimelineEvent{Time: ev.Timestamp, Type: "exec_path", PID: ev.PID, CgroupID: ev.CgroupID,
+				Binary: d.Path, Verdict: d.Verdict, Note: note}, r.MaxEvents)
+		}
+
 	case EventUnix:
 		d := ev.Data.(UnixData)
 		st := r.state(ev, "")
@@ -890,4 +911,11 @@ type UnixUse struct {
 	Path     string `json:"path"`
 	Verdict  string `json:"verdict"`
 	Datagram bool   `json:"datagram,omitempty"`
+}
+
+// ExecUse is a resolved exec path, as the kernel judged it.
+type ExecUse struct {
+	Path    string `json:"path"`
+	Trusted bool   `json:"trusted"`
+	Verdict string `json:"verdict"`
 }

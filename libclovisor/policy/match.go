@@ -10,6 +10,7 @@ package policy
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 )
 
@@ -236,20 +237,61 @@ func (cp *CompiledProfile) defaultMessage(req Request) string {
 
 // ExecDecision is the answer for an exec.
 type ExecDecision struct {
-	Allowed bool
-	Default bool // no allow entry matched
+	Allowed   bool
+	Default   bool // no allow entry matched
+	Untrusted bool // refused by require_trusted_path
 }
 
 // DecideExec evaluates an exec of an absolute path. Without an exec
 // block, every exec is allowed.
 func (cp *CompiledProfile) DecideExec(path string) ExecDecision {
+	return cp.DecideExecTrusted(path, true)
+}
+
+// DecideExecTrusted is DecideExec for a resolved path whose trusted-path
+// test came out as trusted (milestone 4.4), as the kernel decides: listed
+// passes; else an untrusted file fails under require_trusted_path; else
+// the default.
+func (cp *CompiledProfile) DecideExecTrusted(path string, trusted bool) ExecDecision {
 	if cp.exec == nil {
 		return ExecDecision{Allowed: true, Default: true}
 	}
 	if cp.exec.allow[path] {
 		return ExecDecision{Allowed: true}
 	}
+	for _, p := range cp.exec.prefixes {
+		if strings.HasPrefix(path, p) {
+			return ExecDecision{Allowed: true}
+		}
+	}
+	if cp.exec.RequireTrustedPath && !trusted {
+		return ExecDecision{Allowed: false, Default: true, Untrusted: true}
+	}
 	return ExecDecision{Allowed: cp.exec.Default == ActionAllow, Default: true}
+}
+
+// ExecLayer is one profile's exec policy as the kernel holds it.
+type ExecLayer struct {
+	DefaultAllow   bool
+	RequireTrusted bool
+	Enforce        bool // an enforcing layer refuses; others record
+	Exact          []string
+	Prefixes       []string // each ends in /
+}
+
+// ExecLayer returns the profile's exec policy for the kernel, or false
+// if it has none.
+func (cp *CompiledProfile) ExecLayer() (ExecLayer, bool) {
+	if cp.exec == nil {
+		return ExecLayer{}, false
+	}
+	l := ExecLayer{DefaultAllow: cp.exec.Default == ActionAllow, RequireTrusted: cp.exec.RequireTrustedPath,
+		Enforce: cp.Mode == ModeEnforce && !cp.exec.AuditOnly, Prefixes: cp.exec.prefixes}
+	for p := range cp.exec.allow {
+		l.Exact = append(l.Exact, p)
+	}
+	sort.Strings(l.Exact)
+	return l, true
 }
 
 // DecideName answers whether a DNS name may be resolved (milestone 3.4):

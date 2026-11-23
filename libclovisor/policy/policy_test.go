@@ -318,7 +318,7 @@ func TestReceipt(t *testing.T) {
 		"ext_proc (method and path)",
 		"not terminated: domain-fronting exposed",
 		"exec/git",
-		"not enforced until BPF LSM (Phase 4)",
+		"not enforced: needs transparent mode with BPF LSM",
 		"local MCP gateway (@modelcontextprotocol/server-filesystem)",
 		"tools/list pinned",
 		"api.github.com",
@@ -536,5 +536,65 @@ func TestCeilingRootSockets(t *testing.T) {
 	}
 	if _, diags := NewSet(Options{Linux: true}, []*AgentProfile{p}, []*ProfileCeiling{ceiling(true)}, none, none); len(diags) != 0 {
 		t.Errorf("with allowRootSockets: %v", diags)
+	}
+}
+
+func TestExecTrustedPath(t *testing.T) {
+	doc := `kind: AgentProfile
+metadata: { name: x }
+spec:
+  mode: enforce
+  egress: { default: deny }
+  exec:
+    default: allow
+    require_trusted_path: true
+    allow:
+      - { path: /home/u/proj/target/* }
+      - { path: /home/u/bin/tool }
+`
+	p, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without transparent mode and BPF LSM, enforce mode needs audit_only.
+	if _, diags := Compile(Options{Linux: true}, p); len(diags) == 0 {
+		t.Error("enforced exec accepted without BPF LSM")
+	}
+	c, diags := Compile(Options{Mode: Transparent, Linux: true, KernelLSM: true}, p)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	cp := c.Profiles[0]
+	for _, tc := range []struct {
+		path    string
+		trusted bool
+		allowed bool
+	}{
+		{"/usr/bin/git", true, true},                   // trusted, default allow
+		{"/tmp/x", false, false},                       // untrusted, not listed
+		{"/home/u/proj/target/debug/app", false, true}, // listed by prefix
+		{"/home/u/proj/target", false, false},          // the directory itself is not below it
+		{"/home/u/bin/tool", false, true},              // listed exactly
+	} {
+		if d := cp.DecideExecTrusted(tc.path, tc.trusted); d.Allowed != tc.allowed {
+			t.Errorf("%s trusted=%v: %+v", tc.path, tc.trusted, d)
+		}
+	}
+	l, ok := cp.ExecLayer()
+	if !ok || !l.DefaultAllow || !l.RequireTrusted || !l.Enforce || len(l.Prefixes) != 1 || l.Prefixes[0] != "/home/u/proj/target/" ||
+		len(l.Exact) != 1 {
+		t.Errorf("layer: %+v", l)
+	}
+	// The earlier name still means the same.
+	old, _ := Parse([]byte(strings.Replace(doc, "require_trusted_path", "require_readonly_origin", 1)))
+	oc, _ := Compile(Options{Mode: Transparent, Linux: true, KernelLSM: true}, old)
+	if !oc.Profiles[0].DecideExecTrusted("/tmp/x", false).Untrusted {
+		t.Error("require_readonly_origin no longer requires a trusted path")
+	}
+	for _, bad := range []string{"/*", "relative/*", "/a/b*", "/a/*/b"} {
+		bp, _ := Parse([]byte(strings.Replace(doc, "/home/u/bin/tool", bad, 1)))
+		if _, diags := Compile(Options{Mode: Transparent, Linux: true, KernelLSM: true}, bp); len(diags) == 0 {
+			t.Errorf("exec.allow %q accepted", bad)
+		}
 	}
 }

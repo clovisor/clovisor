@@ -451,3 +451,15 @@ func (e *Effective) UnixAllow(uid int) ([]string, bool) {
 	}
 	return out, enforcing
 }
+
+// ExecLayers are the run's exec layers for the kernel (milestone 4.4):
+// one per layer that has an exec block. Each must allow an exec.
+func (e *Effective) ExecLayers() []ExecLayer {
+	var out []ExecLayer
+	for _, l := range e.Layers {
+		if el, ok := l.Profile.ExecLayer(); ok {
+			out = append(out, el)
+		}
+	}
+	return out
+}

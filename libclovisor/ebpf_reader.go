@@ -29,6 +29,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
+
+	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
 const (
@@ -45,6 +47,7 @@ const (
 	bpfEventDrop     = 5
 	bpfEventSocket   = 6
 	bpfEventUnix     = 7
+	bpfEventExecPath = 8
 
 	afInet  = 2
 	afInet6 = 10
@@ -124,6 +127,10 @@ type bpfLSMObjects struct {
 	SocketSendmsg *ebpf.Program `ebpf:"on_lsm_socket_sendmsg"`
 	UnixStream    *ebpf.Program `ebpf:"on_lsm_unix_stream_connect"`
 	UnixSend      *ebpf.Program `ebpf:"on_lsm_unix_may_send"`
+	Exec          *ebpf.Program `ebpf:"on_lsm_exec"`
+	ExecPolicy    *ebpf.Map     `ebpf:"exec_policy"`
+	ExecAllow     *ebpf.Map     `ebpf:"exec_allow"`
+	ExecSeen      *ebpf.Map     `ebpf:"exec_seen"`
 	UnixPolicy    *ebpf.Map     `ebpf:"unix_policy"`
 	UnixNode      *ebpf.Map     `ebpf:"unix_node"`
 	UnixSeen      *ebpf.Map     `ebpf:"unix_seen"`
@@ -131,11 +138,134 @@ type bpfLSMObjects struct {
 
 func (o *bpfLSMObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.SocketCreate, o.SocketConnect, o.SocketSendmsg,
-		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen} {
+		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen} {
 		if c != nil && !reflect.ValueOf(c).IsNil() {
 			c.Close()
 		}
 	}
+}
+
+// Wire formats of exec_policy and exec_allow (agent_audit.c).
+const (
+	maxExecLayers   = 4
+	maxExecPrefixes = 4
+	execPathBytes   = 256
+)
+
+type bpfExecPrefix struct {
+	Len uint16
+	_   [6]uint8
+	B   [execPathBytes]byte
+	M   [execPathBytes]byte
+}
+
+type bpfExecLayer struct {
+	DefaultAllow   uint32
+	RequireTrusted uint32
+	Enforce        uint32
+	NPrefix        uint32
+	Pre            [maxExecPrefixes]bpfExecPrefix
+}
+
+type bpfExecPolicy struct {
+	N uint32
+	_ uint32
+	L [maxExecLayers]bpfExecLayer
+}
+
+type bpfExecKey struct {
+	Run   uint64
+	Layer uint32
+	_     uint32
+	Hash  uint64
+}
+
+type bpfExecPathEvent struct {
+	Hdr     bpfEventHdr
+	Path    [execPathBytes]byte
+	Len     uint32
+	Verdict uint32
+	Trusted uint32
+	_       uint32
+}
+
+// execHash is exec_hash in agent_audit.c: FNV-1a over the zero-padded
+// path's little-endian 64-bit words.
+func execHash(path string) (uint64, [execPathBytes]byte) {
+	var b [execPathBytes]byte
+	copy(b[:], path)
+	h := uint64(14695981039346656037)
+	for j := 0; j < execPathBytes; j += 8 {
+		h = (h ^ binary.LittleEndian.Uint64(b[j:])) * 1099511628211
+	}
+	return h, b
+}
+
+// SetExecPolicy gives a run its exec layers (milestone 4.4), replacing any
+// earlier ones. No layers: nothing about exec is refused.
+func (r *EBPFReader) SetExecPolicy(runCg uint64, layers []policy.ExecLayer) error {
+	if r.lsm.ExecPolicy == nil {
+		return nil // BPF LSM not in use
+	}
+	if len(layers) > maxExecLayers {
+		return fmt.Errorf("at most %d exec layers, got %d", maxExecLayers, len(layers))
+	}
+	r.ForgetExecPolicy(runCg)
+	if len(layers) == 0 {
+		return nil
+	}
+	var p bpfExecPolicy
+	var keys []bpfExecKey
+	for i, l := range layers {
+		bl := &p.L[i]
+		bl.DefaultAllow, bl.RequireTrusted, bl.Enforce = b2u(l.DefaultAllow), b2u(l.RequireTrusted), b2u(l.Enforce)
+		if len(l.Prefixes) > maxExecPrefixes {
+			return fmt.Errorf("at most %d exec prefixes", maxExecPrefixes)
+		}
+		for j, pre := range l.Prefixes {
+			bl.Pre[j].Len = uint16(len(pre))
+			copy(bl.Pre[j].B[:], pre)
+			for k := 0; k < len(pre) && k < execPathBytes; k++ {
+				bl.Pre[j].M[k] = 0xff
+			}
+		}
+		bl.NPrefix = uint32(len(l.Prefixes))
+		for _, path := range l.Exact {
+			h, b := execHash(path)
+			k := bpfExecKey{Run: runCg, Layer: uint32(i), Hash: h}
+			if err := r.lsm.ExecAllow.Put(k, b); err != nil {
+				return fmt.Errorf("exec allow %s: %w", path, err)
+			}
+			keys = append(keys, k)
+		}
+	}
+	p.N = uint32(len(layers))
+	r.execMu.Lock()
+	r.execKeys[runCg] = keys
+	r.execMu.Unlock()
+	return r.lsm.ExecPolicy.Put(runCg, p)
+}
+
+// ForgetExecPolicy drops a run's exec layers and allow entries.
+func (r *EBPFReader) ForgetExecPolicy(runCg uint64) {
+	if r.lsm.ExecPolicy == nil {
+		return
+	}
+	r.lsm.ExecPolicy.Delete(runCg)
+	r.execMu.Lock()
+	keys := r.execKeys[runCg]
+	delete(r.execKeys, runCg)
+	r.execMu.Unlock()
+	for _, k := range keys {
+		r.lsm.ExecAllow.Delete(k)
+	}
+}
+
+func b2u(b bool) uint32 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Wire formats of unix_policy (agent_audit.c).
@@ -315,6 +445,8 @@ type EBPFReader struct {
 
 	lsm      bpfLSMObjects
 	lsmState string // what the socket hooks do, for status
+	execMu   sync.Mutex
+	execKeys map[uint64][]bpfExecKey // exec_allow entries written, per run
 }
 
 // NewEBPFReader loads the BPF object at bpfObjPath, configures it to
@@ -335,6 +467,7 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		eventsCh:    make(chan AuditEvent, 1000),
 		done:        make(chan struct{}),
 		transparent: t,
+		execKeys:    map[uint64][]bpfExecKey{},
 	}
 
 	if err := spec.LoadAndAssign(&r.objs, nil); err != nil {
@@ -560,6 +693,15 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		ev.Data = UnixData{Path: string(e.Path[:min(int(e.Len), len(e.Path))]), Verdict: connectVerdicts[e.Verdict],
 			Datagram: e.Dgram != 0, PeerCgroup: e.PeerCgroup}
 
+	case bpfEventExecPath:
+		var e bpfExecPathEvent
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		ev.Type = EventExecPath
+		ev.Data = ExecPathData{Path: string(e.Path[:min(int(e.Len), len(e.Path))]), Trusted: e.Trusted != 0,
+			Verdict: connectVerdicts[e.Verdict]}
+
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent
 		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &e); err != nil {
@@ -633,7 +775,7 @@ func BPFLSMActive() bool {
 
 // lsmNames are the socket hooks (milestones 4.1, 4.3), for pins and status.
 var lsmNames = []string{"lsm-socket-create", "lsm-socket-connect", "lsm-socket-sendmsg",
-	"lsm-unix-stream-connect", "lsm-unix-may-send"}
+	"lsm-unix-stream-connect", "lsm-unix-may-send", "lsm-exec"}
 
 // attachLSM loads and attaches the socket hooks in audit and enforce, if
 // BPF LSM is active; in enforce they are pinned like the cgroup hooks.
@@ -669,7 +811,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("load BPF LSM programs: %w", err)
 	}
 	pin := t.Mode == TransparentEnforce
-	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg, r.lsm.UnixStream, r.lsm.UnixSend} {
+	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg, r.lsm.UnixStream, r.lsm.UnixSend, r.lsm.Exec} {
 		name := lsmNames[i]
 		// A tracing link cannot take a new program in place, so attach
 		// the new one first, then let go of a pinned predecessor: for a
@@ -696,7 +838,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		r.links = append(r.links, l)
 	}
 	r.lsmState = map[string]string{TransparentAudit: "audit: refusals recorded, not made",
-		TransparentEnforce: "enforce: unusual families, raw sockets, foreign sockets and Unix sockets outside unix.allow refused"}[t.Mode]
+		TransparentEnforce: "enforce: unusual families, raw sockets, foreign sockets, Unix sockets outside unix.allow, and execs the profile refuses"}[t.Mode]
 	return nil
 }
 

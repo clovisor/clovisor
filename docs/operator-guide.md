@@ -283,9 +283,10 @@ The adoption path, per agent workload (design §7.10):
    widen the profile, or accept the denial.
 4. **Shadow live.** Install the profile with `mode: audit`, then `SIGHUP` the
    node agent. Decisions are recorded as `would-deny` and nothing is blocked.
-5. **Enforce.** Set `mode: enforce` and reload. Exec rules in an enforced
-   profile also need `exec: { audit_only: true }` until exec gating lands
-   (Phase 4).
+5. **Enforce.** Set `mode: enforce` and reload. Exec rules are enforced
+   only by transparent mode with BPF LSM (§11). Elsewhere an enforced
+   profile's exec block needs `audit_only: true`, and the policy does not
+   load without it.
 
 ## 9. MCP
 
@@ -538,8 +539,42 @@ spec:
   the run is recorded once per run, under `unix` in the summary, and not
   refused. Learn drafts the `unix:` block from those records.
 
+**Exec, where BPF LSM is active.** The kernel checks every exec in a run
+with an exec policy, and again for a script's interpreter, by the path it
+resolved (`/bin/true` may be `/usr/bin/gnutrue`):
+
+```yaml
+spec:
+  exec:
+    default: allow             # or deny: then only exec.allow runs
+    require_trusted_path: true # see below
+    allow:
+      - { path: /usr/local/bin/terraform }
+      - { path: /home/dev/project/target/* }   # everything below a directory
+```
+
+1. A path in `exec.allow` runs: an exact path, or anything below a directory
+   given as `dir/*` (at most four of those).
+2. Otherwise, with `require_trusted_path`, a file refused unless it and every
+   directory above it are owned by root and not writable by group or
+   others. Downloads, `/tmp` and home directories fail this test.
+3. Otherwise `default` decides.
+
+Every layer of a run (granted profile, clamps) must allow an exec. A refused
+exec fails with `EPERM`. Each resolved path is recorded once per run with
+its trust and verdict (`exec` in the summary), and learn drafts from those
+paths. Audit layers and audit mode record `would refuse: exec` instead.
+
+**Choosing `require_trusted_path`.** Turn it on for agents that run only
+installed tools: anything they download or write and then run is refused.
+Leave it off for coding agents that run what they build (`go test` runs
+binaries from `/tmp/go-build…`, `cargo run` from `target/`), or allow their
+build directories with `dir/*`. Exec rules catch unknown binaries, not
+unknown behaviour: an allowed interpreter runs any code it is given (design
+§7.6).
+
 **Not covered yet:** a host daemon connecting on a run's behalf through a
-socket the profile allows.
+socket the profile allows; hash matching (`exec.allow[].hash`).
 
 ## 12. Incident response
 
@@ -666,7 +701,9 @@ ignore the proxy, it checks:
 - where BPF LSM is active: raw, packet and vsock sockets refused, netlink
   allowed, and a socket passed in after the run started refused on send;
   a Unix socket in `unix.allow` reached, another one bound outside the run
-  refused, the run's own and the run API reached;
+  refused, the run's own and the run API reached; a root-owned binary in
+  `/tmp` refused by the trusted-path test and one under an allowed
+  directory run;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

@@ -85,6 +85,7 @@ place:
 | 4.0 spikes: global BPF LSM hooks gate exec (trusted path, IMA hash without policy), raw and packet sockets, Unix sockets with the peer's cgroup, and foreign sockets; `lsm_cgroup` works in the kernel but not through cilium/ebpf. Exec gating conflicts with coding agents running what they build. | [4.0 spike results](#40-spike-results-2026-11-23) |
 | Socket families limited and sockets made outside the run refused, through BPF LSM, pinned to fail closed. | [4.1 and 4.3 status](#41-and-43-status-2026-11-23) |
 | Unix sockets outside the run refused unless `unix.allow` names them; root-equivalent sockets need the ceiling's consent; closes the nss-resolve bypass. | [4.2 status](#42-status-2026-11-23) |
+| Exec gating by resolved path through BPF LSM, with the trusted-path test as a per-profile option (`require_trusted_path`) and `dir/*` entries for build output. | [4.4 status](#44-status-2026-11-23) |
 
 ---
 
@@ -2897,6 +2898,65 @@ Limits:
   Unix connects are recorded, not refused, as with egress since Phase 2.
 - A daemon reached through an allowed socket acts with its own authority.
   That is what the root and bypass notes are for.
+
+#### 4.4 status (2026-11-23)
+
+*Decided 2026-11-23:* the trusted-path test is a per-profile option, not the
+default for every profile, because coding agents run what they build.
+
+Implemented, where BPF LSM is active, under transparent audit and enforce:
+
+- **Hook.** `lsm/bprm_check_security`, which runs again for a script's
+  interpreter. It reads the resolved path with `bpf_d_path`, using a
+  `BPF_PROG` with typed arguments so the file pointer stays trusted, and
+  applies the 4.0 trusted-path walk across mounts. For each of up to four
+  layers (granted profile, clamps), in order:
+  1. a path in `exec.allow` passes: exact, by a 64-bit hash then a full
+     compare, so a crafted collision gains nothing; or by one of up to four
+     directory prefixes, compared under masks the node agent computes;
+  2. otherwise, under `require_trusted_path`, an untrusted file fails;
+  3. otherwise the layer's default decides.
+
+  Any enforcing layer's failure refuses the exec with `EPERM` (enforce mode
+  only); an audit layer's is recorded.
+- **Policy.**
+  - `exec.require_trusted_path`; `require_readonly_origin` is kept as its
+    earlier name.
+  - `exec.allow` entries may end in `/*`.
+  - An enforced exec block no longer needs `audit_only` where the
+    deployment can enforce it (transparent mode with BPF LSM); elsewhere it
+    still does.
+  - Receipt placements say what enforces each rule.
+  - Hash entries stay unsupported. IMA hashing costs too much per exec
+    without a cache (4.0).
+- **Kernel state.** The node agent writes each run's layers at bind, clamp
+  and revoke, with exact paths as separate map entries, and removes them
+  when the run ends.
+- **Reporting.** Each resolved path once per run and verdict, with its
+  trust, as `exec` in the summary and `exec_path` events for refusals.
+- **Learn and check.** Learn drafts from resolved paths where present
+  (`/usr/bin/gnutrue`, not `/bin/true`) and lists binaries that ran from
+  untrusted locations, with the choices: exact paths, a `dir/*`, or
+  `default: allow` with the test off. `check` decides with the recorded
+  trust, and `check --transparent` now compiles for the transparent node, so
+  an enforced exec block checks.
+
+Verified on kernel 7.0:
+
+- under a profile with `default: allow`, the test on, and one allowed
+  scratch directory:
+  - system binaries ran;
+  - a copy of `true` outside the directory got `EPERM` in enforce, and ran
+    with `would refuse: exec` in audit;
+  - the copy and a script inside the directory ran;
+  - `python3 x.py` ran: not an exec of `x.py` (§7.6);
+- a clamp to the enforcing profile mid-run refused the next exec;
+- learn drafted resolved paths and the untrusted note;
+- check predicted the refusal;
+- `make integration-transparent`, fourteen checks, with exec gating on for
+  every test run. A root-owned binary in world-writable `/tmp` was refused
+  (the walk catches `/tmp`), one under an allowed directory ran, and curl,
+  Python, git and the rest ran throughout.
 
 #### Decisions
 

@@ -209,8 +209,25 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				}
 			}
 		}
-		for _, b := range tl.Summary.Binaries {
-			ed := cp.DecideExec(b)
+		// The kernel's resolved paths and trust where it reported them, as
+		// the exec hook decides; otherwise the requested paths.
+		type execSeen struct {
+			path    string
+			trusted bool
+		}
+		var execs []execSeen
+		if len(tl.Summary.Exec) > 0 {
+			for _, e := range tl.Summary.Exec {
+				execs = append(execs, execSeen{e.Path, e.Trusted})
+			}
+		} else {
+			for _, b := range tl.Summary.Binaries {
+				execs = append(execs, execSeen{b, true})
+			}
+		}
+		for _, x := range execs {
+			b := x.path
+			ed := cp.DecideExecTrusted(b, x.trusted)
 			f := CheckFinding{Decision: policy.ActionAllow}
 			if !ed.Default {
 				f.Rule = "exec.allow"
@@ -218,6 +235,9 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 			if !ed.Allowed {
 				f.Decision = policy.ActionDeny
 				f.Message = "not in exec.allow"
+				if ed.Untrusted {
+					f.Message = "not in exec.allow, and not on a trusted path (require_trusted_path)"
+				}
 			}
 			kind := "exec-allow"
 			if !ed.Allowed {

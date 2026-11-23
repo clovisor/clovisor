@@ -75,6 +75,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("socket-families", e.testSocketFamilies)
 	t.Run("passed-in-socket", e.testPassedInSocket)
 	t.Run("unix-sockets", e.testUnixSockets)
+	t.Run("exec", e.testExec)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -382,6 +383,22 @@ print("own", connect("\0it-own"))
 `) + "; /it/bin/agentctl status | grep -c Transparent")
 	expect(t, out, "allowed ok", "denied refused 1", "own ok", "\n1\n")
 	expect(t, e.timeline(id), `"path": "/run/it-denied.sock"`, `"verdict": "refused: unix"`)
+}
+
+func (e *env) testExec(t *testing.T) {
+	// Root-owned copies of true: one in /tmp, which anyone can write, so the
+	// trusted-path test fails; one under /tmp/ok, which exec.allow names.
+	e.needLSM(t)
+	if _, errOut, err := e.sh("mkdir -p /tmp/ok && cp /bin/true /tmp/t && cp /bin/true /tmp/ok/t"); err != nil {
+		t.Fatal(errOut)
+	}
+	out, id := e.trun(`
+/bin/true && echo "system: ran"
+/tmp/t && echo "tmp: ran" || echo "tmp: refused"
+/tmp/ok/t && echo "allowed dir: ran"`)
+	expect(t, out, "system: ran", "tmp: refused", "allowed dir: ran")
+	tl := e.timeline(id)
+	expect(t, tl, `"path": "/tmp/t"`, `"verdict": "refused: exec"`, `"trusted": false`)
 }
 
 func (e *env) testCheckTransparent(t *testing.T) {

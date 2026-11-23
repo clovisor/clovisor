@@ -103,3 +103,13 @@ func TestUnixPolicyEncoding(t *testing.T) {
 		t.Error("nine patterns accepted")
 	}
 }
+
+func TestExecHashMatchesLayout(t *testing.T) {
+	// Same path, same hash; the padding is zero; a one-byte change moves it.
+	h1, b := execHash("/usr/bin/git")
+	h2, _ := execHash("/usr/bin/git")
+	h3, _ := execHash("/usr/bin/gix")
+	if h1 != h2 || h1 == h3 || string(b[:12]) != "/usr/bin/git" || b[12] != 0 {
+		t.Fatalf("%x %x %x", h1, h2, h3)
+	}
+}
