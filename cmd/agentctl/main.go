@@ -37,6 +37,7 @@ func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--mcp-config file] [--] <command> [args...]")
 	fmt.Println("                                    Run a command as a governed run")
+	fmt.Println("  agentctl call [--name n] -- cmd   Inside a run: run cmd as a tool call, in a cgroup of its own")
 	fmt.Println("  agentctl status                   Show the node's enforcement state")
 	fmt.Println("  agentctl profiles                 Show which profiles you may request")
 	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
@@ -1071,6 +1072,13 @@ func main() {
 			os.Exit(1)
 		}
 		os.Exit(code)
+	case "call":
+		code, err := callCommand(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(code)
 	case "status":
 		if err := showStatus(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1124,4 +1132,52 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
 	}
+}
+
+// callCommand runs a command as a tool call of the run agentctl is in
+// (milestone 4.5): the node agent gives it a cgroup of its own below the
+// run, so what it does is attributed to the call. Its policy is the run's.
+func callCommand(argv []string) (int, error) {
+	fs := flag.NewFlagSet("call", flag.ContinueOnError)
+	name := fs.String("name", "", "the tool call's name, as the harness knows it (a label for the timeline)")
+	if err := fs.Parse(argv); err != nil {
+		return 1, err
+	}
+	args := fs.Args()
+	if len(args) == 0 {
+		return 1, fmt.Errorf("usage: agentctl call [--name n] -- command [args...]")
+	}
+	path, err := exec.LookPath(args[0])
+	if err != nil {
+		return 1, err
+	}
+	if path, err = filepath.Abs(path); err != nil {
+		return 1, err
+	}
+	api, err := clovisor.DialRunAPI(socketPath())
+	if err != nil {
+		return 1, err
+	}
+	defer api.Close() // closing without call_end ends the call too
+	c, err := api.Call(*name, args)
+	if err != nil {
+		return 1, err
+	}
+	env := append(os.Environ(), "CLOVISOR_CALL="+c.CallID)
+	cmd, err := startInRun(api, path, args, env)
+	if err != nil {
+		return 1, err
+	}
+	code := 0
+	if err := cmd.Wait(); err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			return 1, err
+		}
+		code = ee.ExitCode()
+	}
+	if err := api.CallEnd(&code); err != nil {
+		fmt.Fprintf(os.Stderr, "agentctl: ending call %s: %v\n", c.CallID, err)
+	}
+	return code, nil
 }

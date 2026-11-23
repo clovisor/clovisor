@@ -338,7 +338,8 @@ func (r *Resolver) answer(q []byte, proto string, client, server netip.AddrPort)
 		lookup = r.lookupTCP
 	}
 	runID, runCg, eff, isRun := "", uint64(0), (*policy.Effective)(nil), false
-	if cg, err := lookup(client, server); err == nil {
+	cg, err := lookup(client, server)
+	if err == nil {
 		runID, runCg, eff, isRun = r.api.RunFor(cg)
 		if !isRun {
 			if p := findRunCgroupPath(r.agentsDir, cg); p != "" {
@@ -360,7 +361,7 @@ func (r *Resolver) answer(q []byte, proto string, client, server netip.AddrPort)
 		if !ed.Allowed() && ed.Enforced {
 			if r.enforce {
 				d.Enforced, d.RCode = true, "NXDomain"
-				r.record(runCg, runID, d)
+				r.record(cg, runCg, runID, d)
 				return reply(h, &question, dnsmessage.RCodeNameError, "Clovisor: "+ed.Message)
 			}
 			// Transparent audit: answered, recorded as would-deny.
@@ -372,7 +373,7 @@ func (r *Resolver) answer(q []byte, proto string, client, server netip.AddrPort)
 	resp, upstream, err := r.forward(q, proto)
 	if err != nil {
 		d.RCode, d.Reason = "ServFail", "upstream: "+err.Error()
-		r.record(runCg, runID, d)
+		r.record(cg, runCg, runID, d)
 		return reply(h, &question, dnsmessage.RCodeServerFailure, "")
 	}
 	resp, d.ECHStripped = stripECH(resp)
@@ -381,7 +382,7 @@ func (r *Resolver) answer(q []byte, proto string, client, server netip.AddrPort)
 		r.bind(runCg, name, parsed.Answers)
 	}
 	d.Server = upstream
-	r.record(runCg, runID, d)
+	r.record(cg, runCg, runID, d)
 	return resp
 }
 
@@ -431,11 +432,14 @@ func exchange(q []byte, proto, upstream string) ([]byte, error) {
 	}
 }
 
-func (r *Resolver) record(runCg uint64, runID string, d DNSData) {
+func (r *Resolver) record(leaf, runCg uint64, runID string, d DNSData) {
 	if r.events == nil || runCg == 0 {
 		return
 	}
-	ev := AuditEvent{Type: EventDNS, Timestamp: time.Now(), CgroupID: runCg, RunCgroupID: runCg, Data: d}
+	if leaf == 0 {
+		leaf = runCg
+	}
+	ev := AuditEvent{Type: EventDNS, Timestamp: time.Now(), CgroupID: leaf, RunCgroupID: runCg, Data: d}
 	select {
 	case r.events <- ev:
 	default:

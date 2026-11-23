@@ -259,8 +259,9 @@ func TestSplitAuthority(t *testing.T) {
 	}
 }
 
-// A client in a child cgroup of a run (an MCP server's) is the run's, and
-// its decisions are filed under the run's own cgroup id.
+// A client in a child cgroup of a run (an MCP server's, a tool call's) is
+// the run's: its decisions are filed under the run's own cgroup id, with
+// the client's cgroup as the leaf, so they can be attributed to the call.
 func TestExtProcChildCgroupAttribution(t *testing.T) {
 	xp, events, c := newTestExtProc(t, false)
 	own := ownCgroupID(t)
@@ -270,8 +271,8 @@ func TestExtProcChildCgroupAttribution(t *testing.T) {
 		t.Fatal("child-cgroup client refused")
 	}
 	ev := <-events
-	if ev.RunCgroupID != 42 || ev.CgroupID != 42 || own == 42 {
-		t.Fatalf("filed under %d/%d, want the run's cgroup 42", ev.RunCgroupID, ev.CgroupID)
+	if ev.RunCgroupID != 42 || ev.CgroupID != own || own == 42 {
+		t.Fatalf("filed under %d/%d, want the run's cgroup 42 and the client's %d", ev.RunCgroupID, ev.CgroupID, own)
 	}
 }
 

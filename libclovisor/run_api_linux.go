@@ -235,3 +235,39 @@ func inetSockets(pid int) (int, error) {
 	}
 	return n, nil
 }
+
+// attachCall moves the process behind pidfd into the call opened on this
+// connection. It must be a child of the caller, of the caller's uid, and
+// already inside the same run: a call can only subdivide a run, never let
+// anything in.
+func (ac *apiConn) attachCall(pidfd int) RunAPIResponse {
+	if ac.attached {
+		return fail("call %s already has its process", ac.callID)
+	}
+	pid, err := pidfdPid(pidfd)
+	if err != nil {
+		return fail("%v", err)
+	}
+	ppid, uid, err := procStatus(pid)
+	if err != nil {
+		return fail("%v", err)
+	}
+	if ppid != int(ac.cred.Pid) {
+		return fail("pid %d is not a child of the caller", pid)
+	}
+	if uid != int(ac.cred.Uid) {
+		return fail("pid %d does not belong to uid %d", pid, ac.cred.Uid)
+	}
+	cg, err := procCgroup(pid)
+	if err != nil || ac.s.runOfCgroupPath(cg) != ac.callRun {
+		return fail("pid %d is not in run %s", pid, ac.callRun)
+	}
+	if err := os.WriteFile(filepath.Join(ac.callPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0); err != nil {
+		return fail("failed to move pid %d into call: %v", pid, err)
+	}
+	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
+		return fail("process exited during attach")
+	}
+	ac.attached = true
+	return RunAPIResponse{OK: true, RunID: ac.callRun, CallID: ac.callID}
+}

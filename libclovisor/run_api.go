@@ -57,7 +57,7 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status
+	Op       string   `json:"op"` // create, attach, end, call, call_end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
@@ -77,6 +77,8 @@ type RunAPIRequest struct {
 	PinTool   string `json:"pin_tool,omitempty"`
 	PinHash   string `json:"pin_hash,omitempty"`
 	PinsAll   bool   `json:"pins_all,omitempty"` // pins: include pins with no pending change
+	// CallName labels a tool call (op call): the harness's name for it.
+	CallName string `json:"call_name,omitempty"`
 }
 
 // RunAPIResponse is the agent's reply to each request.
@@ -84,6 +86,7 @@ type RunAPIResponse struct {
 	OK       bool       `json:"ok"`
 	Error    string     `json:"error,omitempty"`
 	RunID    string     `json:"run_id,omitempty"`
+	CallID   string     `json:"call_id,omitempty"` // call
 	CgroupID uint64     `json:"cgroup_id,omitempty"`
 	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
 	Proxy    string     `json:"proxy,omitempty"`  // create: the node's proxy URL, if any
@@ -110,12 +113,47 @@ type RunAPIResponse struct {
 // RunRegistry holds metadata for runs created through the API until the
 // recorder has written their timelines. Safe for concurrent use.
 type RunRegistry struct {
-	mu sync.Mutex
-	m  map[string]RunMeta
+	mu    sync.Mutex
+	m     map[string]RunMeta
+	calls map[uint64]string // call cgroup id -> call id
 }
 
 // NewRunRegistry returns an empty registry.
-func NewRunRegistry() *RunRegistry { return &RunRegistry{m: map[string]RunMeta{}} }
+func NewRunRegistry() *RunRegistry {
+	return &RunRegistry{m: map[string]RunMeta{}, calls: map[uint64]string{}}
+}
+
+// AddCall records a tool call (or MCP server) of a known run.
+func (r *RunRegistry) AddCall(runID string, c CallMeta) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m, ok := r.m[runID]; ok {
+		m.Calls = append(append([]CallMeta{}, m.Calls...), c)
+		r.m[runID] = m
+		r.calls[c.CgroupID] = c.ID
+	}
+}
+
+// EndCall records how a call ended.
+func (r *RunRegistry) EndCall(runID, callID string, exitCode *int) {
+	end := time.Now().UTC()
+	r.Update(runID, func(m *RunMeta) {
+		calls := append([]CallMeta{}, m.Calls...)
+		for i := range calls {
+			if calls[i].ID == callID && calls[i].EndedAt == nil {
+				calls[i].EndedAt, calls[i].ExitCode = &end, exitCode
+			}
+		}
+		m.Calls = calls
+	})
+}
+
+// CallFor names the call whose cgroup is cgroupID, or "".
+func (r *RunRegistry) CallFor(cgroupID uint64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[cgroupID]
+}
 
 // Put records metadata for a run.
 func (r *RunRegistry) Put(m RunMeta) {
@@ -146,6 +184,9 @@ func (r *RunRegistry) Get(runID string) (RunMeta, bool) {
 func (r *RunRegistry) Done(runID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for _, c := range r.m[runID].Calls {
+		delete(r.calls, c.CgroupID)
+	}
 	delete(r.m, runID)
 }
 
@@ -184,6 +225,10 @@ type RunAPIServer struct {
 	nextCg uint64            // credential identity: synthetic run ids
 	tokens map[string]string // credential identity: token -> run id
 	tokOf  map[string]string // run id -> token
+	// Tool calls (milestone 4.5), per run: the last call number given, and
+	// how many are open.
+	callSeq   map[string]int
+	liveCalls map[string]int
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
@@ -307,6 +352,8 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		runCg:     map[string]uint64{},
 		tokens:    map[string]string{},
 		tokOf:     map[string]string{},
+		callSeq:   map[string]int{},
+		liveCalls: map[string]int{},
 		nextCg:    credentialCgBase,
 		done:      make(chan struct{}),
 	}, nil
@@ -450,6 +497,12 @@ type apiConn struct {
 	cgID     uint64
 	cwd      string
 	attached bool
+
+	// A tool call (op call) instead of a run: the caller is inside the run.
+	callID   string
+	callRun  string
+	callPath string
+	callDone bool
 }
 
 func (s *RunAPIServer) handle(c *net.UnixConn) {
@@ -489,7 +542,7 @@ func (s *RunAPIServer) handle(c *net.UnixConn) {
 		if err := mc.send(out); err != nil {
 			return
 		}
-		if req.Op == "end" && resp.OK {
+		if (req.Op == "end" || req.Op == "call_end") && resp.OK {
 			return
 		}
 	}
@@ -511,9 +564,19 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		if len(fds) != 1 {
 			return fail("attach needs exactly one pidfd, got %d fds", len(fds))
 		}
+		if ac.callID != "" {
+			return ac.attachCall(fds[0])
+		}
 		return ac.attach(fds[0])
 	case "end":
+		if ac.callID != "" {
+			return fail("this connection holds a call: send call_end")
+		}
 		return ac.end(req.ExitCode)
+	case "call":
+		return ac.call(req)
+	case "call_end":
+		return ac.callEnd(req.ExitCode)
 	case "profiles":
 		return ac.profiles()
 	case "clamp", "revoke":
@@ -828,6 +891,10 @@ func (ac *apiConn) end(exitCode *int) RunAPIResponse {
 // abandon ends a run whose client went away without "end", unless the
 // node agent is shutting down (see the package comment on restarts).
 func (ac *apiConn) abandon() {
+	if ac.callID != "" && !ac.callDone {
+		ac.callEnd(nil)
+		return
+	}
 	if ac.runID == "" {
 		return
 	}
@@ -996,4 +1063,123 @@ func (s *RunAPIServer) ActiveRuns() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.active)
+}
+
+// maxLiveCalls bounds a run's tool calls in progress at once.
+const maxLiveCalls = 256
+
+// call opens a tool call (milestone 4.5): a cgroup of its own below the
+// caller's run, run-<id>/call-<n>, for the process the caller attaches
+// next. The caller must be inside the run; the run is found from its
+// cgroup, never from the request. Events from the call's processes are
+// the run's, attributed to the call.
+func (ac *apiConn) call(req RunAPIRequest) RunAPIResponse {
+	if ac.s.cm == nil {
+		return fail("tool calls need cgroup identity")
+	}
+	if ac.runID != "" || ac.callID != "" {
+		return fail("this connection already has a run or a call")
+	}
+	cg, err := procCgroup(int(ac.cred.Pid))
+	if err != nil {
+		return fail("cannot read caller's cgroup: %v", err)
+	}
+	runID := ac.s.runOfCgroupPath(cg)
+	if runID == "" {
+		return fail("a tool call must be started from inside a run")
+	}
+	runPath, ok := ac.s.cm.GetRunCgroupPath(runID)
+	ac.s.mu.Lock()
+	live := ac.s.active[runID]
+	b := ac.s.bound[runID]
+	if ok && live && ac.s.liveCalls[runID] >= maxLiveCalls {
+		ok = false
+		err = fmt.Errorf("run %s has %d tool calls in progress", runID, maxLiveCalls)
+	}
+	var n int
+	if ok && live {
+		ac.s.callSeq[runID]++
+		n = ac.s.callSeq[runID]
+		ac.s.liveCalls[runID]++
+	}
+	ac.s.mu.Unlock()
+	switch {
+	case err != nil:
+		return fail("%v", err)
+	case !ok || !live:
+		return fail("run %s is not live", runID)
+	case b != nil && ac.cred.Uid != 0 && int(ac.cred.Uid) != b.uid:
+		ac.releaseCall(runID)
+		return fail("run %s belongs to another user", runID)
+	}
+	callID := fmt.Sprintf("call-%d", n)
+	path := filepath.Join(runPath, callID)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		ac.releaseCall(runID)
+		return fail("failed to create call cgroup: %v", err)
+	}
+	id, err := GetCgroupID(path)
+	if err != nil {
+		os.Remove(path)
+		ac.releaseCall(runID)
+		return fail("%v", err)
+	}
+	ac.s.addRunCgroup(runID, id)
+	ac.s.reg.AddCall(runID, CallMeta{ID: callID, Name: req.CallName, Command: req.Command, CgroupID: id, StartedAt: time.Now().UTC()})
+	ac.callID, ac.callRun, ac.callPath = callID, runID, path
+	return RunAPIResponse{OK: true, RunID: runID, CallID: callID, CgroupID: id}
+}
+
+func (ac *apiConn) releaseCall(runID string) {
+	ac.s.mu.Lock()
+	if ac.s.liveCalls[runID] > 0 {
+		ac.s.liveCalls[runID]--
+	}
+	ac.s.mu.Unlock()
+}
+
+// callEnd records how the call ended, kills what is left in its cgroup,
+// and removes the cgroup. Its events stay attributed: the registry keeps
+// the call until the run's timeline is written.
+func (ac *apiConn) callEnd(exitCode *int) RunAPIResponse {
+	if ac.callID == "" {
+		return fail("no call")
+	}
+	if ac.callDone {
+		return RunAPIResponse{OK: true, RunID: ac.callRun, CallID: ac.callID}
+	}
+	ac.callDone = true
+	ac.s.reg.EndCall(ac.callRun, ac.callID, exitCode)
+	if err := killAndRemoveCgroup(ac.callPath); err != nil {
+		log.Printf("run api: run %s %s: %v", ac.callRun, ac.callID, err)
+	}
+	ac.releaseCall(ac.callRun)
+	return RunAPIResponse{OK: true, RunID: ac.callRun, CallID: ac.callID}
+}
+
+// runOfCgroupPath returns the live run a cgroup path (relative to the
+// cgroup root) is in, or "".
+func (s *RunAPIServer) runOfCgroupPath(cg string) string {
+	if !s.inAgents(cg) {
+		return ""
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(cg, s.agentsRel), "/")
+	first, _, _ := strings.Cut(rest, "/")
+	runID, ok := strings.CutPrefix(first, RunPrefix)
+	if !ok {
+		return ""
+	}
+	return runID
+}
+
+// Call opens a tool call in the caller's run; Attach then moves the
+// call's process in, and CallEnd closes it.
+func (rc *RunAPIClient) Call(name string, command []string) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "call", CallName: name, Command: command})
+}
+
+// CallEnd closes the call opened on this connection.
+func (rc *RunAPIClient) CallEnd(exitCode *int) error {
+	_, err := rc.call(RunAPIRequest{Op: "call_end", ExitCode: exitCode})
+	return err
 }

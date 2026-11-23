@@ -498,7 +498,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	if reason != "" {
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "guard: "+reason
 		d.Message = "Egress to " + net.JoinHostPort(host, strconv.Itoa(int(port))) + " is refused: " + reason + "."
-		s.record(runCg, runID, d)
+		s.record(cg, runCg, runID, d)
 		return s.deny(d, runID), headerOutcome{}
 	}
 
@@ -555,7 +555,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	} else {
 		d.Reason = "unprofiled run"
 	}
-	s.record(runCg, runID, d)
+	s.record(cg, runCg, runID, d)
 	if d.Decision == policy.ActionDeny && d.Enforced {
 		return s.deny(d, runID), headerOutcome{}
 	}
@@ -588,11 +588,16 @@ func parseProxyBasic(v string) (user, pass string, ok bool) {
 
 // record files a decision under the run's own cgroup id, which is how
 // the recorder keys runs, whichever child cgroup the client was in.
-func (s *ExtProcServer) record(runCg uint64, runID string, d HTTPData) {
+// record reports a decision. leaf is the client socket's cgroup (a tool
+// call's, below the run, milestone 4.5), or 0 where unknown.
+func (s *ExtProcServer) record(leaf, runCg uint64, runID string, d HTTPData) {
 	if runID == "" || runCg == 0 || s.events == nil {
 		return
 	}
-	ev := AuditEvent{Type: EventHTTP, Timestamp: time.Now(), CgroupID: runCg, RunCgroupID: runCg, Data: d}
+	if leaf == 0 {
+		leaf = runCg
+	}
+	ev := AuditEvent{Type: EventHTTP, Timestamp: time.Now(), CgroupID: leaf, RunCgroupID: runCg, Data: d}
 	select {
 	case s.events <- ev:
 	default:

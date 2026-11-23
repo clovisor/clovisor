@@ -28,6 +28,22 @@ type RunMeta struct {
 	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	ExitCode  *int       `json:"exit_code,omitempty"`
 	Policy    *RunPolicy `json:"policy,omitempty"`
+	// Calls are the run's tool calls with cgroups of their own (milestone
+	// 4.5), and its MCP servers.
+	Calls []CallMeta `json:"calls,omitempty"`
+}
+
+// CallMeta is one tool call in a cgroup of its own below its run
+// (run-<id>/call-<n>), or an MCP server (run-<id>/mcp-<name>). Name is what
+// the harness called it: a label, not identity.
+type CallMeta struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name,omitempty"`
+	Command   []string   `json:"command,omitempty"`
+	CgroupID  uint64     `json:"cgroup_id"`
+	StartedAt time.Time  `json:"started_at"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	ExitCode  *int       `json:"exit_code,omitempty"`
 }
 
 // RunPolicy records which policy governed a run, by version (design

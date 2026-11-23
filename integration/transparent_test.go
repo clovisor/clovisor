@@ -76,6 +76,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("passed-in-socket", e.testPassedInSocket)
 	t.Run("unix-sockets", e.testUnixSockets)
 	t.Run("exec", e.testExec)
+	t.Run("tool-calls", e.testToolCalls)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -399,6 +400,21 @@ func (e *env) testExec(t *testing.T) {
 	expect(t, out, "system: ran", "tmp: refused", "allowed dir: ran")
 	tl := e.timeline(id)
 	expect(t, tl, `"path": "/tmp/t"`, `"verdict": "refused: exec"`, `"trusted": false`)
+}
+
+func (e *env) testToolCalls(t *testing.T) {
+	// Two tool calls, each in a cgroup of its own below the run; what each
+	// does is attributed to it. A call from outside any run is refused.
+	if _, errOut, err := e.sh("/it/bin/agentctl call -- true"); err == nil || !strings.Contains(errOut, "inside a run") {
+		t.Fatalf("call outside a run: %v %s", err, errOut)
+	}
+	out, id := e.trun(`
+/it/bin/agentctl call --name fetch -- curl -sS -o /dev/null -w "fetch %{http_code}\n" https://origin.test/allowed
+/it/bin/agentctl call --name lookup -- getent hosts other.test || echo "lookup failed"
+/it/bin/agentctl call --name status -- cat /proc/self/cgroup`)
+	expect(t, out, "fetch 200", "lookup failed", "/call-3")
+	tl := e.timeline(id)
+	expect(t, tl, `"id": "call-1"`, `"name": "fetch"`, `"id": "call-2"`, `"name": "lookup"`, `"call": "call-1"`, `"call": "call-2"`)
 }
 
 func (e *env) testCheckTransparent(t *testing.T) {

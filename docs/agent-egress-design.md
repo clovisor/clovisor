@@ -86,6 +86,7 @@ place:
 | Socket families limited and sockets made outside the run refused, through BPF LSM, pinned to fail closed. | [4.1 and 4.3 status](#41-and-43-status-2026-11-23) |
 | Unix sockets outside the run refused unless `unix.allow` names them; root-equivalent sockets need the ceiling's consent; closes the nss-resolve bypass. | [4.2 status](#42-status-2026-11-23) |
 | Exec gating by resolved path through BPF LSM, with the trusted-path test as a per-profile option (`require_trusted_path`) and `dir/*` entries for build output. | [4.4 status](#44-status-2026-11-23) |
+| Tool calls in cgroups of their own (`agentctl call`), with events, proxy decisions and DNS attributed per call; MCP servers recorded as calls. | [4.5 status](#45-status-2026-11-23) |
 
 ---
 
@@ -2957,6 +2958,44 @@ Verified on kernel 7.0:
   every test run. A root-owned binary in world-writable `/tmp` was refused
   (the walk catches `/tmp`), one under an allowed directory ran, and curl,
   Python, git and the rest ran throughout.
+
+#### 4.5 status (2026-11-23)
+
+Implemented:
+
+- **Run API `call` op.** A process inside a run opens a call. The run is
+  found from the caller's cgroup, never the request, and the caller must be
+  the run's user. The node agent creates `run-<id>/call-<n>` (at most 256 open
+  per run), registers it as the run's, and moves the caller's parked child in
+  on `attach`. That child must already be in the same run: a call subdivides
+  a run, never lets anything in. `call_end`, or a dropped connection,
+  records the exit, kills what is left and removes the cgroup.
+- **`agentctl call [--name n] -- cmd`**, on the same shim and pidfd path as
+  `agentctl run`, with `CLOVISOR_CALL` set for the command.
+- **Attribution.** Kernel events already carried the leaf cgroup. `ext_proc`
+  and the resolver now record the client socket's cgroup as the leaf too,
+  instead of the run's. The recorder maps leaf cgroups to calls through the
+  run registry: timeline events carry `call`, and the timeline's `calls`
+  merges the run API's record with per-call event counts and refusals.
+- **MCP servers.** The gateway's `run-<id>/mcp-<name>` cgroups are recorded
+  as calls `mcp-<name>`.
+- **Policy is unchanged:** a call's processes are in the run's subtree, which
+  every kernel map is keyed by.
+
+Nearest-run resolution ([finding 4](#phase-4-plan-2026-11-23)) turned out
+not to be needed here. Calls sit directly below their run, which every
+lookup already resolves, so it moves to 4.6, where runs nest.
+
+Verified on kernel 7.0: a run with three calls, `ls`, a curl to an allowed
+host, and a curl to an unlisted one.
+
+- Each call's events were attributed to it: 1 exec; then exec, 2 DNS, 2
+  connects and 2 proxy decisions; then exec, 4 DNS and 2 connects.
+- The third call recorded its exit code 6 and 4 refusals, its refused
+  lookups.
+- A call from outside a run was refused.
+- `make integration-transparent` gained a tool-call check (fifteen in all):
+  two attributed calls, and the third running in `/call-3`.
 
 #### Decisions
 

@@ -671,8 +671,13 @@ func (g *MCPGateway) launchGoverned(srv *mcpServer) (*exec.Cmd, func(), error) {
 			return nil, nil, err
 		}
 		// Egress from the server is the run's: register its cgroup so the
-		// proxy attributes it.
+		// proxy attributes it, and record the server as one of the run's
+		// calls so its events are attributed to it (milestone 4.5).
 		g.api.addRunCgroup(run.runID, cgID)
+		if g.api.reg != nil && g.api.reg.CallFor(cgID) == "" {
+			g.api.reg.AddCall(run.runID, CallMeta{ID: "mcp-" + srv.spec.Name, Name: "MCP server " + srv.spec.Name,
+				Command: srv.spec.Command, CgroupID: cgID, StartedAt: time.Now().UTC()})
+		}
 		cgDir, err := os.Open(cgPath)
 		if err != nil {
 			return nil, nil, err

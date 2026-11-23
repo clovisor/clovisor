@@ -51,8 +51,21 @@ type RunTimeline struct {
 	// complete.
 	SuppressedEvents uint64 `json:"suppressed_events,omitempty"`
 
-	Summary RunSummary      `json:"summary"`
-	Events  []TimelineEvent `json:"events"`
+	Summary RunSummary `json:"summary"`
+	// Calls are the run's tool calls and MCP servers, each with a cgroup of
+	// its own (milestone 4.5), and what happened in them.
+	Calls  []CallSummary   `json:"calls,omitempty"`
+	Events []TimelineEvent `json:"events"`
+}
+
+// CallSummary is one tool call or MCP server, from the run API's record
+// and the events attributed to its cgroup.
+type CallSummary struct {
+	CallMeta
+	// Events counts the events attributed to the call, by type (exec,
+	// connect, http, dns, ...); Refused those that were refused.
+	Events  map[string]int `json:"events,omitempty"`
+	Refused int            `json:"refused,omitempty"`
 }
 
 // RunSummary aggregates a run's events.
@@ -245,6 +258,9 @@ type TimelineEvent struct {
 	ResolvedName string `json:"resolved_name,omitempty"`
 	// Verdict is what transparent mode did with a connect.
 	Verdict string `json:"verdict,omitempty"`
+	// Call is the tool call or MCP server the event came from (milestone
+	// 4.5), when it came from one.
+	Call string `json:"call,omitempty"`
 	// mcp events:
 	MCPServer string `json:"mcp_server,omitempty"`
 	MCPName   string `json:"mcp_name,omitempty"` // tool or resource
@@ -271,6 +287,10 @@ type runState struct {
 	ipName  map[string]string
 	proxied map[proxKey]*ProxiedDest
 	mcp     map[mcpKey]*MCPUse
+	// callFor names the call a cgroup belongs to; calls counts events
+	// per call.
+	callFor func(cgroupID uint64) string
+	calls   map[string]*CallSummary
 }
 
 type mcpKey struct{ server, method, name string }
@@ -402,6 +422,13 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		ipName:   make(map[string]string),
 		proxied:  make(map[proxKey]*ProxiedDest),
 		mcp:      make(map[mcpKey]*MCPUse),
+		calls:    make(map[string]*CallSummary),
+		callFor: func(cg uint64) string {
+			if r.Meta == nil {
+				return ""
+			}
+			return r.Meta.CallFor(cg)
+		},
 	}
 	if ev.Type == EventRunStart {
 		st.sawStart = true
@@ -460,6 +487,20 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 }
 
 func (st *runState) add(te TimelineEvent, max int) {
+	if te.CgroupID != 0 && te.CgroupID != st.tl.CgroupID && st.callFor != nil {
+		if call := st.callFor(te.CgroupID); call != "" {
+			te.Call = call
+			cs := st.calls[call]
+			if cs == nil {
+				cs = &CallSummary{CallMeta: CallMeta{ID: call}, Events: map[string]int{}}
+				st.calls[call] = cs
+			}
+			cs.Events[te.Type]++
+			if strings.HasPrefix(te.Verdict, "refused") || (te.Decision == "deny" && te.Enforced) {
+				cs.Refused++
+			}
+		}
+	}
 	if max > 0 && len(st.tl.Events) >= max {
 		st.tl.DroppedEvents++
 		return
@@ -780,11 +821,31 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	if m.Policy != nil {
 		tl.Policy = m.Policy
 	}
+	if len(m.Calls) > 0 {
+		tl.Calls = make([]CallSummary, 0, len(m.Calls))
+		for _, c := range m.Calls {
+			tl.Calls = append(tl.Calls, CallSummary{CallMeta: c})
+		}
+	}
 }
 
 func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	tl := st.tl
 	r.mergeMeta(tl)
+	// The run API's record of each call, with the counts attributed to it.
+	// A call only events know of (a resumed timeline) is kept too.
+	seen := map[string]bool{}
+	for i := range tl.Calls {
+		if cs := st.calls[tl.Calls[i].ID]; cs != nil {
+			tl.Calls[i].Events, tl.Calls[i].Refused = cs.Events, cs.Refused
+		}
+		seen[tl.Calls[i].ID] = true
+	}
+	for id, cs := range st.calls {
+		if !seen[id] {
+			tl.Calls = append(tl.Calls, *cs)
+		}
+	}
 	tl.Summary.Binaries = sortedKeys(st.binaries)
 
 	tl.Summary.DNSNames = sortedKeys(st.names)

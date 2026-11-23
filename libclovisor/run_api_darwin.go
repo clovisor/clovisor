@@ -61,3 +61,7 @@ func procCgroup(pid int) (string, error) { return "", errors.New("cgroups need L
 func (ac *apiConn) attach(pidfd int) RunAPIResponse {
 	return fail("attach needs Linux cgroups; with credential identity the client starts the run's process itself")
 }
+
+func (ac *apiConn) attachCall(pidfd int) RunAPIResponse {
+	return fail("tool calls need Linux cgroups")
+}

@@ -162,6 +162,31 @@ func (cm *CgroupManager) DestroyRunCgroup(runID string) error {
 	return nil
 }
 
+// killAndRemoveCgroup kills every process in the cgroup at path and
+// removes it and its children.
+func killAndRemoveCgroup(path string) error {
+	populated, err := cgroupPopulated(path)
+	if err != nil {
+		return err
+	}
+	if populated {
+		if err := os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0); err != nil {
+			return fmt.Errorf("failed to kill remaining processes: %w", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for populated {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("cgroup %s still populated after kill", path)
+			}
+			time.Sleep(10 * time.Millisecond)
+			if populated, err = cgroupPopulated(path); err != nil {
+				return err
+			}
+		}
+	}
+	return removeCgroupTree(path)
+}
+
 // cgroupPopulated reports whether any process lives in the cgroup subtree.
 func cgroupPopulated(path string) (bool, error) {
 	data, err := os.ReadFile(filepath.Join(path, "cgroup.events"))

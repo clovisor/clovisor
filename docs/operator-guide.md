@@ -251,6 +251,23 @@ agentctl run --profile research --mcp-config ~/.mcp.json -- my-harness
 
 The run ends when the command exits, or when `agentctl` dies.
 
+**Tool calls** (cgroup identity). A harness running inside a run can give a
+tool call a cgroup of its own:
+
+```sh
+agentctl call --name run_tests -- go test ./...
+```
+
+The call runs in `run-<id>/call-<n>` under the run's policy, unchanged.
+Everything it and its children do (execs, connects, DNS, proxy decisions) is
+attributed to it: each timeline event carries `call`, and the timeline's
+`calls` list gives each call's name, command, start, end, exit code, events
+by type and refusals. The name is the harness's label, not identity. The
+call's process sees its id in `CLOVISOR_CALL`. A call can be started only
+from inside a run, and only subdivides it. Calls end with their command, and
+anything left in their cgroup is killed. MCP servers started by the gateway
+are listed among the calls as `mcp-<name>`.
+
 Tested clients: curl, Python requests and urllib (3.11+), and git (smart and
 dumb HTTP; git authenticates to the proxy after a `407` challenge). Node's
 built-in `fetch` does not read proxy variables by default. Configure the

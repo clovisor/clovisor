@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -373,5 +374,59 @@ func TestReceiptSockets(t *testing.T) {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("KernelLSM=%v receipt lacks %q", lsm, want)
 		}
+	}
+}
+
+func TestRunOfCgroupPath(t *testing.T) {
+	s := &RunAPIServer{agentsRel: "/agents"}
+	for path, want := range map[string]string{
+		"/agents/run-abc":        "abc",
+		"/agents/run-abc/call-3": "abc",
+		"/agents/run-abc/mcp-fs": "abc",
+		"/agents":                "",
+		"/agents/other":          "",
+		"/user.slice/run-abc":    "",
+		"/agentsX/run-abc":       "",
+	} {
+		if got := s.runOfCgroupPath(path); got != want {
+			t.Errorf("%s: %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestRunRecorderCalls(t *testing.T) {
+	r := newTestRecorder(t)
+	r.Meta = NewRunRegistry()
+	r.Meta.Put(RunMeta{RunID: "abc", StartedAt: t0, UID: os.Getuid()})
+	const callCg = 777
+	r.Meta.AddCall("abc", CallMeta{ID: "call-1", Name: "run_tests", CgroupID: callCg, StartedAt: t0})
+	code := 3
+	r.Meta.EndCall("abc", "call-1", &code)
+	callExec := execEv(1, callCg, 20, 10, "/usr/bin/go", "go", "test")
+	http := AuditEvent{Type: EventHTTP, Timestamp: at(2), CgroupID: callCg, RunCgroupID: testRunCg,
+		Data: HTTPData{Method: "CONNECT", Host: "evil.example", Port: 443, Decision: "deny", Enforced: true}}
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		execEv(1, testRunCg, 10, 1, "/usr/bin/agent"),
+		callExec, http,
+		runEv(EventRunEnd, 3, "/agents/run-abc"),
+	)
+	if len(tl.Calls) != 1 {
+		t.Fatalf("calls: %+v", tl.Calls)
+	}
+	c := tl.Calls[0]
+	if c.ID != "call-1" || c.Name != "run_tests" || *c.ExitCode != 3 || c.Events["exec"] != 1 || c.Events["http"] != 1 || c.Refused != 1 {
+		t.Fatalf("call summary: %+v", c)
+	}
+	var attributed []string
+	for _, e := range tl.Events {
+		attributed = append(attributed, e.Type+":"+e.Call)
+	}
+	if strings.Join(attributed, " ") != "exec: exec:call-1 http:call-1" {
+		t.Fatalf("attribution: %v", attributed)
+	}
+	r.Meta.Done("abc")
+	if r.Meta.CallFor(callCg) != "" {
+		t.Error("call kept after the run was written")
 	}
 }
