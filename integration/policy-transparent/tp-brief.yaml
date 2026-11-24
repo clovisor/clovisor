@@ -1,0 +1,11 @@
+# A duration limit (milestone 5.2): the node agent ends the run.
+kind: AgentProfile
+metadata: { name: tp-brief }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: origin, to: { fqdn: ["origin.test"], ports: [443] }, action: allow }
+  limits:
+    duration: 2s

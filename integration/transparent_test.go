@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,8 @@ func TestTransparent(t *testing.T) {
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
+	t.Run("limits", e.testTransparentLimits)
+	t.Run("duration", e.testDuration)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -588,4 +591,46 @@ except OSError as err:
 	if !strings.Contains(out, "\n2\n") {
 		t.Errorf("lookup not refused with the node agent down:\n%s", out)
 	}
+}
+
+func (e *env) testTransparentLimits(t *testing.T) {
+	// Milestone 5.2: a rate-limit rule, and egress bytes counted in the
+	// kernel. Past 256Ki the run's packets are dropped and its egress
+	// revoked.
+	out, id := e.agentRun("tp-limits", `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+for i in 1 2 3; do curl -s -o /dev/null -w "other$i %{http_code}\n" https://other.test/x; done
+echo "small: $(curl -s -o /dev/null -w %{http_code} --data-binary hello https://origin.test/echo)"
+head -c 1000000 /dev/zero > /tmp/1m
+echo "big: $(curl -s -m 5 -o /dev/null -w %{http_code} --data-binary @/tmp/1m https://origin.test/echo)"
+sleep 2
+echo "after: $(curl -s -m 3 -o /dev/null -w %{http_code} https://origin.test/allowed)"`)
+	expect(t, out, "other1 200", "other2 200", "other3 429", "small: 200")
+	for _, l := range strings.Split(out, "\n") {
+		if (strings.HasPrefix(l, "big: ") || strings.HasPrefix(l, "after: ")) && strings.HasSuffix(l, " 200") {
+			t.Errorf("past the egress limit: %s\n%s", l, out)
+		}
+	}
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Limit     egress_bytes 256Ki (profile tp-limits): revoked", "Egress    ")
+	n := regexp.MustCompile(`Egress    (\d+) bytes`).FindStringSubmatch(shown)
+	if n == nil {
+		t.Fatalf("no egress bytes:\n%s", shown)
+	}
+	// What was sent: up to the limit, the upload filling it before it was
+	// cut off. Refused packets are not counted.
+	if b, _ := strconv.Atoi(n[1]); b < 128<<10 || b > 256<<10 {
+		t.Errorf("egress bytes %d: want most of 256Ki and no more", b)
+	}
+}
+
+func (e *env) testDuration(t *testing.T) {
+	start := time.Now()
+	out, errOut, _ := e.sh(`/it/bin/agentctl run --profile tp-brief -- sh -c 'sleep 10; echo survived'`)
+	if strings.Contains(out, "survived") || time.Since(start) > 8*time.Second {
+		t.Fatalf("not ended at its duration (%s):\n%s%s", time.Since(start), out, errOut)
+	}
+	expect(t, errOut, "was ended by the node agent: it reached its duration limit of 2s (profile tp-brief)")
 }

@@ -2,5 +2,5 @@ kind: ProfileCeiling
 metadata: { name: everyone }
 spec:
   appliesTo: { any: true }
-  allow: [it, it-content]
+  allow: [it, it-content, it-limits]
   default: it

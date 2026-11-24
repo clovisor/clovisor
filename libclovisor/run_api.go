@@ -90,7 +90,9 @@ type RunAPIResponse struct {
 	Parent   string     `json:"parent,omitempty"`  // create: the run this one is nested in
 	CgroupID uint64     `json:"cgroup_id,omitempty"`
 	Policy   *RunPolicy `json:"policy,omitempty"` // create, clamp, revoke
-	Proxy    string     `json:"proxy,omitempty"`  // create: the node's proxy URL, if any
+	// end: why the node agent ended the run first, if it did (a limit)
+	EndReason string `json:"end_reason,omitempty"`
+	Proxy     string `json:"proxy,omitempty"` // create: the node's proxy URL, if any
 	// create: trust anchors for terminated destinations
 	TrustBundle string `json:"trust_bundle,omitempty"`
 	NodeCACert  string `json:"node_ca_cert,omitempty"`
@@ -252,6 +254,11 @@ type RunAPIServer struct {
 	OnPolicy func(runCg uint64, uid int, eff *policy.Effective, nested bool) error
 	// OnNestedEnd, if set, hears that a nested run's cgroup is gone.
 	OnNestedEnd func(runCg uint64)
+	// OnRunStart, if set, hears of every run once its cgroup exists and
+	// before any process joins it; OnRunEnd as it ends, before its cgroup
+	// is removed, while its metadata can still change (milestone 5.2).
+	OnRunStart func(runID string, runCg uint64)
+	OnRunEnd   func(runID string, runCg uint64)
 	// MCP is the local MCP gateway, if enabled.
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.
@@ -274,6 +281,9 @@ type RunAPIServer struct {
 	// each live run's live children.
 	parentOf map[string]string
 	children map[string][]string
+	// endReasons holds why the node agent ended a run, until its client
+	// ends it too and is told (the run's metadata may be gone by then).
+	endReasons map[string]string
 
 	mu      sync.Mutex
 	conns   map[*net.UnixConn]struct{}
@@ -293,6 +303,76 @@ type boundRun struct {
 	uid      int
 	cgroupID uint64
 	eff      *policy.Effective // replaced, never mutated, under RunAPIServer.mu
+	started  time.Time
+}
+
+// runLink is one run in a chain of nested runs.
+type runLink struct {
+	runID    string
+	cgroupID uint64
+	eff      *policy.Effective // nil: unprofiled
+	started  time.Time
+}
+
+// chain is runID and the runs it is nested in, outermost first. Empty if
+// runID is not live.
+func (s *RunAPIServer) chain(runID string) []runLink {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []runLink
+	for r := runID; r != ""; r = s.parentOf[r] {
+		if !s.active[r] {
+			return nil
+		}
+		l := runLink{runID: r, cgroupID: s.runCg[r]}
+		if b := s.bound[r]; b != nil {
+			l.eff, l.started = b.eff, b.started
+		}
+		out = append([]runLink{l}, out...)
+		if len(out) > maxNest+1 {
+			break
+		}
+	}
+	return out
+}
+
+// liveRuns lists the live runs.
+func (s *RunAPIServer) liveRuns() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.active))
+	for r := range s.active {
+		out = append(out, r)
+	}
+	return out
+}
+
+// EndRunFor ends a live run, and its nested runs, recording why: the node
+// agent's own decision (a duration limit), not its client's.
+func (s *RunAPIServer) EndRunFor(runID, reason string) {
+	why := map[string]string{runID: reason}
+	for _, k := range s.descendantsOf(runID) {
+		why[k] = "its parent run " + runID + " ended: " + reason
+	}
+	s.mu.Lock()
+	if s.endReasons == nil {
+		s.endReasons = map[string]string{}
+	}
+	for r, w := range why {
+		s.endReasons[r] = w
+	}
+	s.mu.Unlock()
+	for r, w := range why {
+		s.reg.Update(r, func(m *RunMeta) { m.EndReason = w })
+	}
+	log.Printf("run api: run %s: ending it: %s", runID, reason)
+	s.endRun(runID, nil)
+}
+
+func (s *RunAPIServer) descendantsOf(runID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.descendants(runID)
 }
 
 // SetPolicy installs the policy used for new runs. Runs already bound
@@ -384,25 +464,26 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		return nil, err
 	}
 	return &RunAPIServer{
-		cm:        cm,
-		reg:       reg,
-		agentsRel: rel,
-		ln:        ln,
-		path:      path,
-		conns:     map[*net.UnixConn]struct{}{},
-		active:    map[string]bool{},
-		bound:     map[string]*boundRun{},
-		byCg:      map[uint64]*boundRun{},
-		runByCg:   map[uint64]string{},
-		runCg:     map[string]uint64{},
-		tokens:    map[string]string{},
-		tokOf:     map[string]string{},
-		callSeq:   map[string]int{},
-		liveCalls: map[string]int{},
-		parentOf:  map[string]string{},
-		children:  map[string][]string{},
-		nextCg:    credentialCgBase,
-		done:      make(chan struct{}),
+		cm:         cm,
+		reg:        reg,
+		agentsRel:  rel,
+		ln:         ln,
+		path:       path,
+		conns:      map[*net.UnixConn]struct{}{},
+		active:     map[string]bool{},
+		bound:      map[string]*boundRun{},
+		byCg:       map[uint64]*boundRun{},
+		runByCg:    map[uint64]string{},
+		runCg:      map[string]uint64{},
+		tokens:     map[string]string{},
+		tokOf:      map[string]string{},
+		callSeq:    map[string]int{},
+		liveCalls:  map[string]int{},
+		parentOf:   map[string]string{},
+		children:   map[string][]string{},
+		endReasons: map[string]string{},
+		nextCg:     credentialCgBase,
+		done:       make(chan struct{}),
 	}, nil
 }
 
@@ -751,7 +832,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		ac.s.runByCg[id] = runID
 		ac.s.runCg[runID] = id
 		if eff != nil {
-			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: eff}
+			b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: eff, started: time.Now()}
 			ac.s.bound[runID] = b
 			ac.s.byCg[id] = b
 		}
@@ -765,6 +846,9 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 		return fail("%v", err)
 	}
 	ac.runID, ac.runPath, ac.cgID, ac.cwd, ac.parent = runID, path, id, req.Cwd, parent
+	if ac.s.OnRunStart != nil {
+		ac.s.OnRunStart(runID, id)
+	}
 	if eff != nil && ac.s.OnPolicy != nil {
 		if err := ac.s.OnPolicy(id, int(ac.cred.Uid), eff, parent != ""); err != nil && parent != "" {
 			// The kernel would look the nested run's policy up by its
@@ -1001,40 +1085,57 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 		}
 	}
 
+	rp, err := ac.s.applyLayer(runID, layer, func(b *boundRun) string {
+		if ac.cred.Uid != 0 && int(ac.cred.Uid) != b.uid {
+			return fmt.Sprintf("run %s belongs to another user", runID)
+		}
+		if within != "" && within != runID && !contains(ac.s.descendants(within), runID) {
+			return fmt.Sprintf("from inside run %s, only it and the runs nested in it can be clamped", within)
+		}
+		return ""
+	})
+	if err != nil {
+		return fail("%v", err)
+	}
+	return RunAPIResponse{OK: true, RunID: runID, Policy: rp}
+}
+
+// applyLayer layers a profile onto a live run and the runs nested in it,
+// in the proxy, the kernel and the run's record. permit, called with the
+// lock held, may refuse.
+func (s *RunAPIServer) applyLayer(runID string, layer policy.Layer, permit func(*boundRun) string) (*RunPolicy, error) {
 	type update struct {
 		b   *boundRun
 		eff *policy.Effective
 	}
 	var updates []update
-	ac.s.mu.Lock()
-	b, ok := ac.s.bound[runID]
-	if ok && ac.cred.Uid != 0 && int(ac.cred.Uid) != b.uid {
-		ac.s.mu.Unlock()
-		return fail("run %s belongs to another user", runID)
-	}
-	if ok && within != "" && within != runID && !contains(ac.s.descendants(within), runID) {
-		ac.s.mu.Unlock()
-		return fail("from inside run %s, only it and the runs nested in it can be clamped", within)
+	s.mu.Lock()
+	b, ok := s.bound[runID]
+	if ok && permit != nil {
+		if why := permit(b); why != "" {
+			s.mu.Unlock()
+			return nil, errors.New(why)
+		}
 	}
 	var kids []string
 	if ok {
 		// The clamp cascades: a nested run's policy is its parent's and
 		// more, so it must stay at most its parent's (§7.8).
-		kids = ac.s.descendants(runID)
+		kids = s.descendants(runID)
 		for _, r := range append([]string{runID}, kids...) {
-			if bb := ac.s.bound[r]; bb != nil {
+			if bb := s.bound[r]; bb != nil {
 				bb.eff = bb.eff.With(layer)
 				updates = append(updates, update{bb, bb.eff})
 			}
 		}
 	}
-	ac.s.mu.Unlock()
+	s.mu.Unlock()
 	if !ok {
-		return fail("no live profiled run %s", runID)
+		return nil, fmt.Errorf("no live profiled run %s", runID)
 	}
-	if ac.s.OnPolicy != nil {
+	if s.OnPolicy != nil {
 		for _, u := range updates {
-			if err := ac.s.OnPolicy(u.b.cgroupID, u.b.uid, u.eff, ac.s.isNested(u.b.runID)); err != nil {
+			if err := s.OnPolicy(u.b.cgroupID, u.b.uid, u.eff, s.isNested(u.b.runID)); err != nil {
 				log.Printf("run api: run %s: kernel policy after %s: %v", u.b.runID, layer.Source, err)
 			}
 		}
@@ -1047,7 +1148,7 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 		if r != runID {
 			lr.Source = "run " + runID + ": " + lr.Source
 		}
-		ac.s.reg.Update(r, func(m *RunMeta) {
+		s.reg.Update(r, func(m *RunMeta) {
 			if m.Policy != nil {
 				// Copy on write: the recorder may hold the old record.
 				np := *m.Policy
@@ -1064,7 +1165,7 @@ func (ac *apiConn) clamp(req RunAPIRequest) RunAPIResponse {
 	} else {
 		log.Printf("run api: run %s: %s %s", runID, layer.Source, layer.Profile.Name)
 	}
-	return RunAPIResponse{OK: true, RunID: runID, Policy: rp}
+	return rp, nil
 }
 
 func (ac *apiConn) end(exitCode *int) RunAPIResponse {
@@ -1073,7 +1174,11 @@ func (ac *apiConn) end(exitCode *int) RunAPIResponse {
 	}
 	runID := ac.runID
 	ac.finish(exitCode)
-	return RunAPIResponse{OK: true, RunID: runID}
+	ac.s.mu.Lock()
+	why := ac.s.endReasons[runID]
+	delete(ac.s.endReasons, runID)
+	ac.s.mu.Unlock()
+	return RunAPIResponse{OK: true, RunID: runID, EndReason: why}
 }
 
 // abandon ends a run whose client went away without "end", unless the
@@ -1094,6 +1199,7 @@ func (ac *apiConn) abandon() {
 		return
 	}
 	log.Printf("run api: run %s: client disconnected; ending run", ac.runID)
+	ac.s.forgetEndReason(ac.runID)
 	ac.finish(nil)
 }
 
@@ -1101,6 +1207,13 @@ func (ac *apiConn) abandon() {
 func (ac *apiConn) finish(exitCode *int) {
 	ac.s.endRun(ac.runID, exitCode)
 	ac.runID = ""
+}
+
+// forgetEndReason drops a reason no client will collect.
+func (s *RunAPIServer) forgetEndReason(runID string) {
+	s.mu.Lock()
+	delete(s.endReasons, runID)
+	s.mu.Unlock()
 }
 
 // endRun records how a run ended, then kills what is left and removes the
@@ -1123,6 +1236,9 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 		s.endRun(k, nil)
 	}
 
+	if s.OnRunEnd != nil {
+		s.OnRunEnd(runID, cgID)
+	}
 	end := time.Now().UTC()
 	s.reg.Update(runID, func(m *RunMeta) {
 		m.EndedAt = &end
@@ -1305,10 +1421,11 @@ func (rc *RunAPIClient) Attach(pidfd int) error {
 	return err
 }
 
-// End reports the exit code (nil if unknown) and ends the run.
-func (rc *RunAPIClient) End(exitCode *int) error {
-	_, err := rc.call(RunAPIRequest{Op: "end", ExitCode: exitCode})
-	return err
+// End reports the exit code (nil if unknown) and ends the run. It returns
+// why the node agent had ended it already, if it had.
+func (rc *RunAPIClient) End(exitCode *int) (string, error) {
+	resp, err := rc.call(RunAPIRequest{Op: "end", ExitCode: exitCode})
+	return resp.EndReason, err
 }
 
 // ActiveRuns counts runs whose agentctl connection is open.

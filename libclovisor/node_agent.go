@@ -49,6 +49,8 @@ type NodeAgent struct {
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
 	running    bool
+	limiter    *Limiter
+	limitDone  chan struct{}
 }
 
 // NodeAgentOptions configures where run timelines go.
@@ -180,12 +182,14 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if !opts.ProxyListen.IsValid() {
 			return nil, fmt.Errorf("transparent mode needs the proxy (-proxy-listen)")
 		}
-		// Runs reach the explicit proxy and the MCP gateway directly.
-		t.Exceptions = nil
-		for _, a := range []netip.AddrPort{opts.ProxyListen, opts.MCPListen} {
-			if a.IsValid() {
-				t.Exceptions = append(t.Exceptions, a)
-			}
+	}
+	// Runs reach the explicit proxy and the MCP gateway directly. The
+	// connect hooks use this list only in transparent mode; the egress
+	// byte count, in every mode, counts loopback bytes to them.
+	t.Exceptions = nil
+	for _, a := range []netip.AddrPort{opts.ProxyListen, opts.MCPListen} {
+		if a.IsValid() {
+			t.Exceptions = append(t.Exceptions, a)
 		}
 	}
 	// Load policy before touching the kernel or the socket: a policy that
@@ -424,6 +428,24 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if r := audit.reader; r != nil && recorder != nil {
 		recorder.LostFor = r.LostFor
 	}
+	// Limits (milestone 5.2): duration and egress bytes here, connection
+	// and request rates in ext_proc, sharing the run's allowances.
+	store, err := OpenCounterStore(d.Counters())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "node agent: counters: %v; counting afresh\n", err)
+		store, _ = OpenCounterStore("")
+	}
+	buckets := NewRateBuckets()
+	if xp != nil {
+		xp.Rates = buckets
+	}
+	var bc byteCounter
+	if r := audit.reader; r != nil && !credential {
+		bc = r
+	}
+	na.limiter = NewLimiter(api, bc, store, buckets)
+	api.OnRunStart, api.OnRunEnd = na.limiter.RunStarted, na.limiter.RunEnded
+	na.limiter.Resume()
 
 	return na, nil
 }
@@ -629,6 +651,13 @@ func (na *NodeAgent) Stop() error {
 	if na.api != nil {
 		na.api.Close()
 	}
+	if na.limitDone != nil {
+		close(na.limitDone)
+		na.limitDone = nil
+		if err := na.limiter.store.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "node agent: saving counters: %v\n", err)
+		}
+	}
 
 	// Close BPF reader if it exists
 	if na.bpfReader != nil {
@@ -672,6 +701,10 @@ func (na *NodeAgent) Run() error {
 	}
 	if na.resolver != nil {
 		go na.resolver.Serve()
+	}
+	if na.limiter != nil {
+		na.limitDone = make(chan struct{})
+		go na.limiter.Run(time.Second, na.limitDone)
 	}
 	if na.proxyOpts != nil && na.audit.reader != nil {
 		na.audit.reader.SetHealth(na.health)

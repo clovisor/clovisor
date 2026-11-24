@@ -149,6 +149,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("no-credential", e.testNoCredential)
 	t.Run("timeline-and-learn", e.testTimeline)
 	t.Run("content", e.testContent)
+	t.Run("limits", e.testLimits)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -433,7 +434,7 @@ EOS`); err != nil {
 		t.Errorf("2 MB body not delivered whole:\n%s", out)
 	}
 
-	shown, _, err := e.sh("/it/bin/agentctl show " + id + " && /it/bin/agentctl events " + id)
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,6 +443,30 @@ EOS`); err != nil {
 	if strings.Contains(shown, "AKIA") || strings.Contains(shown, "tok_") {
 		t.Errorf("timeline records a match:\n%s", shown)
 	}
+}
+
+func (e *env) testLimits(t *testing.T) {
+	// A rate-limit rule: two a minute. A duration of 3s: with credential
+	// identity the node agent withdraws the run's credential, since its
+	// processes are in no cgroup to kill.
+	out, errOut, _ := e.sh(`/it/bin/agentctl run --profile it-limits -- sh -c '
+for i in 1 2; do curl -s -o /dev/null -w "get$i %{http_code}\n" https://origin.test/allowed; done
+curl -s -D /tmp/h3 https://origin.test/allowed; echo; grep -i "^retry-after" /tmp/h3
+sleep 4
+echo "after: $(curl -s -o /dev/null -w "%{http_connect}" https://origin.test/allowed)"'`)
+	m := runIDRE.FindStringSubmatch(errOut)
+	if m == nil {
+		t.Fatalf("no run:\n%s%s", out, errOut)
+	}
+	expect(t, out, "get1 200", "get2 200", "limited to 2 per 1m0s by rule allowed of profile it-limits; retry in", "retry-after: ",
+		"after: 407")
+	expect(t, errOut, "was ended by the node agent: it reached its duration limit of 3s (profile it-limits)")
+	shown, _, err := e.sh("/it/bin/agentctl events " + m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Ended by  the node agent: it reached its duration limit of 3s", "Limit     duration 3s (profile it-limits): ended",
+		"deny rule allowed by it-limits [rate limit]")
 }
 
 func (e *env) testPinDrift(t *testing.T) {

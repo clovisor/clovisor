@@ -82,6 +82,7 @@ func (d Dirs) NodeCACert() string    { return filepath.Join(d.Runtime, "ca.crt")
 func (d Dirs) CADir() string         { return filepath.Join(d.State, "ca") }
 func (d Dirs) Pins() string          { return filepath.Join(d.State, "mcp-pins.json") }
 func (d Dirs) Runs() string          { return filepath.Join(d.State, "runs") }
+func (d Dirs) Counters() string      { return filepath.Join(d.State, "counters.json") }
 
 // systemUpstreamCA is the trust store Envoy verifies origins against.
 func systemUpstreamCA() string {

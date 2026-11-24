@@ -109,6 +109,10 @@ type ExtProcServer struct {
 	MaxInspected       int
 	MaxInspectedPerRun int
 	insp               inspectLimits
+
+	// Rates are the connection and request allowances (milestone 5.2),
+	// shared with the limiter, which forgets a run's as it ends.
+	Rates *RateBuckets
 }
 
 type resolved struct {
@@ -626,6 +630,21 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
 			d.Message = fmt.Sprintf("Content rules cover %s, but this proxy cannot read what is sent inside this TLS tunnel. "+
 				"An operator must restart Envoy with the current configuration.", host)
+		}
+		if d.Decision != policy.ActionDeny || !d.Enforced {
+			// Limits (milestone 5.2). A connection: a CONNECT, or plain
+			// HTTP from the run itself. A request: anything but a CONNECT
+			// Envoy terminates, whose requests come through here one by one.
+			conn := phase == policy.PhaseConnect || !inner
+			reqs := !(phase == policy.PhaseConnect && terminated)
+			if ok, wait := s.checkRates(&d, ed, eff, runID, conn, reqs); !ok {
+				s.record(cg, runCg, runID, d)
+				r := s.denyStatus(d, runID, typev3.StatusCode_TooManyRequests)
+				ir := r.GetImmediateResponse()
+				ir.Headers.SetHeaders = append(ir.Headers.SetHeaders, &corev3.HeaderValueOption{Header: &corev3.HeaderValue{
+					Key: "retry-after", RawValue: []byte(strconv.Itoa(int(retryIn(wait).Seconds())))}})
+				return r, headerOutcome{}
+			}
 		}
 	} else {
 		d.Reason = "unprofiled run"

@@ -275,7 +275,6 @@ spec:
 		"exec: exec rules cannot be enforced by this deployment",
 		`exec.allow[0]: path "git" must be absolute`,
 		"exec.allow[1]: exec hash cannot be enforced yet: it needs IMA hash verification (Phase 4)",
-		"spec.limits: limits cannot be enforced yet",
 	} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("missing diagnostic %q", want)

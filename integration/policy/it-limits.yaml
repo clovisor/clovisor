@@ -1,0 +1,14 @@
+kind: AgentProfile
+metadata: { name: it-limits }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: allowed
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed"] }
+        action: rate-limit
+        rate: { requests: 2, per: 1m }
+  limits:
+    duration: 3s

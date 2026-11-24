@@ -394,6 +394,9 @@ type EffectiveDecision struct {
 	Layer    string // profile that decided a block
 	// WouldDeny names audit-mode layers that would have denied.
 	WouldDeny []string
+	// Rates are the rate-limit rules that matched, in every layer: the
+	// attempt is allowed only while each has room (milestone 5.2).
+	Rates []RateHit
 }
 
 // Decide evaluates an egress attempt against every layer. Any
@@ -433,6 +436,10 @@ func (e *Effective) decide(decide func(*CompiledProfile) Decision) EffectiveDeci
 		if d.Action == ActionTagAndLog {
 			out.Action = ActionTagAndLog
 		}
+		if d.Action == ActionRateLimit && d.rate != nil {
+			out.Rates = append(out.Rates, RateHit{Profile: l.Profile, Layer: l.Profile.Name, Rule: d.Rule,
+				Requests: d.rate.requests, Per: d.rate.per, Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce})
+		}
 	}
 	out.Deferred = deferred
 	return out
@@ -449,6 +456,16 @@ func RevokedProfile() *CompiledProfile {
 	}
 	cp := c.Profiles[0]
 	cp.DefaultMessage = "Egress for this run has been revoked."
+	return cp
+}
+
+// LimitedProfile is the profile the node agent layers onto a run that
+// reached a limit (milestone 5.2): like a revoke, every egress is refused,
+// narrated by msg.
+func LimitedProfile(msg string) *CompiledProfile {
+	cp := RevokedProfile()
+	cp.Name = "limit-reached"
+	cp.DefaultMessage = msg
 	return cp
 }
 

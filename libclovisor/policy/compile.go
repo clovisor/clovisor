@@ -93,6 +93,7 @@ type compiledRule struct {
 	nets    []netip.Prefix
 	ports   map[uint16]bool
 	http    *HTTPMatch
+	rate    *compiledRate
 	src     EgressRule
 }
 
@@ -132,6 +133,8 @@ type CompiledProfile struct {
 	Net NetGrant
 
 	content []*compiledContent
+	// Limits are the limits block, parsed (milestone 5.2).
+	Limits CompiledLimits
 }
 
 // DestPosture is the TLS posture derived for one destination. Posture is
@@ -169,15 +172,13 @@ var methodRE = regexp.MustCompile(`^[A-Z]+$`)
 // phase (design §10) that delivers them. Compiling them is an error: a
 // rule that looks enforced but is not is worse than no rule (§7.1).
 var notYet = map[string]string{
-	"mode ask":          "the approval UI (Phase 5)",
-	"action ask":        "the approval UI (Phase 5)",
-	"action rate-limit": "stateful limits (Phase 5)",
-	"action redirect":   "transparent mode (Phase 3)",
-	"model":             "model allow-lists with budgets (Phase 5)",
-	"budget":            "budgets (Phase 5)",
-	"limits":            "stateful limits (Phase 5)",
-	"exec hash":         "IMA hash verification (Phase 4)",
-	"sampling ask":      "the approval UI (Phase 5)",
+	"mode ask":        "the approval UI (Phase 5)",
+	"action ask":      "the approval UI (Phase 5)",
+	"action redirect": "transparent mode (Phase 3)",
+	"model":           "model allow-lists with budgets (Phase 5)",
+	"budget":          "budgets (Phase 5)",
+	"exec hash":       "IMA hash verification (Phase 4)",
+	"sampling ask":    "the approval UI (Phase 5)",
 }
 
 type compiler struct {
@@ -270,9 +271,7 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 	c.net(p, cp)
 	c.content(p, cp)
 	c.contentTerminates(p, cp)
-	if p.Spec.Limits != nil {
-		c.unsupported("spec.limits", "limits")
-	}
+	c.limits(p, cp)
 	return cp
 }
 
@@ -341,7 +340,9 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 
 		switch r.Action {
 		case ActionAllow, ActionDeny, ActionTagAndLog:
-		case "ask", "rate-limit", "redirect":
+		case ActionRateLimit:
+			cr.rate = c.rate(where, r)
+		case "ask", "redirect":
 			c.unsupported(where, "action "+r.Action)
 		case ContentActionRedact:
 			c.errf(where, "redact is an action for content rules (spec.content), not egress rules")
@@ -352,6 +353,9 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 		}
 		if r.Action == ActionDeny && strings.TrimSpace(r.Message) == "" {
 			c.errf(where, "a deny rule needs a message: it is what the agent is told (design §7.7)")
+		}
+		if r.Rate != nil && r.Action != ActionRateLimit {
+			c.errf(where, "rate: is only valid with action rate-limit")
 		}
 		if r.Ask != nil && r.Action != "ask" {
 			c.errf(where, "ask: is only valid with action ask")
@@ -436,6 +440,10 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 	}
 	if r.Action == ActionTagAndLog {
 		pl.Notes = append(pl.Notes, "allowed and tagged in the audit log")
+	}
+	if r.Action == ActionRateLimit && r.Rate != nil {
+		pl.Notes = append(pl.Notes, fmt.Sprintf("allowed up to %d requests per %s, shared with the run's nested runs; beyond it, a narrated 429",
+			r.Rate.Requests, r.Rate.Per))
 	}
 	if (c.opts.Mode == Transparent || c.opts.Mode == TransparentAudit) && len(r.To.FQDN) > 0 && r.Action != ActionDeny && mayCarryRawTCP(r.To.Ports) {
 		pl.Notes = append(pl.Notes, "transparent: traffic that is neither TLS nor HTTP (SSH, databases) matches through the run's own lookup of the name via the node; a hard-coded address does not")

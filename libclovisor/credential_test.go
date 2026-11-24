@@ -104,7 +104,7 @@ func TestCredentialIdentity(t *testing.T) {
 		t.Fatal("inner hop trusted a client Proxy-Authorization")
 	}
 
-	if err := rc.End(nil); err != nil {
+	if _, err := rc.End(nil); err != nil {
 		t.Fatal(err)
 	}
 	rc.Close()

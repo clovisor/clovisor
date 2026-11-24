@@ -1554,6 +1554,110 @@ int on_egress(struct __sk_buff *skb)
 }
 
 /*
+ * Egress bytes (milestone 5.2), counted per run in every mode: what a run
+ * sends to other hosts, and on loopback to the proxy, the MCP gateway, the
+ * transparent listener and the resolver (the way out of the node).
+ * Loopback within the node is not counted. A nested run's bytes are also
+ * charged to each run it is nested in. The node agent creates an entry
+ * per run; a non-zero limit drops the packets of a run over it, or of a
+ * run nested in one, and the node agent revokes its egress.
+ */
+struct run_bytes_val {
+    __u64 used;           /* bytes sent */
+    __u64 limit;          /* 0: no limit */
+    __u64 dropped;        /* bytes refused at the limit */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct run_bytes_val);
+} run_bytes SEC(".maps");
+
+/* A packet that would take a run past its limit is refused, and counted
+ * as dropped for that run; one that would not is charged. */
+static __always_inline int bytes_over(__u64 id, __u64 len)
+{
+    struct run_bytes_val *v = bpf_map_lookup_elem(&run_bytes, &id);
+    if (!v || v->limit == 0 || v->used + len <= v->limit)
+        return 0;
+    __sync_fetch_and_add(&v->dropped, len);
+    return 1;
+}
+
+static __always_inline void charge_bytes(__u64 id, __u64 len)
+{
+    struct run_bytes_val *v = bpf_map_lookup_elem(&run_bytes, &id);
+    if (v)
+        __sync_fetch_and_add(&v->used, len);
+}
+
+SEC("cgroup_skb/egress")
+int on_egress_count(struct __sk_buff *skb)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg || cfg->agents_cgroup_id == 0)
+        return 1;
+    if (bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level) != cfg->agents_cgroup_id)
+        return 1;
+    __u64 run = bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level + 1);
+    if (run == 0)
+        return 1;
+
+    struct addr ip = {};
+    __u8 proto;
+    __u32 l4off;
+    if (skb->protocol == bpf_htons(ETH_P_IP)) {
+        __u8 vihl;
+        __u32 d4;
+        if (bpf_skb_load_bytes(skb, 0, &vihl, 1) < 0 || bpf_skb_load_bytes(skb, 9, &proto, 1) < 0 ||
+            bpf_skb_load_bytes(skb, 16, &d4, 4) < 0)
+            return 1;
+        v4mapped(&ip, d4);
+        l4off = (vihl & 0x0f) * 4;
+    } else if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+        if (bpf_skb_load_bytes(skb, 6, &proto, 1) < 0 || bpf_skb_load_bytes(skb, 24, ip.a, 16) < 0)
+            return 1;
+        l4off = 40;
+    } else {
+        return 1;
+    }
+    if (is_loopback(&ip)) {
+        __u16 dport = 0;
+        if (proto == IPPROTO_UDP || proto == IPPROTO_TCP_) {
+            __u16 p;
+            if (bpf_skb_load_bytes(skb, l4off + 2, &p, 2) == 0)
+                dport = bpf_ntohs(p);
+        }
+        if (dport == 0 || !(in_exceptions(cfg->exc, &ip, dport) || dport == cfg->tproxy_port ||
+                            (cfg->dns_port != 0 && dport == cfg->dns_port)))
+            return 1;
+    }
+
+    /* The packet's run and each run it is nested in, innermost last. */
+    __u64 len = skb->len;
+    __u64 ids[MAX_NEST + 1] = {run};
+#pragma unroll
+    for (int i = 1; i <= MAX_NEST; i++) {
+        __u64 id = bpf_skb_ancestor_cgroup_id(skb, cfg->agents_level + 1 + i);
+        ids[i] = id && bpf_map_lookup_elem(&nested_run, &id) ? id : 0;
+    }
+    int over = 0;
+#pragma unroll
+    for (int i = 0; i <= MAX_NEST; i++)
+        if (ids[i])
+            over |= bytes_over(ids[i], len);
+    if (over)
+        return 0;
+#pragma unroll
+    for (int i = 0; i <= MAX_NEST; i++)
+        if (ids[i])
+            charge_bytes(ids[i], len);
+    return 1;
+}
+
+/*
  * The proxy's own connects (milestone 3.5), attached to Envoy's cgroup
  * when it holds nothing else. ext_proc refuses node-local destinations,
  * but checks a name by resolving it itself: a name that resolves

@@ -431,6 +431,48 @@ func (r *EBPFReader) SetNetPolicy(runCg uint64, g policy.NetGrant) error {
 	return r.objs.RunNet.Put(runCg, p)
 }
 
+// bpfRunBytes matches struct run_bytes_val.
+type bpfRunBytes struct {
+	Used    uint64
+	Limit   uint64
+	Dropped uint64
+}
+
+// SetRunBytes starts counting a run's egress bytes, from used, or changes
+// its limit (0: none), keeping what it has counted. Over the limit, the
+// kernel drops the run's packets.
+func (r *EBPFReader) SetRunBytes(runCg, used, limit uint64) error {
+	if r.objs.RunBytes == nil {
+		return nil
+	}
+	var v bpfRunBytes
+	if err := r.objs.RunBytes.Lookup(runCg, &v); err == nil {
+		// Read-modify-write: bytes counted in between are lost, a few
+		// packets at most.
+		used = max(used, v.Used)
+	}
+	return r.objs.RunBytes.Put(runCg, bpfRunBytes{Used: used, Limit: limit, Dropped: v.Dropped})
+}
+
+// RunBytes is what a run has sent, and what was refused at its limit.
+func (r *EBPFReader) RunBytes(runCg uint64) (sent, dropped uint64, ok bool) {
+	if r.objs.RunBytes == nil {
+		return 0, 0, false
+	}
+	var v bpfRunBytes
+	if err := r.objs.RunBytes.Lookup(runCg, &v); err != nil {
+		return 0, 0, false
+	}
+	return v.Used, v.Dropped, true
+}
+
+// ForgetRunBytes stops counting a run.
+func (r *EBPFReader) ForgetRunBytes(runCg uint64) {
+	if r.objs.RunBytes != nil {
+		r.objs.RunBytes.Delete(runCg)
+	}
+}
+
 // ForgetNetPolicy drops a run's UDP and ICMP grant.
 func (r *EBPFReader) ForgetNetPolicy(runCg uint64) {
 	if r.objs.RunNet != nil {
@@ -499,12 +541,14 @@ type bpfObjects struct {
 	OrigByTuple  *ebpf.Map     `ebpf:"orig_by_tuple"`
 	NestedRun    *ebpf.Map     `ebpf:"nested_run"`
 	RunNet       *ebpf.Map     `ebpf:"run_net"`
+	EgressCount  *ebpf.Program `ebpf:"on_egress_count"`
+	RunBytes     *ebpf.Map     `ebpf:"run_bytes"`
 }
 
 func (o *bpfObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.ExecProg, o.MkdirProg, o.RmdirProg, o.IngressProg,
 		o.Connect4Prog, o.Connect6Prog, o.Bind4Prog, o.Bind6Prog, o.Peer4Prog, o.Peer6Prog, o.SockopsProg, o.SockoptProg, o.Send4Prog, o.Send6Prog, o.Recv4Prog, o.Recv6Prog, o.EgressProg, o.UDPReported, o.DropRate, o.ProxyConn4, o.ProxyConn6, o.Lost, o.Suppressed, o.RunBudget, o.ProxyRefused,
-		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple, o.NestedRun, o.RunNet} {
+		o.Config, o.Heartbeat, o.Events, o.OrigBySk, o.RunBySk, o.OrigByTuple, o.NestedRun, o.RunNet, o.EgressCount, o.RunBytes} {
 		if c != nil {
 			c.Close()
 		}
@@ -641,6 +685,8 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		{"recvmsg6", agentsDir, ebpf.AttachCGroupUDP6Recvmsg, r.objs.Recv6Prog, on},
 		// The packet backstop; it acts in enforce only.
 		{"egress", agentsDir, ebpf.AttachCGroupInetEgress, r.objs.EgressProg, on},
+		// Egress bytes per run (milestone 5.2), in every mode.
+		{"egress-count", agentsDir, ebpf.AttachCGroupInetEgress, r.objs.EgressCount, true},
 		// On the root: the proxy runs outside agents/, wherever its
 		// operator put it. The program answers only tasks outside runs.
 		{"getsockopt", CgroupV2Root, ebpf.AttachCGroupGetsockopt, r.objs.SockoptProg, on},

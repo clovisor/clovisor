@@ -98,6 +98,7 @@ place:
 | Phase 5 broken into milestones. Found: body reading generalizes the MCP mode override; counters can be node-local; ask holds `ext_proc` streams; nested runs charge their ancestors. | [Phase 5 plan](#phase-5-plan-2026-11-23) |
 | 5.0 spikes: request bodies must be streamed with `ext_proc`'s own cap (buffered stalls past 1 MiB, partial is fail-open); Envoy's default circuit breaker fails every request past 1,024 `ext_proc` streams; held asks work with a per-stream timeout override; QUIC names read in userspace; a BPF exec hash cache was never stale on ext4 and tmpfs. | [5.0 spike results](#50-spike-results-2026-11-23) |
 | Content rules: deny, redact (keeping the length) or record matches in request bodies and query strings, on every host the profile names unless scoped; bodies held and checked whole, with limits that fail closed; remote MCP bodies moved off buffered mode; Envoy's `ext_proc` circuit breaker raised. | [5.1 status](#51-status-2026-11-23) |
+| Limits: duration ends a run, `connections_per_min` and `rate-limit` rules answer 429, and `egress_bytes` is counted and capped in the kernel, then revoked; nested runs charge their parents; byte counts persisted. | [5.2 status](#52-status-2026-11-23) |
 
 ---
 
@@ -3231,7 +3232,7 @@ if the later ones never ship.
 | **5.1** | Bodies and content policy | Envoy's `ext_proc` circuit breaker raised, with node-wide and per-run stream caps in `ext_proc` (see the 5.0 results). Body plumbing for any terminated stream that a rule needs, with a size cap that fails closed. `content:` rules (regex) that `deny` or `redact` request bodies. Content rules force termination; the receipt lists them; the timeline records matches, not the content. | Stops known secrets leaving in a request to an allowed host ([§11](#11-non-goals-and-honest-limits)). |
 | **5.2** | Limits | The node agent's counter store. `limits.duration` (the node agent ends the run), `connections_per_min`, `egress_bytes`, and `action: rate-limit`. Counters roll up to ancestor runs. | Bounds a runaway agent in time and volume. |
 | **5.3** | Model allow-lists | The `model` field of Anthropic- and OpenAI-shaped requests checked against a rule's list; others refused with a narrated denial. Learn drafts the models it saw; check replays them. | Keeps a run on the models the operator pays for or trusts. |
-| **5.4** | Budgets | `budget: {tokens, cost_usd}` per rule, charged from response usage, streamed or not; prices from node configuration; ancestors charged too; a request over budget refused before it is sent. Timelines and `agentctl show` report spend. | The cost control the design began with ([§7.9](#79-budgets-are-the-stateful-exception)). |
+| **5.4** | Budgets | `budget: {tokens, cost_usd}` per rule, charged from response usage, streamed or not; prices from node configuration; ancestors charged too; a request over budget refused before it is sent. Timelines and `agentctl events` report spend. | The cost control the design began with ([§7.9](#79-budgets-are-the-stateful-exception)). |
 | **5.5** | Ask | `action: ask`, `mode: ask` and MCP `sampling: ask`. A pending queue; `agentctl pending`, `approve` and `deny` over the run API; `ask.timeout` and `on_timeout`; a cap on held requests. The timeline records each decision and who made it. | A person in the loop for writes that policy cannot judge ([§12](#12-open-questions) question 6). |
 | **5.6** | QUIC by name (opt-in) | Only if 5.0 shows it is sound: UDP 443 relayed by the node agent, the server name read from the Initial and decided as SNI is, so HTTP/3 to allowed names works. QUIC stays refused by default. | Lets HTTP/3-only clients work without opening UDP. |
 | **5.7** | Exec hash | `exec.allow[].hash` through `bpf_ima_file_hash`, with the kernel-side cache (finding 6); opt-in per profile. | The high-assurance form of [§7.6](#76-exec-matching-path-hash-or-provenance). |
@@ -3361,7 +3362,7 @@ Implemented:
   - refusals for size, encoding or load.
 
   The matched text is never recorded, nor quoted in a narration.
-  `agentctl show` and `events` list them. `check` names a profile's content
+  `agentctl events` lists them. `check` names a profile's content
   rules as not replayable, since runs do not record what was sent.
 
 Found on the way:
@@ -3407,9 +3408,113 @@ Verified:
     403; a Brotli body got 415;
   - a 2 MB body arrived whole; 9 MB, sized or chunked, got 413;
   - 160 concurrent requests, uploads mixed with refusals, gave no 502;
-  - `agentctl show` and `events` reported it all without the matches.
+  - `agentctl events` reported it all without the matches.
 
   The transparent suite still passes all eighteen checks.
+
+#### 5.2 status (2026-11-23)
+
+Implemented:
+
+- **`limits:`** takes:
+  - `duration`, from 1s to 30 days;
+  - `connections_per_min`;
+  - `egress_bytes`, as a plain count or with a suffix (`100Mi`, `2G`).
+
+  An **egress rule with `action: rate-limit`** and `rate: { requests, per }`
+  allows matching requests up to the rate. `egress_bytes` is a compile
+  error without the Linux node agent with cgroup identity: only the kernel
+  sees every byte, tunnels included. The receipt places each limit, and
+  says that under credential identity a duration cannot kill processes.
+- **Ownership.** A limit belongs to the run that holds the layer setting
+  it: the outermost run in the chain whose policy has that layer. A nested
+  run inherits its parent's layers, so its activity is charged to the
+  parent's allowance as well as to its own (finding 4). A run checks only
+  the limits of layers it holds itself; its parent checks its own, on
+  counts that include the child.
+- **Duration.** The node agent checks once a second. A run past its limit
+  is ended with its nested runs, its processes killed, and the reason
+  recorded. `agentctl run` prints it, and the timeline keeps it.
+- **Connections and rate-limit rules,** in `ext_proc`, as token buckets
+  keyed by the owning run, refilling continuously. What counts:
+  - for `connections_per_min`, each CONNECT, and each plain-HTTP request
+    from the run itself;
+  - for a rate-limit rule, each request; a CONNECT Envoy terminates is not
+    counted, the requests inside it are.
+
+  Past the allowance, a narrated 429 with `Retry-After`, recorded with
+  reason `rate limit` or `connections_per_min`. Audit layers record a
+  would-deny instead.
+- **Egress bytes, in the kernel.** A new `cgroup_skb/egress` program on the
+  agents cgroup, attached in every mode and pinned with the rest in
+  transparent enforce, counts:
+  - packets to other hosts;
+  - loopback packets to the proxy, the MCP gateway, the transparent
+    listener and the resolver.
+
+  It charges the packet's run and each run it is nested in. A packet that
+  would take any of them past its limit is dropped and counted as refused,
+  not sent, so the count never passes the limit. The node agent sets each
+  run's kernel limit: the smallest enforced `egress_bytes` among the layers
+  the run holds itself. Once anything is refused, it layers a revoke with a
+  narration, so new requests are told why. The proxy and gateway
+  addresses, which the connect hooks used only in transparent mode, are
+  now always in the kernel config, for this count.
+- **Counter store.** `<state-dir>/counters.json` holds per-run byte counts.
+  It is written every 5 seconds and on stop, and read back for runs that
+  outlive a restart; entries of runs that ended meanwhile are dropped.
+  Budgets (5.4) will add to it.
+- **Records.** Run metadata and timelines gain `egress_bytes`, `limits` (each
+  limit reached, with its layer, its value, what was done and when) and
+  `end_reason`. `agentctl events <run>` shows them.
+
+Found on the way:
+
+- **Counting before deciding overstated what was sent.** The first version
+  charged a packet, then dropped it if the count was past the limit. A run
+  capped at 256Ki was reported at 692,822 bytes: retransmissions of dropped
+  packets counted too. The kernel now decides first, and counts refused
+  bytes separately. The node agent treats refused bytes as the sign the
+  limit was reached.
+- **The end reason must outlive the run's metadata.** By the time `agentctl`
+  reported the end, the recorder had written the timeline and dropped the
+  metadata, so it could not be told why. The run API keeps the reason until
+  the client collects it.
+- **`agentctl` exited 0 on an unknown command,** which hid a test calling a
+  `show` subcommand that does not exist (the 5.1 docs had it too). It now
+  exits 2, and the docs say `agentctl events`.
+
+Decisions:
+
+- **Duration ends the run; bytes revoke it.** A run out of time should
+  stop, as a CI job does. A run out of bytes may still need to write its
+  results locally and exit cleanly, so it keeps running with no egress.
+- **The kernel drops; the node agent narrates.** A revoke alone would leave
+  open tunnels flowing. Dropping packets alone would leave the agent
+  without an explanation. Both are needed.
+- **Per-run rate allowances live in memory.** After a restart they start
+  full again. Byte counts are persisted, since a reset would grant a fresh
+  allowance.
+
+Verified:
+
+- Unit tests:
+  - parsing and compile errors; rate hits per layer;
+  - token buckets and the counter store;
+  - ownership across nested runs;
+  - the limiter on a nested pair: each refused at its own limit, the
+    parent's revoke separate from the child's, a duration inherited from a
+    parent decided by the parent's clock, audit layers recording only;
+  - 429s with `Retry-After`; all under `-race`.
+- `make integration`, profile `it-limits`: the third request in a minute
+  got the 429 naming its rule and a `Retry-After`. The 3s duration withdrew
+  the run's credential (`407`), `agentctl run` printed why, and the
+  timeline holds the limit.
+- `make integration-transparent`, now twenty checks:
+  - `tp-limits`: the third request to `other.test` got 429. A 1 MB upload
+    past 256Ki stalled. The run was revoked within a second and its
+    timeline shows 255,629 bytes sent.
+  - `tp-brief`: `sleep 10` ended at 2s with the reason printed.
 
 #### Proposed decisions
 

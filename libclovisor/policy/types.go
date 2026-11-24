@@ -56,15 +56,17 @@ type Egress struct {
 // EgressRule is one egress rule. Rules are evaluated in order; the first
 // whose destination and http block match decides.
 type EgressRule struct {
-	Name        string      `yaml:"name" json:"name"`
-	To          Destination `yaml:"to" json:"to"`
-	HTTP        *HTTPMatch  `yaml:"http,omitempty" json:"http,omitempty"`
-	Model       *ModelMatch `yaml:"model,omitempty" json:"model,omitempty"`
-	Budget      *Budget     `yaml:"budget,omitempty" json:"budget,omitempty"`
-	Action      string      `yaml:"action" json:"action"`
-	Ask         *Ask        `yaml:"ask,omitempty" json:"ask,omitempty"`
-	Message     string      `yaml:"message,omitempty" json:"message,omitempty"`
-	NoTerminate bool        `yaml:"no_terminate,omitempty" json:"no_terminate,omitempty"`
+	Name   string      `yaml:"name" json:"name"`
+	To     Destination `yaml:"to" json:"to"`
+	HTTP   *HTTPMatch  `yaml:"http,omitempty" json:"http,omitempty"`
+	Model  *ModelMatch `yaml:"model,omitempty" json:"model,omitempty"`
+	Budget *Budget     `yaml:"budget,omitempty" json:"budget,omitempty"`
+	Action string      `yaml:"action" json:"action"`
+	Ask    *Ask        `yaml:"ask,omitempty" json:"ask,omitempty"`
+	// Rate is a rate-limit rule's allowance (milestone 5.2).
+	Rate        *Rate  `yaml:"rate,omitempty" json:"rate,omitempty"`
+	Message     string `yaml:"message,omitempty" json:"message,omitempty"`
+	NoTerminate bool   `yaml:"no_terminate,omitempty" json:"no_terminate,omitempty"`
 }
 
 // Destination selects where a rule applies.
@@ -194,7 +196,8 @@ type ContentRule struct {
 	To *ContentScope `yaml:"to,omitempty" json:"to,omitempty"`
 }
 
-// Limits are per-run limits (Phase 5).
+// Limits are per-run limits (milestone 5.2). EgressBytes takes a
+// quantity such as 100Mi; Duration a Go duration such as 30m.
 type Limits struct {
 	ConnectionsPerMin int    `yaml:"connections_per_min,omitempty" json:"connections_per_min,omitempty"`
 	EgressBytes       string `yaml:"egress_bytes,omitempty" json:"egress_bytes,omitempty"`

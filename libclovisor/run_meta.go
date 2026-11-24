@@ -36,6 +36,26 @@ type RunMeta struct {
 	// run (milestone 4.6); Children are the runs started from inside it.
 	Parent   string   `json:"parent,omitempty"`
 	Children []string `json:"children,omitempty"`
+	// EndReason says why the node agent ended the run, when it did
+	// (milestone 5.2: a duration limit, or its parent's).
+	EndReason string `json:"end_reason,omitempty"`
+	// EgressBytes is what the run sent, nested runs included, as the
+	// kernel counted it (milestone 5.2).
+	EgressBytes *uint64 `json:"egress_bytes,omitempty"`
+	// Limits are the limits the run reached, and what was done.
+	Limits []LimitHit `json:"limits,omitempty"`
+}
+
+// LimitHit is one limit a run reached (milestone 5.2).
+type LimitHit struct {
+	At     time.Time `json:"at"`
+	Limit  string    `json:"limit"` // duration, egress_bytes
+	Layer  string    `json:"layer"`
+	Value  string    `json:"value"`  // the limit, e.g. 30m, 100Mi
+	Action string    `json:"action"` // ended, revoked, would end, would revoke
+	// Run is the run that holds the layer, when it is not this one: an
+	// ancestor whose limit this run's traffic counted toward.
+	Run string `json:"run,omitempty"`
 }
 
 // CallMeta is one tool call in a cgroup of its own below its run

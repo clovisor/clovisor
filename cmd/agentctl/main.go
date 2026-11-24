@@ -31,7 +31,8 @@ import (
 	"github.com/clovisor/clovisor/libclovisor/policy"
 )
 
-func printUsage() {
+// printUsage prints usage and exits with code.
+func printUsage(code int) {
 	fmt.Println("agentctl - run and govern agent processes (see docs/operator-guide.md)")
 	fmt.Println()
 	fmt.Println("Usage:")
@@ -64,7 +65,7 @@ func printUsage() {
 	fmt.Println("It finds the node agent's socket in a per-user directory if one is running")
 	fmt.Println("there, else in the system's; CLOVISOR_SOCKET overrides. Timelines are read")
 	fmt.Println("from the matching directory; CLOVISOR_RUNS or --dir overrides.")
-	os.Exit(0)
+	os.Exit(code)
 }
 
 // shimArg is the hidden subcommand agentctl re-executes itself with to
@@ -377,7 +378,9 @@ func runCommand(args []string, profile string, noProxy bool, mcpConfigPath strin
 	if err != nil {
 		return 0, err
 	}
-	if err := api.End(&code); err != nil {
+	if reason, err := api.End(&code); reason != "" {
+		fmt.Fprintf(os.Stderr, "agentctl: run %s was ended by the node agent: %s\n", run.RunID, reason)
+	} else if err != nil {
 		// Most likely the node agent restarted during the run. It removes
 		// the run cgroup once empty, but never learns the exit code.
 		fmt.Fprintf(os.Stderr, "agentctl: warning: could not report the end of run %s to the node agent "+
@@ -720,7 +723,7 @@ func printTimeline(tl *clovisor.RunTimeline) {
 		fmt.Printf("Command   %s\n", strings.Join(tl.Command, " "))
 	}
 	if tl.Parent != "" {
-		fmt.Printf("Parent    run %s: its policy bounds this one (agentctl show %s)\n", tl.Parent, tl.Parent)
+		fmt.Printf("Parent    run %s: its policy bounds this one (agentctl events %s)\n", tl.Parent, tl.Parent)
 	}
 	if len(tl.Children) > 0 {
 		fmt.Printf("Nested    %s\n", strings.Join(tl.Children, ", "))
@@ -740,6 +743,20 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	}
 	if tl.ExitCode != nil {
 		fmt.Printf("Exit      %d\n", *tl.ExitCode)
+	}
+	if tl.EndReason != "" {
+		fmt.Printf("Ended by  the node agent: %s\n", tl.EndReason)
+	}
+	if tl.EgressBytes != nil {
+		fmt.Printf("Egress    %d bytes, nested runs included\n", *tl.EgressBytes)
+	}
+	for _, h := range tl.Limits {
+		of := ""
+		if h.Run != "" {
+			of = " of run " + h.Run
+		}
+		fmt.Printf("Limit     %s %s (profile %s%s): %s at +%s\n", h.Limit, h.Value, h.Layer, of, h.Action,
+			h.At.Sub(tl.StartedAt).Round(time.Millisecond))
 	}
 	if !tl.Complete {
 		fmt.Println("Note      incomplete: the node agent did not see the whole run")
@@ -1123,7 +1140,7 @@ func truncate(s string, n int) string {
 
 func main() {
 	if len(os.Args) < 2 {
-		printUsage()
+		printUsage(2)
 	}
 
 	command := os.Args[1]
@@ -1200,10 +1217,10 @@ func main() {
 			os.Exit(1)
 		}
 	case "-h", "--help", "help":
-		printUsage()
+		printUsage(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
-		printUsage()
+		printUsage(2)
 	}
 }
 

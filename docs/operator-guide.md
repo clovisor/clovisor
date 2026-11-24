@@ -233,6 +233,7 @@ spec:
 | `udp` | UDP destinations besides DNS, exact `ip:port` | the kernel, transparent mode | §11 |
 | `icmp` | Ping (echo) destinations | the kernel, transparent mode | §11 |
 | `content` | Patterns in request bodies and query strings: deny, redact or record | the proxy, on hosts it terminates or that are plaintext | §10 |
+| `limits` | How long a run may last, how many connections a minute, how many bytes it may send | the node agent, the proxy, the kernel | below |
 
 **Ceiling fields**, under `spec:`:
 - `appliesTo`;
@@ -253,6 +254,44 @@ A profile's `udp` or `icmp` entry works only where its ceiling lists it too.
 - **Versions.** Every profile is versioned by content (`name@sha256:…`). A run
   is bound to the versions in force when it started; reloading changes only
   new runs.
+
+### Limits
+
+```yaml
+  egress:
+    rules:
+      - name: search
+        to: { fqdn: ["api.search.example"] }
+        action: rate-limit             # allowed, up to the rate
+        rate: { requests: 60, per: 1m }
+  limits:
+    duration: 30m                      # then the run ends
+    connections_per_min: 120
+    egress_bytes: 100Mi                # K, M, G, T or Ki, Mi, Gi, Ti
+```
+
+| Limit | Counts | Past it |
+|---|---|---|
+| `duration` | Time since the run that holds the profile started. | The node agent ends the run and its nested runs, killing their processes. `agentctl run` reports why. With credential identity, processes are in no cgroup: the run's proxy credential stops working instead. |
+| `connections_per_min` | Connections through the proxy: each CONNECT, and each plain-HTTP request from the run. A token bucket. | A narrated `429` with `Retry-After`. |
+| `rate-limit` rule | Requests that match the rule: each request inside a terminated tunnel, else each tunnel. A token bucket. | A narrated `429` with `Retry-After`. |
+| `egress_bytes` | Bytes the run sends, headers included: to other hosts, and on loopback to the proxy, the MCP gateway, the transparent listener and the resolver. Loopback within the node is not counted. The kernel counts, so this needs the Linux node agent with cgroup identity. | The kernel drops any packet that would pass the limit, open tunnels included. The node agent then revokes the run's egress, so new requests are refused with a narration. |
+
+- **Nested runs share their parent's limits.** A limit belongs to the run
+  that holds the layer. A nested run inherits its parent's layers, so its
+  activity counts toward its parent's limits as well as its own: a sub-agent
+  cannot get a fresh allowance. A clamp with limits counts for the run it
+  was applied to and the runs nested in it.
+- **Audit layers record only.** A limit in an audit layer is recorded as
+  what it would have done (`would end`, `would revoke`, or `would deny` on
+  the request).
+- **Records.** The timeline (`agentctl events <run>`) shows the bytes the
+  run sent, each limit it reached and when, and why the node agent ended
+  it. Refused requests appear as denials with reason `rate limit` or
+  `connections_per_min`.
+- **Restarts.** Byte counts are saved in `<state-dir>/counters.json` every
+  few seconds, and picked up again by runs that outlive a node agent
+  restart. Rate allowances start full again.
 
 ## 7. Running agents
 
@@ -845,6 +884,9 @@ agentctl events --json <run-id>
 | `needs termination` | A rule needs method or path, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
 | `413` on a large upload | The body is over `-inspect-max-body`, and a content rule or remote MCP covers the host. Raise the limit, or scope the content rule with `to:`. |
 | `415` from the proxy | A content rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| `429` with `Retry-After` | A `rate-limit` rule or `connections_per_min` (§6 Limits). The narration names the rule or profile. |
+| `agentctl: run … was ended by the node agent` | The run reached its `duration`, or its parent run did. Exit status 137 (killed). |
+| A run's connections stall, then everything is refused | It reached `egress_bytes`: the kernel drops its packets, then its egress is revoked. `agentctl events <run>` shows the limit and the bytes sent. |
 | `503` "inspected requests in flight" | The node or the run holds as many inspected requests as allowed. Transient. |
 | curl over HTTP/2 shows `000` for a refused upload | curl 7.88 loses a refusal sent before it has sent any of its body, as for a path deny on a POST. The timeline has the refusal. |
 | `426 Upgrade Required` | A bootstrap from before 2.7 with an HTTP/1.0 client (Python before 3.12). Regenerate it by restarting the node agent, then restart Envoy. |
@@ -884,6 +926,8 @@ They check:
 - content rules: bodies denied, redacted in place and passed unchanged,
   including chunked, gzip, query strings, 2 MB bodies, the size limit, and
   concurrent uploads mixed with refusals;
+- limits: a rate-limit rule's 429 and `Retry-After`, and a duration that
+  ends a credential-identity run;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 
@@ -921,6 +965,9 @@ ignore the proxy, it checks:
   revoked with it;
 - per-run UDP and ping granted by profile and ceiling, refused elsewhere and
   to a sub-agent whose profile lacks them;
+- limits: a rate-limit rule's 429 on a terminated host; an upload past
+  `egress_bytes` cut off in the kernel, the run revoked, and no more than the
+  limit counted as sent; a `duration` that kills the run;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

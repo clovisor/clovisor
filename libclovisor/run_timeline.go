@@ -42,6 +42,12 @@ type RunTimeline struct {
 	// timeline is separate; Children are the runs nested in this one.
 	Parent   string   `json:"parent,omitempty"`
 	Children []string `json:"children,omitempty"`
+	// EndReason, EgressBytes and Limits are from the run's limits
+	// (milestone 5.2): why the node agent ended it, what it sent, and the
+	// limits it reached.
+	EndReason   string     `json:"end_reason,omitempty"`
+	EgressBytes *uint64    `json:"egress_bytes,omitempty"`
+	Limits      []LimitHit `json:"limits,omitempty"`
 
 	// Complete is true only if the node agent saw the run from cgroup
 	// creation to removal without interruption. Otherwise events may be
@@ -941,6 +947,7 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	if len(m.Children) > 0 {
 		tl.Children = m.Children
 	}
+	tl.EndReason, tl.EgressBytes, tl.Limits = m.EndReason, m.EgressBytes, m.Limits
 	if len(m.Calls) > 0 {
 		tl.Calls = make([]CallSummary, 0, len(m.Calls))
 		for _, c := range m.Calls {

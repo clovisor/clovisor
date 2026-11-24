@@ -1,0 +1,21 @@
+# Limits (milestone 5.2): requests to other.test by a rate-limit rule, and
+# what the run may send in all.
+kind: AgentProfile
+metadata: { name: tp-limits }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: echo
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET, POST], paths: ["/echo", "/allowed"] }
+        action: allow
+      - name: other
+        to: { fqdn: ["other.test"], ports: [443] }
+        http: { paths: ["/*"] }   # terminated, so the 429 is seen
+        action: rate-limit
+        rate: { requests: 2, per: 1m }
+  limits:
+    connections_per_min: 100
+    egress_bytes: 256Ki
