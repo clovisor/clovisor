@@ -111,6 +111,7 @@ place:
 | Change | Where |
 |---|---|
 | Integration tests for the gaps: content rules and `connections_per_min` under transparent mode, and `sampling: ask` on a remote MCP server's event stream; operator guide gains Phase 5 records, incident response for held requests, and security notes. Phase 5 complete. | [5.8 status](#58-status-2026-11-24), [operator guide](operator-guide.md) |
+| Phase 6 broken into milestones: restart recovery first, since a restarted node agent forgets what runs were granted; then TLS uprobes for visibility only, per library (libssl, Go, Node and Bun), capturing request lines and headers, not bodies. | [Phase 6 plan](#phase-6-plan-2026-11-24) |
 
 ---
 
@@ -1526,7 +1527,7 @@ kernel objects. Treat this as a new codebase in Clovisor's lineage, not a port.
 | **3** | Transparent mode on Linux: `connect4` redirect-or-deny, `SO_ORIGINAL_DST` via `cgroup/getsockopt`, identity handoff, `sendmsg4/6`, forced local DNS with ECH stripping, the UDP backstop and QUIC deny ([§6.8](#68-channels-connect4-does-not-see)). Fail closed. | Medium |
 | **4** | Exec gating via BPF LSM; raw-socket and `AF_UNIX` gating. Child cgroups per tool call. Sub-agent attenuation. | Medium |
 | **5** | Budgets (stateful), content policy, ask-mode with a human approval UI, MCP sampling control, opt-in SNI-forwarded QUIC. | Higher |
-| **6** | TLS uprobes for visibility without termination. | Low |
+| **6** | Restart recovery, then TLS uprobes for visibility without termination. *Revised 2026-11-24: restart recovery added* ([Phase 6 plan](#phase-6-plan-2026-11-24)). | Low |
 
 **Why this order.** The original order put the proxy at Phase 3 and MCP at
 Phase 5, behind kernel enforcement. That front-loaded the least novel part
@@ -4135,6 +4136,90 @@ The proposed decisions below were applied in 5.4 and 5.5.
 - **Who may approve:** root, or the run's user from outside the run. Never
   from inside the run or its descendants, or an agent could approve itself.
 
+### Phase 6 plan (2026-11-24)
+
+Goal, from the table above: visibility into TLS that the proxy does not
+terminate, through uprobes on the TLS libraries inside a run. That covers
+hosts marked `no_terminate`, clients that pin certificates, and runs on nodes
+that terminate nothing. Restart recovery comes first, because it is a hole in
+the enforcement every earlier phase built. Each milestone must be useful if
+the later ones never ship.
+
+#### Findings that shape the plan
+
+1. **A node agent restart forgets what runs were granted.** Runs keep their
+   cgroups across a restart (3.5), and their timelines resume (Phase 1). But
+   what each run was granted lives only in the node agent's memory: its
+   profile, clamps, nesting, and the kernel's exec, Unix and per-run network
+   maps. A revocation is a layer too, so it is lost with the rest. Partial
+   timelines record the layers, but nothing reads them back. A restarted
+   node agent treats such runs as unprofiled, so their traffic is recorded,
+   not refused (4.2 and 4.4 limits). That is [open question 4](#12-open-questions). Counters
+   (5.2) and spend (5.4) already persist; grants must too. Restoring them
+   before the node is marked healthy keeps the ordering fail-closed: until
+   then, the heartbeat is stale and connects are refused.
+2. **Uprobes see plaintext, but only in cooperating code.** A uprobe on
+   `SSL_write` reads the buffer before it is encrypted, in the run's own
+   process, so attribution to the run is exact. But a run can bring its own
+   TLS: a static binary, a copied library, a stack with no symbols. So
+   uprobes are visibility for software that is not trying to hide, never a
+   control. The proxy stays the only place a decision is made
+   ([§6.6](#66-tls-posture)).
+3. **Coverage is per library.** The stacks agents use differ in how they can
+   be hooked:
+   - OpenSSL and BoringSSL as shared libraries (curl, Python, git, most
+     distribution software) have stable exported symbols.
+   - Go's `crypto/tls` is linked into each binary. Hooking it needs the
+     binary's symbols, offsets per Go version, and no uretprobes, since Go
+     moves stacks; probes go on the function's return instructions instead.
+     Stripped binaries cannot be hooked.
+   - Node bundles OpenSSL and Bun bundles BoringSSL, statically, usually
+     with symbols. Coding agents run on both, so they matter most.
+   - rustls has no stable symbols, and may not be feasible.
+4. **Captured plaintext is the most sensitive data in the system.**
+   [§6.6](#66-tls-posture) warns that termination creates a box holding
+   plaintext; uprobes create the same box. Capture should take what audit
+   needs (the request line, headers, MCP methods and tool names) and not
+   bodies. Matches can be recorded without content, as 5.1 does.
+5. **Plaintext is not requests.** HTTP/1.1 can be parsed from captured
+   bytes. HTTP/2 needs frames reassembled and HPACK decoded with state per
+   connection, which belongs in userspace. BPF copies bounded bytes, tagged
+   with the process and the TLS object, and the node agent parses them.
+6. **A hook costs every call.** A uprobe traps into the kernel on each
+   `SSL_write` and `SSL_read`, whatever the destination. The spike must
+   measure that cost per call and per megabyte, to decide whether capture is
+   per node or per profile.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **6.0** | Spikes | Restart: what a restarted node agent needs to restore each run's grants, and whether pinned kernel maps can carry them across. Uprobes on `SSL_write` and `SSL_read` (and their `_ex` forms) in libssl for curl and Python. Go `crypto/tls` in an unstripped binary across two Go versions, with probes on return instructions. The OpenSSL in Node and the BoringSSL in Bun. Whether rustls can be hooked at all. The cost per call and per megabyte. HTTP/2 rebuilt from captured bytes. Tying a TLS object to its socket and connect event. | Settles what restart and the kernel allow before product code depends on it. |
+| **6.1** | Restart recovery | Each run's grants written at bind, clamp, nest and revoke under `/var/lib/clovisor`, as counters are. On start, the node agent restores them, kernel maps included, before it reports healthy. Runs that ended meanwhile are dropped. A run whose profile version no longer loads is revoked with a narrated reason, not left unprofiled. `agentctl status` reports what was restored. | Closes open question 4: enforcement survives upgrades and crashes. |
+| **6.2** | libssl capture (audit) | Opt-in per node (`-uprobes`). Uprobes on the shared OpenSSL and BoringSSL libraries runs load, filtered to runs as the other hooks are. Bounded bytes per call to the node agent, which parses HTTP/1.1 and HTTP/2 into method, host, path and status, and MCP into methods and tool names. Records marked as seen in the process, for hosts the proxy did not terminate. Learn drafts path rules from them; check replays them as path rules would decide. | Path-level audit of hosts that cannot be terminated, with no CA. |
+| **6.3** | Go `crypto/tls` | Run binaries' symbols read at exec, with the Go version from their build info. Offsets per supported version; probes on return instructions. Stripped or unsupported binaries recorded as not visible. | Go tools and agents (`gh`, `terraform`, Go-based harnesses). |
+| **6.4** | Bundled stacks | Node's OpenSSL and Bun's BoringSSL, where 6.0 shows their symbols are usable; others as the spike allows. | The runtimes coding agents run on. |
+| **6.5** | Visibility report | Per run and destination: seen by the proxy, by a uprobe, by SNI alone, or not at all; in the timeline, `agentctl events` and the receipt. | An operator can see what audit missed, not just what it saw. |
+| **6.6** | Tests and docs | Integration tests for each milestone, privileged where they need the kernel: a restart in the middle of an enforcing run; captured requests from curl, Python, a Go binary and Node. Operator guide on restart, `-uprobes`, what is visible and what is not. | Phase 6 ships. |
+
+Order: 6.0; 6.1, which needs nothing else, first; then 6.2, which 6.3 and
+6.4 build on. 6.3 and 6.4 are independent, and either moves on if its
+spike says no. 6.5 after 6.2. 6.6 last.
+
+#### Proposed decisions
+
+- **Uprobes inform; they never decide.** Captured plaintext never changes a
+  verdict. A refusal still needs the proxy, which a run cannot bypass;
+  uprobes it can.
+- **Request lines and headers, not bodies.** Capture stops at the end of the
+  headers, and timelines hold what they hold for terminated hosts. Content
+  rules on captured bodies, if ever, are opt-in, audit-only, and record
+  matches, not content.
+- **Opt-in per node.** Uprobes read plaintext from every process in every
+  run, so a node turns them on with a flag, and the receipt says so.
+- **Restart fails closed.** A run whose grants cannot be restored is revoked
+  and told why, never left unprofiled.
+
 ---
 
 ## 11. Non-goals and honest limits
@@ -4197,7 +4282,9 @@ The proposed decisions below were applied in 5.4 and 5.5.
    that with a narrated 503.
 4. **Reconcile loop for orphaned runs** — node agent restarts, harness crashes,
    cgroups outliving their policy entries. Standard controller reconcile, but the
-   fail-closed ordering needs care.
+   fail-closed ordering needs care. *Planned in 6.1:* grants persisted and
+   restored before the node reports healthy; a run whose grants cannot be
+   restored is revoked.
 5. **Explicit-proxy identity** — per-run listener or per-run credential, and how
    a laptop harness obtains either without a privileged helper. See
    [§4.3](#43-two-deployment-modes). *Answered in Phase 2:* the cgroup by
