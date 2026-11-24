@@ -158,3 +158,19 @@ func askNote(a *AskData) string {
 	}
 	return n
 }
+
+// httpNote is an http event's note for the timeline: QUIC, and an ask.
+func httpNote(d HTTPData) string {
+	n := askNote(d.Ask)
+	if d.QUIC {
+		q := "QUIC"
+		if d.Upstream != "" {
+			q += " to " + d.Upstream
+		}
+		if n != "" {
+			q += "; " + n
+		}
+		n = q
+	}
+	return n
+}

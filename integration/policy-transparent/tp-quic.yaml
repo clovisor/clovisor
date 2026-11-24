@@ -1,0 +1,14 @@
+# QUIC by name (milestone 5.6, node -quic): other.test by a host rule is
+# relayed; origin.test, with path rules, needs termination and gets TCP.
+kind: AgentProfile
+metadata: { name: tp-quic }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: other, to: { fqdn: ["other.test"], ports: [443] }, action: allow }
+      - name: origin-paths
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/allowed"] }
+        action: allow

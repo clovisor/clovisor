@@ -123,6 +123,8 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-transparent-stale 3s` | How long after the node agent stops its heartbeat connects are refused. |
 | `-transparent-dns-port 15053` | The local resolver's port, on `127.0.0.1` and `::1`, UDP and TCP. |
 | `-udp-allow ip:port,…` | UDP destinations runs may reach in transparent mode (NTP, say). All other UDP but DNS is refused. At most four. |
+| `-quic` | Relay QUIC (UDP 443) by server name in transparent enforce mode (§11 QUIC). Off by default: QUIC is refused and clients use TCP. |
+| `-quic-port 15443` | The QUIC relay's port, on `127.0.0.1` and `::1`. |
 | `-dns-upstream ip:port,…` | Where the local resolver forwards allowed names. Default: the nameservers in `/etc/resolv.conf`. |
 
 Signals: `SIGHUP` reloads the policy directory (a bad edit is rejected and the
@@ -815,10 +817,43 @@ deny.
 | DNS (port 53, UDP or TCP, to any server) | To the node's resolver (below). |
 | UDP to a `-udp-allow` destination, or one the run's ceiling and profile both allow (`udp.allow`) | Direct. |
 | UDP on loopback, socket bound by the same run, or nothing listening | Direct. |
-| Any other UDP, QUIC included | Refused with `EPERM`. Browsers and HTTP/3 clients fall back to TCP at once. Recorded once per connect, or once per unconnected socket. |
+| UDP 443, with `-quic` | To the node's QUIC relay, which decides the server name (below). |
+| Any other UDP, QUIC without `-quic` included | Refused with `EPERM`. Browsers and HTTP/3 clients fall back to TCP at once. Recorded once per connect, or once per unconnected socket. |
 | ICMP echo from a ping socket to a destination the run's ceiling and profile both allow (`icmp.allow`) | Direct. |
 | Any other packet leaving the node (other ICMP, a raw socket) | Dropped by the packet backstop. Recorded at most once a second per run, with a count. |
 | Anything, while the node agent is down | Refused with `EPERM`. |
+
+**QUIC (opt-in, `-quic`).** HTTP/3 and other QUIC clients send UDP to port
+443. With `-quic`, the connect hooks send it to the node agent's relay
+instead of refusing it.
+
+- **How it is decided.** The relay holds a client's first datagrams until
+  their Initial packets hold the whole TLS ClientHello. Those packets are
+  protected only with keys anyone can derive. It then decides the server
+  name as a `CONNECT` to that name on port 443 would be decided.
+- **Where it goes.** Allowed, the datagrams go on untouched to the address
+  the name resolves to, never the one the client chose; the replies come
+  back as if from where the client sent.
+- **What is refused,** with a QUIC `CONNECTION_REFUSED` saying why, so the
+  client reports it and falls back to TCP:
+  - names the profile does not allow;
+  - hosts whose rules need method, path, body, model or budget checks, or
+    a person's approval, since those are done on terminated TCP;
+  - encrypted ClientHellos (ECH), whose real name is hidden;
+  - connections with no server name.
+
+  Other QUIC versions and packets the relay cannot read get no answer; the
+  client falls back after its handshake timeout.
+- **Records.** Each connection is a `CONNECT` in the timeline, noted
+  `QUIC to <address>`, so `learn` and `check` treat it like a TLS tunnel.
+  `agentctl check --transparent --quic` replays refused UDP 443 from earlier
+  runs as the relay would decide it.
+- **Limits.**
+  - At most 4,096 relayed connections on the node, 256 per run.
+  - A connection with no traffic for 2 minutes is dropped.
+  - A client that migrates to a new address loses its connection, which
+    then fails and falls back.
+  - Connections count toward `connections_per_min` and `egress_bytes`.
 
 **Fail closed.** In enforce mode the connect hooks are pinned in
 `/sys/fs/bpf/clovisor`, so they outlive the node agent. The node agent
@@ -1104,6 +1139,7 @@ agentctl events --json <run-id>
 | A timeline has `suppressed_events` and `complete: false` | The run produced events faster than its budget (bursts of about 1,300 execs, then about 5,000 execs or 70,000 connects a second), so the excess was not reported, to keep it from crowding out other runs. Enforcement was unaffected. |
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination the run did not look up through the node (a hard-coded address) needs a `cidr` rule. |
+| A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS, `-udp-allow`, and what both the ceiling's and the profile's `udp.allow` name. Check `udp_refused` and the connect events in the timeline. |
 | `Name or service not known` in a run (transparent) | The resolver refused the name: no rule allows a connection to it. Check `dns_blocked` in the timeline, or `dig` for the EDE reason. |
 | DNS in runs fails entirely (transparent) | The node agent is down (DNS is refused with it), or the resolver cannot reach `-dns-upstream`: see `server` and `reason` on the timeline's dns events. |
@@ -1165,7 +1201,11 @@ ignore the proxy, it checks:
   port the rule does not name;
 - forced DNS: an allowed name resolved; an unlisted name and a
   tunnelling-shaped name refused, from glibc and Python;
-- UDP refused, QUIC-shaped included, and a `-udp-allow` echo answered;
+- UDP refused, and a `-udp-allow` echo answered;
+- QUIC with `-quic`: relayed for a host rule, with a ClientHello over one
+  datagram and over two; refused with a reason for a host with path rules,
+  and for a name the profile does not allow, decided by the name though
+  sent to an allowed address;
 - a same-run dev server reached and a host service on loopback refused;
 - a run with an inherited TCP socket refused at start;
 - where BPF LSM is active: raw, packet and vsock sockets refused, netlink

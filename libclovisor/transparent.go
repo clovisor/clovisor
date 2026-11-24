@@ -51,6 +51,10 @@ type TransparentOptions struct {
 	// DNSPort is the local resolver's port; DefaultResolverPort if 0. In
 	// audit and enforce, every DNS query from a run goes there.
 	DNSPort uint16
+	// QUICPort, if set, is the QUIC relay's port (milestone 5.6): in
+	// enforce, UDP 443 from a run goes there and is decided by the
+	// server name in its Initial. 0: QUIC is refused like other UDP.
+	QUICPort uint16
 	// Exceptions are reached directly: the explicit proxy and the MCP
 	// gateway. An unspecified address matches any loopback address.
 	Exceptions []netip.AddrPort
@@ -80,6 +84,9 @@ func (t *TransparentOptions) normalize() error {
 	}
 	if t.DNSPort == t.Port {
 		return fmt.Errorf("the resolver and the transparent listener need different ports")
+	}
+	if t.QUICPort != 0 && (t.QUICPort == t.DNSPort || t.Mode != TransparentEnforce) {
+		return fmt.Errorf("the QUIC relay needs transparent enforce mode and a port of its own")
 	}
 	if t.Stale == 0 {
 		t.Stale = DefaultHeartbeatStale
@@ -128,6 +135,7 @@ var connectVerdicts = map[uint32]string{
 	15: "allowed",
 	16: "refused: exec",
 	17: "would refuse: exec",
+	18: "quic: relay",
 }
 
 // Connect verdicts a timeline treats specially.
@@ -135,4 +143,5 @@ const (
 	VerdictRedirect = "redirect"
 	VerdictRefused  = "refused: node agent down"
 	VerdictUDP      = "refused: UDP"
+	VerdictQUIC     = "quic: relay"
 )

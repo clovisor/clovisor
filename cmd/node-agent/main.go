@@ -45,6 +45,8 @@ var (
 	udpOK  = flag.String("udp-allow", "", "Comma-separated ip:port UDP destinations runs may reach in transparent mode (0.0.0.0:port: any loopback address); other UDP but DNS is refused")
 	dnsUp  = flag.String("dns-upstream", "", "Comma-separated ip:port resolvers the local resolver forwards to (default: the nameservers in /etc/resolv.conf)")
 	tStale = flag.Duration("transparent-stale", clovisor.DefaultHeartbeatStale, "How long after the node agent stops connects are refused")
+	quic   = flag.Bool("quic", false, "Relay QUIC (UDP 443) from runs by the server name in its Initial, decided as TLS by name is (transparent enforce only); otherwise QUIC is refused and clients use TCP")
+	quicP  = flag.Uint("quic-port", clovisor.DefaultQUICPort, "QUIC relay port, on 127.0.0.1 and ::1 (with -quic)")
 )
 
 // defaultEnvoyUIDs is the uid of the official Envoy image's user when the
@@ -136,7 +138,7 @@ func main() {
 		CADir:           *caDir,
 		EnvoyUpstreamCA: *upCA,
 		Transparent: clovisor.TransparentOptions{Mode: *transp, Port: uint16(*tPort), DNSPort: uint16(*tDNS), Stale: *tStale,
-			UDPExceptions: addrList("-udp-allow", *udpOK)},
+			UDPExceptions: addrList("-udp-allow", *udpOK), QUICPort: quicPort(*quic, *quicP)},
 		DNSUpstreams: splitList(*dnsUp),
 	})
 	// A policy that does not load is fatal at start: running without it
@@ -171,4 +173,12 @@ func main() {
 			return
 		}
 	}
+}
+
+// quicPort is the relay's port with -quic, else 0 (no relay).
+func quicPort(on bool, port uint) uint16 {
+	if !on {
+		return 0
+	}
+	return uint16(port)
 }

@@ -61,7 +61,8 @@ type bpfAuditConfig struct {
 	StaleNs        uint64
 	TproxyPort     uint16
 	DNSPort        uint16
-	_              uint32
+	QUICPort       uint16
+	_              uint16
 	Exc            [maxTransparentExceptions]bpfException
 	UDPExc         [maxTransparentExceptions]bpfException
 }
@@ -613,7 +614,7 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 
 	cfg := bpfAuditConfig{AgentsCgroupID: agentsCgroupID, AgentsLevel: agentsLevel,
 		Mode:    map[string]uint32{TransparentOff: 0, TransparentAudit: 1, TransparentEnforce: 2}[t.Mode],
-		StaleNs: uint64(t.Stale.Nanoseconds()), TproxyPort: t.Port, DNSPort: t.DNSPort}
+		StaleNs: uint64(t.Stale.Nanoseconds()), TproxyPort: t.Port, DNSPort: t.DNSPort, QUICPort: t.QUICPort}
 	for i, x := range t.Exceptions {
 		if a := x.Addr(); !a.IsUnspecified() {
 			cfg.Exc[i].IP = a.As16() // IPv4 comes out as ::ffff:a.b.c.d

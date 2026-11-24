@@ -87,6 +87,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("models", e.testTransparentModels)
 	t.Run("budgets", e.testTransparentBudgets)
 	t.Run("ask", e.testTransparentAsk)
+	t.Run("quic", e.testQUIC)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -143,6 +144,8 @@ func (e *env) startTransparent() {
 	e.run("network", "create", e.name("net"))
 	e.run("volume", "create", e.name("run"))
 	e.startOrigin("-banner", ":2222", "-udp-echo", ":5000,:5002")
+	// A QUIC server for every name the origin answers (milestone 5.6).
+	e.run("exec", "-d", e.name("origin"), "/it/bin/quictest", "server", "-listen", ":443")
 	e.originIP = strings.TrimSpace(e.run("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", e.name("origin")))
 	if e.originIP == "" {
 		t.Fatal("no origin address")
@@ -180,7 +183,7 @@ cat /etc/ssl/certs/ca-certificates.crt /it/test-ca.crt > /run/clovisor/upstream.
 		"echo $$ > /run/node-agent.pid; exec /it/bin/node-agent -identity cgroup -bpf /it/bin/agent_audit.o"+
 			" -agents-cgroup "+e.agentsCgroup()+
 			" -policy-dir /etc/clovisor/policy -proxy-listen 127.0.0.1:18000 -envoy-upstream-ca /run/clovisor/upstream.pem"+
-			" -transparent enforce -udp-allow "+e.originIP+":5000 > /var/log/node-agent.log 2>&1")
+			" -transparent enforce -quic -udp-allow "+e.originIP+":5000 > /var/log/node-agent.log 2>&1")
 	if out, errOut, err := e.sh(`for i in $(seq 50); do [ -S /run/clovisor/agent.sock ] && [ -f /run/clovisor/envoy.json ] && exit 0; sleep 0.1; done
 cat /var/log/node-agent.log; exit 1`); err != nil {
 		t.Fatalf("node agent did not start: %v\n%s%s", err, out, errOut)
@@ -272,7 +275,7 @@ func (e *env) testUDP(t *testing.T) {
 	out, id := e.trun(e.py("udp", `import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(3)
-for dst in [("8.8.8.8", 443), ("`+e.originIP+`", 5001)]:
+for dst in [("8.8.8.8", 4443), ("`+e.originIP+`", 5001)]:
     try:
         s.sendto(b"x", dst)
         print("sent", dst)
@@ -281,7 +284,7 @@ for dst in [("8.8.8.8", 443), ("`+e.originIP+`", 5001)]:
 s.sendto(b"ping", ("`+e.originIP+`", 5000))
 print("echo", s.recvfrom(16)[0])
 `))
-	expect(t, out, "refused 443 1", "refused 5001 1", "echo b'ping'")
+	expect(t, out, "refused 4443 1", "refused 5001 1", "echo b'ping'")
 	// One report per unconnected socket: the first refusal.
 	expect(t, e.timeline(id), `"udp_refused": 1`, `"udp_refused_to"`, `"8.8.8.8"`)
 }
@@ -562,13 +565,13 @@ print(who, "ping other", ping("192.0.2.1"))
 func (e *env) testCheckTransparent(t *testing.T) {
 	_, id := e.trun("getent hosts other.test; " + e.py("udp443", `import socket
 try:
-    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("8.8.8.8", 443))
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("8.8.8.8", 4443))
 except OSError:
     pass
 `))
 	e.timeline(id)
 	out, _, _ := e.sh("/it/bin/agentctl check --transparent --profile /etc/clovisor/policy/tp.yaml " + id)
-	expect(t, out, "as transparent enforce would decide", "dns    other.test", "udp    UDP 8.8.8.8:443")
+	expect(t, out, "as transparent enforce would decide", "dns    other.test", "udp    UDP 8.8.8.8:4443")
 }
 
 func (e *env) testFailClosed(t *testing.T) {
@@ -697,6 +700,30 @@ echo "other: $(curl -s -o /dev/null -w %{http_code} https://other.test/x)"
 		t.Fatalf("no run:\n%s%s", r.out, r.errOut)
 	}
 	expect(t, e.timeline(m[1]), `"ask `+id+`: approved by root (uid 0) after`, `"unlisted.test"`)
+}
+
+func (e *env) testQUIC(t *testing.T) {
+	// QUIC by name (milestone 5.6): other.test is allowed by a host rule,
+	// so its QUIC is relayed, with the default post-quantum key shares
+	// (a ClientHello over two datagrams) and with X25519 (one). origin.test
+	// has path rules, so its QUIC is refused and the client told why. A
+	// connection to the origin's address naming an unlisted host is
+	// decided by the name, and refused.
+	q := "/it/bin/quictest get -timeout 3s"
+	out, id := e.agentRun("tp-quic", strings.Join([]string{
+		"unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy",
+		`echo "other: $(` + q + ` -name other.test 2>&1)"`,
+		`echo "other x25519: $(` + q + ` -name other.test -x25519 2>&1)"`,
+		`echo "origin: $(` + q + ` -name origin.test 2>&1)"`,
+		`echo "by address: $(` + q + ` -name unlisted.test -addr ` + e.originIP + `:443 2>&1)"`,
+	}, "; "))
+	expect(t, out, "other: quic other.test ok", "other x25519: quic other.test ok",
+		"origin: refused after", "CONNECTION_REFUSED", "Rules for origin.test need what is sent inside the connection",
+		"by address: refused after", "No rule in profile tp-quic allows unlisted.test:443.")
+	tl := e.timeline(id)
+	expect(t, tl, `"note": "QUIC to `+e.originIP+`:443"`, `"reason": "quic: needs termination"`)
+	shown, _, _ := e.sh("/it/bin/agentctl events " + id)
+	expect(t, shown, "CONNECT other.test:443 -> allow rule other", "(QUIC to ")
 }
 
 func (e *env) testDuration(t *testing.T) {

@@ -69,6 +69,11 @@ type HTTPData struct {
 	ResolvedName string
 	// Ask is how a request an ask rule held was settled (milestone 5.5).
 	Ask *AskData
+	// QUIC marks a QUIC connection the relay decided by the server name
+	// in its Initial (milestone 5.6); Method is CONNECT. Upstream is the
+	// address it was forwarded to: the name's, not the one the run chose.
+	QUIC     bool
+	Upstream string
 }
 
 // ExtProcServer decides proxied requests for runs (milestone 2.3). It

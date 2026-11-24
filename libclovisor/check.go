@@ -68,6 +68,10 @@ type CheckOptions struct {
 	// even when the traffic carries no name.
 	Transparent bool
 	UDPAllow    []netip.AddrPort
+	// QUIC replays UDP 443 as the node's QUIC relay decides it (milestone
+	// 5.6): by the names the run looked up, as a CONNECT, where no
+	// termination or approval is needed.
+	QUIC bool
 }
 
 // httpish are ports whose traffic is assumed TLS or HTTP, so that it
@@ -175,6 +179,22 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				continue
 			case d.Proto == "UDP" && o.Transparent:
 				what := d.Proto + " " + addr + namesSuffix(d.Names)
+				if o.QUIC && d.Port == 443 && len(d.Names) > 0 {
+					for _, n := range d.Names {
+						w := d.Proto + " " + addr + " (" + n + ", QUIC)"
+						dec := cp.Decide(policy.Request{Host: n, Port: 443})
+						switch {
+						case dec.Deferred || dec.Action == policy.ActionAsk:
+							add("udp-deny", w, CheckFinding{Decision: policy.ActionDeny, Rule: dec.Rule,
+								Message: "QUIC is refused where the rule needs termination or a person; the client uses TCP"}, tl.RunID, d.Count)
+						case dec.Allowed():
+							add("udp-allow", w, CheckFinding{Decision: policy.ActionAllow, Rule: dec.Rule + " (QUIC relay)"}, tl.RunID, d.Count)
+						default:
+							add("udp-deny", w, CheckFinding{Decision: policy.ActionDeny, Rule: dec.Rule, Message: dec.Message}, tl.RunID, d.Count)
+						}
+					}
+					continue
+				}
 				if udpAllowed(ip, d.Port) {
 					add("udp-allow", what, CheckFinding{Decision: policy.ActionAllow, Rule: "node -udp-allow"}, tl.RunID, d.Count)
 				} else if profileUDP(cp, ip, d.Port) {

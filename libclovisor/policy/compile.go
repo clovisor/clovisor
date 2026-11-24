@@ -61,6 +61,9 @@ type Options struct {
 	// KernelLSM: BPF LSM is active, so transparent mode also governs
 	// socket families, raw sockets and sockets made outside the run.
 	KernelLSM bool
+	// QUIC: transparent enforce relays QUIC by server name (milestone
+	// 5.6, node -quic); otherwise UDP 443 is refused like other UDP.
+	QUIC bool
 }
 
 // Diagnostic is one compile error.
@@ -273,6 +276,13 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 	}
 
 	c.egress(p, cp)
+	if c.opts.QUIC && c.opts.Mode == Transparent {
+		cp.Placements = append(cp.Placements, Placement{Rule: "(quic)", Tier: "0+2",
+			EnforcedBy: "connect hooks send UDP 443 to the node's QUIC relay, which decides the Initial's server name as a CONNECT",
+			Notes: []string{"allowed only where TLS to the name passes without termination: hosts whose rules need method, path, body or a person get TCP instead",
+				"refused: other QUIC versions, encrypted ClientHellos, connection migration; clients fall back to TCP",
+				"forwarded to the address the name resolves to, not the one the run chose"}})
+	}
 	c.exec(p, cp)
 	c.mcp(p, cp)
 	c.unix(p, cp)

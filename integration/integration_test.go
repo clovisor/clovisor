@@ -174,6 +174,13 @@ func (e *env) build() {
 			t.Fatalf("build %s: %v\n%s", pkg, err, out)
 		}
 	}
+	// The QUIC client and server (milestone 5.6): a module of their own.
+	cmd := exec.Command("go", "build", "-o", filepath.Join(bin, "quictest"), ".")
+	cmd.Dir = filepath.Join(root, "integration", "quic")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build quictest: %v\n%s", err, out)
+	}
 	for _, f := range []string{"mcp_client.py"} {
 		data, err := os.ReadFile(f)
 		if err != nil {

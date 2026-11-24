@@ -102,6 +102,7 @@ place:
 | Model allow-lists: a rule's `model` list checked against the JSON body's top-level `model` and a `model` query parameter; bodies naming none, or naming it twice, refused; models recorded per request, drafted by learn from runs observed under `"*"`, replayed by check. | [5.3 status](#53-status-2026-11-24) |
 | Budgets: a rule's `budget` of tokens and dollars, charged from the usage in each response, streamed or not, at prices from a node `ModelPrices` document; `include_usage` set on OpenAI streams and its chunk removed again; refused once spent, and for unpriced models under a cost budget; nested runs charge their parents; spend persisted and reported. | [5.4 status](#54-status-2026-11-24) |
 | Ask: `action: ask`, `mode: ask` and `sampling: ask` hold a request in the node agent's queue until a person decides over the run API, or its timeout; decisions refused from inside a run, and needing root with credential identity; remembered decisions; held requests capped; open question 3 answered for host deployments. | [5.5 status](#55-status-2026-11-24) |
+| QUIC by name (opt-in, `-quic`): UDP 443 from runs sent by the connect hooks to a relay in the node agent, which reads the server name from the Initial packets and decides it as a CONNECT; refused, with a narrated `CONNECTION_REFUSED`, for hosts needing termination or a person, ECH and unnamed connections. | [5.6 status](#56-status-2026-11-24) |
 
 ---
 
@@ -3833,6 +3834,108 @@ Verified:
   `tp-ask` (mode ask), `agentctl pending` from inside the run was refused,
   the ask rule's name resolved and an unlisted one did not, and the held
   request was approved from outside and reached the origin.
+
+#### 5.6 status (2026-11-24)
+
+Implemented:
+
+- **`-quic`** on the node agent, in transparent enforce mode, needing
+  cgroup identity and the proxy. Off by default: UDP 443 stays refused,
+  and clients use TCP.
+- **Kernel.** The connect and sendmsg hooks send UDP 443 to non-loopback
+  addresses to the relay on `127.0.0.1` and `::1` (`-quic-port`, 15443).
+  - A profile's `udp.allow` and the node's `-udp-allow` still go direct.
+  - While the node is unhealthy, it is refused as other connects are.
+  - The recvmsg and getpeername hooks make the relay's replies appear to
+    come from where the client sent, which QUIC clients check.
+  - Bytes to the relay count toward `egress_bytes`.
+- **The relay** keeps a flow per client address:
+  - it identifies the run with socket diagnostics, as the resolver does;
+  - it holds datagrams, at most 8 or 16 KB, for at most 5 seconds, until
+    the Initial packets (version 1 only, coalesced packets read) hold the
+    whole ClientHello;
+  - it reads `server_name` and whether the ClientHello carries ECH.
+- **The decision** is `ext_proc`'s, as for a `CONNECT` to the name on port
+  443, with the guard against node-local names and with
+  `connections_per_min`. QUIC is allowed only where TLS by name would pass
+  without termination. A host whose deciding rule needs method or path,
+  has content, model or budget rules, is a governed MCP server or asks a
+  person is refused, since those checks are made on terminated TCP. ECH
+  and unnamed ClientHellos are refused, because the name to decide is
+  hidden or absent.
+- **Allowed,** the held datagrams are forwarded untouched to the address
+  the name resolves to, never the one the run chose, and replies are
+  relayed. A flow idle for 2 minutes is dropped. At most 4,096 flows on the
+  node, 256 per run.
+- **Refused,** the client gets a server Initial with `CONNECTION_CLOSE`
+  (`CONNECTION_REFUSED`) and the narration as its reason, protected with
+  the server Initial keys the client expects. quic-go reports it as a
+  remote `CONNECTION_REFUSED` with the reason. Datagrams the relay
+  cannot read (other versions) get no answer.
+- **Records.** Each decision is an HTTP record of a `CONNECT`, marked
+  QUIC, with the address it was forwarded to. `learn` and `check` treat it
+  as a TLS tunnel. `agentctl check --transparent --quic` replays refused UDP
+  443 from earlier runs by the names the run looked up. The receipt has a
+  `(quic)` entry in transparent mode with `-quic`.
+- **No new dependency.** The relay's Initial parsing and protection is
+  about 400 lines on the standard library, HKDF included, checked against
+  RFC 9001's Initial keys. The integration tests' QUIC client and server
+  are a module of their own (`integration/quic`), so the main module does
+  not depend on quic-go.
+
+Found on the way:
+
+- **QUIC clients do not connect their sockets.** quic-go sends with
+  `sendmsg` on an unconnected socket, so the kernel reports no connect
+  for it, as for other unconnected UDP it lets through. The relay's
+  record is the record.
+
+Decisions:
+
+- **Refuse QUIC where TCP would be terminated.** A host with path, body or
+  approval rules is enforced by reading the request; QUIC to it would skip
+  that. Refusing sends the client to TCP, where it is read. This applies
+  the 5.0 finding that QUIC is decided by name only.
+- **Narrate the refusal in QUIC itself.** Silence would leave a client
+  waiting for its handshake timeout (5 seconds in quic-go) before falling
+  back. A `CONNECTION_CLOSE` in an Initial is readable by any client, needs
+  only the keys the relay already derives, and carries the narration as
+  §7.7 asks.
+- **Forward to the name's address.** As transparent TCP does: a run cannot
+  pair an allowed name with an address of its choosing.
+
+Limits:
+
+- Connection migration: a client that moves to a new address arrives as a
+  new flow without an Initial, and is refused; the connection fails and
+  the client falls back to TCP.
+- Only QUIC version 1 is read. Version 2, or anything else, gets no answer
+  and falls back after the client's timeout.
+- QUIC is decided by name alone, like TLS that is not terminated: what is
+  sent inside is not seen.
+
+Verified:
+
+- Unit tests:
+  - Initial keys against RFC 9001 Appendix A;
+  - ClientHellos over one and two datagrams, ECH, tampered, version 2
+    and short header packets refused;
+  - the CONNECTION_CLOSE decrypted and read back;
+  - the relay forwarding datagrams unchanged to the name's address and
+    relaying replies, and refusing denied, path-ruled, asking and ECH
+    hosts with the narration;
+  - recording, and `check --quic`.
+- `make integration-transparent`, now twenty-four checks, with `-quic` and
+  quic-go v0.65 as client and server. Under `tp-quic`:
+  - other.test was relayed, with default post-quantum key shares (two
+    datagrams) and with X25519 (one);
+  - origin.test, which has path rules, was refused with
+    `CONNECTION_REFUSED` and the narration;
+  - a connection to the origin's address naming an unlisted host was
+    refused by the name.
+
+  The UDP checks now use port 4443 for refused UDP, since 443 goes to the
+  relay.
 
 #### Proposed decisions
 

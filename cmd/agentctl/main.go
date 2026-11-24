@@ -48,7 +48,7 @@ func printUsage(code int) {
 	fmt.Println("                                    Draft a profile from recorded runs")
 	fmt.Println("  agentctl explain [--transparent off|audit|enforce] profile.yaml...")
 	fmt.Println("                                    Compile profiles and print the enforcement receipt")
-	fmt.Println("  agentctl check --profile p.yaml [--transparent [--udp-allow ip:port,...]] (--all | run-id...)")
+	fmt.Println("  agentctl check --profile p.yaml [--transparent [--udp-allow ip:port,...] [--quic]] (--all | run-id...)")
 	fmt.Println("                                    Replay recorded runs against a profile; exit 1 on violations")
 	fmt.Println("  agentctl pins [--all]             List MCP tools whose definitions changed since pinned")
 	fmt.Println("  agentctl pins show <server> <tool>")
@@ -1144,6 +1144,7 @@ func checkProfile(argv []string) error {
 	all := fs.Bool("all", false, "check every finished run in -dir")
 	transparent := fs.Bool("transparent", false, "replay as transparent enforce mode decides: DNS by name, UDP refused, non-TLS TCP by address")
 	udpAllow := fs.String("udp-allow", "", "with --transparent: the node's -udp-allow list (comma-separated ip:port)")
+	quic := fs.Bool("quic", false, "with --transparent: the node relays QUIC by name (-quic)")
 	platform := platformFlag(fs)
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -1151,7 +1152,7 @@ func checkProfile(argv []string) error {
 	if *profile == "" {
 		return fmt.Errorf("--profile is required")
 	}
-	opts := clovisor.CheckOptions{Transparent: *transparent}
+	opts := clovisor.CheckOptions{Transparent: *transparent, QUIC: *quic && *transparent}
 	for _, f := range strings.Split(*udpAllow, ",") {
 		if f = strings.TrimSpace(f); f == "" {
 			continue

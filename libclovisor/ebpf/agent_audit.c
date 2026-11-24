@@ -263,6 +263,7 @@ struct unix_sock {
 #define V_EXEC_OK        15 /* an exec, allowed (reported once per path) */
 #define V_EXEC_DENY      16
 #define V_AUDIT_EXEC     17
+#define V_QUIC           18 /* UDP 443, to the node agent's QUIC relay (milestone 5.6) */
 
 /* Addresses as 16 bytes, network order, IPv4 as ::ffff:a.b.c.d. */
 struct addr {
@@ -285,7 +286,8 @@ struct audit_config {
     __u64 stale_ns;       /* heartbeat older than this: unhealthy */
     __u16 tproxy_port;    /* transparent listener on 127.0.0.1 and ::1, host order */
     __u16 dns_port;       /* local resolver on 127.0.0.1 and ::1, host order; 0: none */
-    __u32 _pad2;
+    __u16 quic_port;      /* QUIC relay on 127.0.0.1 and ::1, host order; 0: none (milestone 5.6) */
+    __u16 _pad2;
     struct exception exc[MAX_EXCEPTIONS];
     struct exception udp_exc[MAX_EXCEPTIONS]; /* UDP destinations runs may reach */
 };
@@ -1085,13 +1087,20 @@ static __always_inline __u32 decide(struct bpf_sock_addr *ctx, struct audit_conf
         if (run_udp_ok(bpf_map_lookup_elem(&run_net, &prun), ip, hport))
             return V_EXCEPTION;
         if (is_loopback(ip)) {
-            if (hport == cfg->dns_port && cfg->dns_port != 0)
+            if ((hport == cfg->dns_port && cfg->dns_port != 0) || (hport == cfg->quic_port && cfg->quic_port != 0))
                 return V_EXCEPTION;
             int who = loopback_listener(ctx, ip, port, run, 1);
             if (who == LISTENER_SAME)
                 return V_SAME_RUN;
             if (who == LISTENER_NONE)
                 return V_UNBOUND;
+        } else if (hport == 443 && cfg->quic_port != 0 && cfg->mode == MODE_ENFORCE) {
+            /* QUIC by name (milestone 5.6): the relay reads the server
+             * name from the Initial and decides it, as for TLS. */
+            if (!healthy(cfg))
+                return V_DENY_UNHEALTHY;
+            *to_port = cfg->quic_port;
+            return V_QUIC;
         }
         return cfg->mode == MODE_ENFORCE ? V_UDP_DENY : V_AUDIT_UDP;
     }
@@ -1253,15 +1262,22 @@ int on_sendmsg6(struct bpf_sock_addr *ctx)
     return rewrite6(ctx, &ip, port, v, to);
 }
 
-/* A reply from the resolver appears to come from the server the client
- * asked; resolvers drop replies from anyone else. */
+/* A reply from the resolver, or the QUIC relay, appears to come from the
+ * server the client asked; resolvers and QUIC clients drop replies from
+ * anyone else. */
+static __always_inline int redirected_port(struct audit_config *cfg, __u32 port)
+{
+    return (cfg->dns_port != 0 && port == bpf_htons(cfg->dns_port)) ||
+           (cfg->quic_port != 0 && port == bpf_htons(cfg->quic_port));
+}
+
 SEC("cgroup/recvmsg4")
 int on_recvmsg4(struct bpf_sock_addr *ctx)
 {
     struct audit_config *cfg = get_config();
-    if (!cfg || cfg->dns_port == 0)
+    if (!cfg)
         return 1;
-    if (ctx->user_ip4 != bpf_htonl(0x7f000001) || ctx->user_port != bpf_htons(cfg->dns_port))
+    if (ctx->user_ip4 != bpf_htonl(0x7f000001) || !redirected_port(cfg, ctx->user_port))
         return 1;
     struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
     if (o && o->family == AF_INET) {
@@ -1275,7 +1291,7 @@ SEC("cgroup/recvmsg6")
 int on_recvmsg6(struct bpf_sock_addr *ctx)
 {
     struct audit_config *cfg = get_config();
-    if (!cfg || cfg->dns_port == 0 || ctx->user_port != bpf_htons(cfg->dns_port))
+    if (!cfg || !redirected_port(cfg, ctx->user_port))
         return 1;
     struct orig *o = bpf_sk_storage_get(&orig_by_sk, ctx->sk, 0, 0);
     if (!o)
@@ -1631,7 +1647,8 @@ int on_egress_count(struct __sk_buff *skb)
                 dport = bpf_ntohs(p);
         }
         if (dport == 0 || !(in_exceptions(cfg->exc, &ip, dport) || dport == cfg->tproxy_port ||
-                            (cfg->dns_port != 0 && dport == cfg->dns_port)))
+                            (cfg->dns_port != 0 && dport == cfg->dns_port) ||
+                            (cfg->quic_port != 0 && dport == cfg->quic_port)))
             return 1;
     }
 

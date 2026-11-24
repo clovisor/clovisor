@@ -46,6 +46,8 @@ type NodeAgent struct {
 	policyDir  string
 	deployment policy.DeploymentMode
 	lsm        bool
+	quic       bool
+	relay      *QUICRelay
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
 	running    bool
@@ -194,7 +196,8 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	}
 	// Load policy before touching the kernel or the socket: a policy that
 	// does not load is fatal, and failing here leaves nothing behind.
-	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsmFor(*t, credential))
+	quic := t.QUICPort != 0
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsmFor(*t, credential), quic)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +216,20 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if t.Mode != TransparentOff {
 		if resolver, err = NewResolver(nil, "", t.DNSPort, opts.DNSUpstreams, t.Mode == TransparentEnforce, httpEvents); err != nil {
 			return nil, fmt.Errorf("resolver: %w", err)
+		}
+	}
+	// Likewise the QUIC relay's (milestone 5.6); it decides once ext_proc
+	// exists.
+	var relay *QUICRelay
+	if quic {
+		if credential || !opts.ProxyListen.IsValid() {
+			return nil, fmt.Errorf("-quic needs cgroup identity, the proxy and transparent enforce mode")
+		}
+		if relay, err = NewQUICRelay(nil, t.QUICPort); err != nil {
+			if resolver != nil {
+				resolver.Close()
+			}
+			return nil, err
 		}
 	}
 	var cmgr *CgroupManager
@@ -256,6 +273,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		}
 		if resolver != nil {
 			resolver.Close()
+		}
+		if relay != nil {
+			relay.Close()
 		}
 	}
 
@@ -343,6 +363,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			fmt.Printf("transparent: %s; listener 127.0.0.1:%d and [::1]:%d; exceptions %v; UDP allowed to %v\n",
 				t.Mode, t.Port, t.Port, t.Exceptions, t.UDPExceptions)
 		}
+		if relay != nil {
+			relay.xp = xp
+			fmt.Printf("quic: relay on 127.0.0.1:%d and [::1]:%d; UDP 443 from runs is decided by server name\n", t.QUICPort, t.QUICPort)
+		}
 	}
 
 	var gw *MCPGateway
@@ -377,6 +401,8 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		policyDir:  opts.PolicyDir,
 		deployment: t.DeploymentMode(),
 		lsm:        lsmFor(*t, credential),
+		quic:       quic,
+		relay:      relay,
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -483,7 +509,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic)
 	if err != nil {
 		return err
 	}
@@ -613,12 +639,12 @@ func lsmFor(t TransparentOptions, credential bool) bool {
 	return !credential && t.Mode != TransparentOff && BPFLSMActive()
 }
 
-func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm bool) (*policy.Set, error) {
+func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm}, os.Geteuid() == 0)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -680,6 +706,9 @@ func (na *NodeAgent) Stop() error {
 	if na.resolver != nil {
 		na.resolver.Close()
 	}
+	if na.relay != nil {
+		na.relay.Close()
+	}
 	if na.api != nil {
 		na.api.Close()
 	}
@@ -733,6 +762,9 @@ func (na *NodeAgent) Run() error {
 	}
 	if na.resolver != nil {
 		go na.resolver.Serve()
+	}
+	if na.relay != nil {
+		go na.relay.Serve()
 	}
 	if na.limiter != nil {
 		na.limitDone = make(chan struct{})

@@ -701,12 +701,14 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			st.tl.Summary.ProxyConnects++
 			return nil, nil
 		}
-		if d.Verdict == VerdictRedirect || d.Verdict == VerdictRefused || d.Verdict == VerdictUDP {
+		if d.Verdict == VerdictRedirect || d.Verdict == VerdictRefused || d.Verdict == VerdictUDP || d.Verdict == VerdictQUIC {
 			// Redirected: it went to the proxy, and what it was for
 			// arrives as http events. Refused: it went nowhere. Neither
 			// is a destination the run reached directly.
 			switch d.Verdict {
-			case VerdictRedirect:
+			case VerdictRedirect, VerdictQUIC:
+				// QUIC to the relay (milestone 5.6): decided by name, as
+				// an http event.
 				st.tl.Summary.Redirected++
 			case VerdictUDP:
 				st.tl.Summary.UDPRefused++
@@ -984,7 +986,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Layer:     d.Layer,
 			WouldDeny: d.WouldDeny,
 			Reason:    d.Reason,
-			Note:      askNote(d.Ask),
+			Note:      httpNote(d),
 
 			Transparent:  d.Transparent,
 			OrigDst:      d.OrigDst,
