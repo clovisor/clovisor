@@ -750,6 +750,28 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	if tl.EgressBytes != nil {
 		fmt.Printf("Egress    %d bytes, nested runs included\n", *tl.EgressBytes)
 	}
+	for _, b := range tl.Budgets {
+		var of []string
+		if b.LimitTokens > 0 {
+			of = append(of, fmt.Sprintf("%d of %d tokens", b.Tokens, b.LimitTokens))
+		} else {
+			of = append(of, fmt.Sprintf("%d tokens", b.Tokens))
+		}
+		if b.LimitCost > 0 {
+			of = append(of, fmt.Sprintf("$%.4f of $%.2f", b.CostUSD, b.LimitCost))
+		} else {
+			of = append(of, fmt.Sprintf("$%.4f", b.CostUSD))
+		}
+		note := ""
+		if b.Estimated > 0 {
+			note += fmt.Sprintf(", %d estimated", b.Estimated)
+		}
+		if b.Unpriced > 0 {
+			note += fmt.Sprintf(", %d unpriced", b.Unpriced)
+		}
+		fmt.Printf("Budget    rule %s (profile %s): %s in %d requests, nested runs included%s\n", b.Rule, b.Layer,
+			strings.Join(of, ", "), b.Requests, note)
+	}
 	for _, h := range tl.Limits {
 		of := ""
 		if h.Run != "" {
@@ -802,6 +824,8 @@ func printTimeline(tl *clovisor.RunTimeline) {
 				detail += " [" + e.Reason + "]"
 			}
 			detail += " (" + e.Note + ")"
+		case "usage":
+			detail = fmt.Sprintf("%s %s:%d%s model %q: %s", e.Method, e.DstName, e.DstPort, e.Path, e.Model, e.Note)
 		case "model":
 			detail = fmt.Sprintf("%s %s:%d%s -> %s", e.Method, e.DstName, e.DstPort, e.Path, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -912,6 +936,22 @@ func printTimeline(tl *clovisor.RunTimeline) {
 				note += fmt.Sprintf(" audit-only %d", u.WouldHave)
 			}
 			fmt.Printf("  %-28s %-40s x%-4d%s\n", u.Host, what, u.Requests, note)
+		}
+	}
+	if len(tl.Summary.Spend) > 0 {
+		fmt.Printf("Spend (%d)\n", len(tl.Summary.Spend))
+		for _, u := range tl.Summary.Spend {
+			note := ""
+			for _, c := range []struct {
+				n    int
+				what string
+			}{{u.Estimated, "estimated"}, {u.Unpriced, "unpriced"}, {u.Partial, "incomplete"}, {u.Uncharged, "not charged"}, {u.Refused, "refused"}} {
+				if c.n > 0 {
+					note += fmt.Sprintf(" %s %d", c.what, c.n)
+				}
+			}
+			fmt.Printf("  %-28s %-28s x%-4d %d in, %d out, %d cache, $%.4f%s\n", u.Host, strconv.Quote(u.Model), u.Requests,
+				u.Usage.Input, u.Usage.Output, u.Usage.CacheRead+u.Usage.CacheWrite, u.CostUSD, note)
 		}
 	}
 	if len(tl.Summary.Models) > 0 {

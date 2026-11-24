@@ -85,6 +85,8 @@ func LoadPolicyDir(dir string, opts policy.Options, requireRoot bool) (*policy.S
 
 	var profiles []*policy.AgentProfile
 	var ceilings []*policy.ProfileCeiling
+	var prices *policy.ModelPrices
+	var pricesFile string
 	var errs []string
 	for _, n := range names {
 		path := filepath.Join(dir, n)
@@ -95,6 +97,19 @@ func LoadPolicyDir(dir string, opts policy.Options, requireRoot bool) (*policy.S
 		data, err := os.ReadFile(path)
 		if err != nil {
 			errs = append(errs, err.Error())
+			continue
+		}
+		if policy.DocumentKind(data) == "ModelPrices" {
+			// The node's prices (milestone 5.4): one list per node.
+			mp, err := policy.ParsePrices(data)
+			switch {
+			case err != nil:
+				errs = append(errs, fmt.Sprintf("%s: %v", path, err))
+			case prices != nil:
+				errs = append(errs, fmt.Sprintf("%s: a second ModelPrices document (the first is %s)", path, pricesFile))
+			default:
+				prices, pricesFile = mp, path
+			}
 			continue
 		}
 		p, c, err := policy.ParseDocument(data)
@@ -114,6 +129,7 @@ func LoadPolicyDir(dir string, opts policy.Options, requireRoot bool) (*policy.S
 			errs = append(errs, d.Error())
 		}
 		if len(errs) == 0 {
+			set.Prices = prices
 			return set, nil
 		}
 	}

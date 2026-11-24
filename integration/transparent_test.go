@@ -85,6 +85,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("limits", e.testTransparentLimits)
 	t.Run("duration", e.testDuration)
 	t.Run("models", e.testTransparentModels)
+	t.Run("budgets", e.testTransparentBudgets)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -644,6 +645,24 @@ EOS`); err != nil {
 		t.Fatal(err)
 	}
 	expect(t, shown, "Models (2)", `"gpt-4o"`, "denied 1")
+}
+
+func (e *env) testTransparentBudgets(t *testing.T) {
+	// 300 tokens a call against a budget of 500: the parent's call and its
+	// nested run's first spend it; the nested run's second is refused, by
+	// its parent's budget.
+	c := `curl -s -w " %{http_code}\n" --data-binary '{"model":"claude-sonnet-5-5","max_tokens":200}' https://other.test/v1/messages`
+	child := e.script("budget-child", "echo \"child1: $("+c+")\"\necho \"child2: $("+c+")\"\n")
+	parent := e.script("budget-parent", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy\n"+
+		"echo \"parent: $("+c+")\"\n/it/bin/agentctl run --profile tp-budget -- "+child+" 2>/dev/null\n")
+	out, id := e.agentRun("tp-budget", parent)
+	expect(t, out, `parent: {"content"`, `child1: {"content"`, "Run "+id+" and the runs nested in it have spent the budget of rule llm of profile tp-budget",
+		"600 tokens", "} 403")
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Budget    rule llm (profile tp-budget): 600 of 500 tokens, $0.0066 in 2 requests, nested runs included")
 }
 
 func (e *env) testDuration(t *testing.T) {

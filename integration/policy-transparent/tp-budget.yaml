@@ -1,0 +1,13 @@
+# Budgets (milestone 5.4): other.test is terminated for its budget alone.
+# A nested run holding the same profile is charged to its parent's budget.
+kind: AgentProfile
+metadata: { name: tp-budget }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: llm
+        to: { fqdn: ["other.test"], ports: [443] }
+        budget: { tokens: 500 }
+        action: allow

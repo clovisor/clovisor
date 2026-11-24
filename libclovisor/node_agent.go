@@ -444,6 +444,11 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		bc = r
 	}
 	na.limiter = NewLimiter(api, bc, store, buckets)
+	if xp != nil {
+		// Budgets (milestone 5.4) share the counter store.
+		xp.Budgets = NewBudgetLedger(api, store)
+		na.limiter.Ledger = xp.Budgets
+	}
 	api.OnRunStart, api.OnRunEnd = na.limiter.RunStarted, na.limiter.RunEnded
 	na.limiter.Resume()
 
@@ -598,6 +603,9 @@ func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode,
 		names = append(names, p.Name+"@"+p.Profile.ShortVersion())
 	}
 	fmt.Printf("policy: loaded %s: %s\n", dir, strings.Join(names, ", "))
+	if set.Prices != nil {
+		fmt.Printf("policy: model prices for %d patterns (%s)\n", len(set.Prices.Spec.Models), set.Prices.Metadata.Name)
+	}
 	return set, nil
 }
 
@@ -837,6 +845,21 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		}
 		fmt.Printf("%s [CONTENT] run=%d %s %s%s %s decision=%s hits=[%s]%s\n", ts, event.RunCgroupID, d.Method,
 			net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))), d.Path, d.Where, d.Decision, strings.Join(hits, " "), extra)
+	case EventUsage:
+		d := event.Data.(UsageData)
+		extra := ""
+		if d.Estimated {
+			extra += " estimated"
+		}
+		if d.Refused != "" {
+			extra += " refused=" + strconv.Quote(d.Refused)
+		}
+		for _, b := range d.Budgets {
+			extra += fmt.Sprintf(" budget=%s/%s:%dtok,$%.4f", b.Layer, b.Rule, b.Tokens, b.CostUSD)
+		}
+		fmt.Printf("%s [USAGE] run=%d %s %s%s model=%q status=%d in=%d out=%d cache=%d cost=$%.6f%s\n", ts, event.RunCgroupID, d.Method,
+			net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))), d.Path, d.Model, d.Status, d.Usage.Input, d.Usage.Output,
+			d.Usage.CacheRead+d.Usage.CacheWrite, d.CostUSD, extra)
 	case EventModel:
 		d := event.Data.(ModelData)
 		extra := ""

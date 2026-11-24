@@ -1,0 +1,7 @@
+# The node's model prices (milestone 5.4), US dollars per million tokens.
+kind: ModelPrices
+metadata: { name: it }
+spec:
+  models:
+    - { match: "claude-sonnet-5-5*", input: 3, output: 15 }
+    - { match: "gpt-5", input: 1.25, output: 10 }

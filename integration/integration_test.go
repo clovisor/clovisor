@@ -151,6 +151,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("content", e.testContent)
 	t.Run("limits", e.testLimits)
 	t.Run("models", e.testModels)
+	t.Run("budgets", e.testBudgets)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -518,6 +519,47 @@ EOS`); err != nil {
 		`model  POST origin.test:443/echo model "claude-sonnet-5-5"`)
 	out, _, _ = e.sh("/it/bin/agentctl check --profile /etc/clovisor/policy/it-models.yaml " + id)
 	expect(t, out, "Would be denied (1)", `model  POST origin.test:443/echo model "claude-haiku-5-5"`, "not in the rule's model list")
+}
+
+func (e *env) testBudgets(t *testing.T) {
+	// The origin's model API charges 100 input tokens (40 for OpenAI) and
+	// max_tokens output. The budget is 1000 tokens: three calls of 300 and
+	// one of 240 spend it, and the fifth is refused before it is sent.
+	if _, errOut, err := e.sh(`cat > /tmp/budget.sh <<'EOS'
+a=https://origin.test/v1/messages
+o=https://origin.test/v1/chat/completions
+echo "json: $(curl -s -H 'Accept-Encoding: gzip' --data-binary '{"model":"claude-sonnet-5-5","max_tokens":200}' $a)"
+echo "sse: $(curl -sN --data-binary '{"model":"claude-sonnet-5-5","max_tokens":200,"stream":true}' $a | grep -c message_delta)"
+curl -sN --data-binary '{"model":"gpt-5","max_tokens":200,"stream":true,"messages":[]}' $o > /tmp/openai
+echo "openai: $(grep -o 'include_usage=[a-z]*' /tmp/openai) usage chunks $(grep -c prompt_tokens /tmp/openai) done $(grep -c DONE /tmp/openai)"
+echo "fourth: $(curl -s -o /dev/null -w '%{http_code}' --data-binary '{"model":"claude-sonnet-5-5","max_tokens":200}' $a)"
+echo "fifth: $(curl -s -w ' %{http_code}' --data-binary '{"model":"claude-sonnet-5-5","max_tokens":200}' $a)"
+EOS
+cat > /tmp/unpriced.sh <<'EOS'
+echo "unpriced: $(curl -s -w ' %{http_code}' --data-binary '{"model":"mystery-1"}' https://origin.test/v1/messages)"
+EOS`); err != nil {
+		t.Fatal(errOut)
+	}
+	out, id := e.agentRun("it-budget", `sh /tmp/budget.sh`)
+	expect(t, out,
+		// Accept-Encoding is removed so responses can be read.
+		`include_usage=false accept-encoding=\"\"`, `"usage":{"input_tokens":100,"output_tokens":200}`,
+		"sse: 2",
+		// ext_proc asked for usage, and took the chunk out again.
+		"openai: include_usage=true usage chunks 0 done 1",
+		"fourth: 200",
+		"spent the budget of rule llm of profile it-budget (1000 tokens and $1.00): 1140 tokens", "} 403")
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Budget    rule llm (profile it-budget): 1140 of 1000 tokens, $0.01", "of $1.00 in 4 requests",
+		"Limit     budget llm 1000 tokens and $1.00 (profile it-budget): reached", "refused at",
+		"Spend (2)", `"claude-sonnet-5-5"`, "300 in, 600 out, 0 cache, $0.0099",
+		`"gpt-5"`, "deny rule llm by it-budget [budget]")
+
+	out, _ = e.agentRun("it-budget", `sh /tmp/unpriced.sh`)
+	expect(t, out, `this node has no price for model \"mystery-1\"`, "} 403")
 }
 
 func (e *env) testPinDrift(t *testing.T) {

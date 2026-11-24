@@ -129,8 +129,20 @@ func orDefault(v, def int) int {
 type streamState struct {
 	mcp     *remoteMCP
 	body    *heldBody
+	budget  *budgetStream
 	release func()
 }
+
+func (st *streamState) budgetStream() *budgetStream {
+	if st == nil {
+		return nil
+	}
+	return st.budget
+}
+
+// encodingUnreadable marks a body held only for budgets whose encoding
+// cannot be decoded.
+const encodingUnreadable = "unreadable"
 
 func (st *streamState) remoteMCP() *remoteMCP {
 	if st == nil {
@@ -143,6 +155,9 @@ func (st *streamState) done(s *ExtProcServer) {
 	if st == nil {
 		return
 	}
+	// A response that ended early is still charged, from what was seen.
+	s.finishBudget(st.budget)
+	st.budget = nil
 	if st.body != nil {
 		s.insp.held.Add(-int64(len(st.body.buf)))
 		st.body.buf = nil
@@ -317,11 +332,21 @@ func (s *ExtProcServer) finishBody(st *streamState) *extprocv3.ProcessingRespons
 	b := st.body
 	body := b.buf
 	plain := body
-	if b.encoding != "" && (b.content || len(b.models) > 0) {
+	switch {
+	case b.encoding == encodingUnreadable:
+		plain = nil
+	case b.encoding != "" && (b.content || len(b.models) > 0):
 		var err error
 		if plain, err = decodeBody(b.encoding, body, b.max); err != nil {
 			return s.refuseBody(b, typev3.StatusCode_BadRequest, "body not decodable",
 				fmt.Sprintf("The request body, sent as %s, could not be decoded to check it (%v), so it was not sent.", b.encoding, err))
+		}
+	case b.encoding != "":
+		// Budgets alone: decoded only to read the model.
+		if p, err := decodeBody(b.encoding, body, b.max); err == nil {
+			plain = p
+		} else {
+			plain = nil
 		}
 	}
 	if len(b.models) > 0 && len(plain) > 0 {
@@ -364,6 +389,23 @@ func (s *ExtProcServer) finishBody(st *streamState) *extprocv3.ProcessingRespons
 		if r.GetImmediateResponse() != nil {
 			return r
 		}
+	}
+	if bs := st.budget; bs != nil {
+		bs.reqModel = ""
+		if m, _ := bodyModel(plain); m != policy.ModelMissing {
+			bs.reqModel = m
+		}
+		if o := s.unpricedBudget(bs); o != nil {
+			msg := fmt.Sprintf("The request to %s was not sent: rule %s of profile %s has a cost budget, and this node has no price for model %q.",
+				b.d.Host, o.Rule, o.Layer, bs.reqModel)
+			st.budget = nil
+			s.recordUsage(bs, UsageData{Host: b.d.Host, Port: b.d.Port, Method: b.d.Method, Path: b.d.Path, Model: bs.reqModel,
+				Refused: "no price for model", Rule: o.Rule, Layer: o.Layer})
+			d := b.d
+			d.Decision, d.Enforced, d.Rule, d.Layer, d.Reason, d.Message = policy.ActionDeny, true, o.Rule, o.Layer, "no price for model", msg
+			return s.deny(d, b.runID)
+		}
+		body = bs.requestBody(body, plain, b.encoding)
 	}
 	return requestBody(body)
 }

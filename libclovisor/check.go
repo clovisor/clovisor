@@ -51,6 +51,10 @@ type CheckReport struct {
 	// ContentRules names the profile's content rules, which no replay can
 	// decide: runs record which rules matched, not what was sent.
 	ContentRules []string
+	// BudgetRules names the profile's rules with budgets (milestone 5.4),
+	// which no replay decides: what a run spent depends on the order of
+	// its calls and on the node's prices.
+	BudgetRules []string
 }
 
 // CheckOptions describe the deployment to replay against.
@@ -92,6 +96,11 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 	rep := &CheckReport{Profile: cp.Name, Version: cp.Profile.ShortVersion(), Transparent: o.Transparent}
 	for _, r := range cp.Profile.Spec.Content {
 		rep.ContentRules = append(rep.ContentRules, r.Name)
+	}
+	for _, r := range cp.Profile.Spec.Egress.Rules {
+		if r.Budget != nil {
+			rep.BudgetRules = append(rep.BudgetRules, r.Name)
+		}
 	}
 	udpAllowed := func(ip netip.Addr, port uint16) bool {
 		for _, a := range o.UDPAllow {
@@ -361,6 +370,11 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 		p("")
 		p("Content rules (%d) not replayed: runs record which rules matched, not what was sent: %s",
 			len(rep.ContentRules), strings.Join(rep.ContentRules, ", "))
+	}
+	if len(rep.BudgetRules) > 0 {
+		p("")
+		p("Budgets (%d) not replayed: spending depends on the order of calls and the node's prices; "+
+			"agentctl events shows what each run spent: %s", len(rep.BudgetRules), strings.Join(rep.BudgetRules, ", "))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err

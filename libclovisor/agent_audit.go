@@ -28,6 +28,7 @@ const (
 	EventExecPath // an exec's resolved path, first use per verdict (milestone 4.4)
 	EventContent  // content rules matched a request, or its body could not be checked (milestone 5.1)
 	EventModel    // a request a model rule decided, and the model it named (milestone 5.3)
+	EventUsage    // a budgeted model call's usage and what it was charged (milestone 5.4)
 )
 
 // ExecPathData is what the exec hook saw: the resolved path the kernel ran,

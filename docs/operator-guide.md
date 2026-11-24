@@ -226,7 +226,7 @@ spec:
 | Block | What it governs | Enforced by | Section |
 |---|---|---|---|
 | `mode` | `enforce` refuses; `audit` records what enforce would refuse | | |
-| `egress` | Destinations by name, address, port, method and path, first match wins; a rule's `model` list limits the models its requests may name | the proxy; in transparent mode every TCP connect goes there | §6 Models, §10, §11 |
+| `egress` | Destinations by name, address, port, method and path, first match wins; a rule's `model` list limits the models its requests may name, and its `budget` the tokens and cost of its model calls | the proxy; in transparent mode every TCP connect goes there | §6 Models, §6 Budgets, §10, §11 |
 | `mcp` | MCP servers and their tools, sampling | the gateway and the proxy | §9 |
 | `exec` | Which binaries a run may execute | BPF LSM | §11 |
 | `unix` | Unix sockets outside the run | BPF LSM | §11 |
@@ -234,6 +234,9 @@ spec:
 | `icmp` | Ping (echo) destinations | the kernel, transparent mode | §11 |
 | `content` | Patterns in request bodies and query strings: deny, redact or record | the proxy, on hosts it terminates or that are plaintext | §10 |
 | `limits` | How long a run may last, how many connections a minute, how many bytes it may send | the node agent, the proxy, the kernel | below |
+
+A third kind of document, `ModelPrices`, holds the node's model prices
+(§6 Budgets). At most one per policy directory.
 
 **Ceiling fields**, under `spec:`:
 - `appliesTo`;
@@ -336,6 +339,76 @@ An egress rule's `model` list limits which models its requests may name.
 - **Learning models.** To find out which models an agent uses, observe it
   under an audit profile whose rule for the host has
   `model: { allow: ["*"] }` (§8).
+
+### Budgets
+
+An egress rule's `budget` bounds the tokens, and the cost in US dollars, of
+the model calls it lets through, for the run holding the profile.
+
+```yaml
+  egress:
+    rules:
+      - name: claude
+        to: { fqdn: ["api.anthropic.com"] }
+        model: { allow: ["claude-sonnet-5-5*"] }
+        budget: { tokens: 2000000, cost_usd: 20 }   # either, or both
+        action: allow
+```
+
+Prices are node configuration, not part of a profile: a profile is what an
+agent asks for, and must not set its own prices. Put one `ModelPrices`
+document in the policy directory, root-owned like the rest, and reload
+with `SIGHUP`:
+
+```yaml
+# /etc/clovisor/policy/prices.yaml — US dollars per million tokens
+kind: ModelPrices
+metadata: { name: node }
+spec:
+  models:                      # first match wins; * is a wildcard
+    - { match: "claude-sonnet-5-5*", input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 }
+    - { match: "gpt-5", input: 1.25, output: 10, cache_read: 0.125 }
+```
+
+Without `cache_read` and `cache_write`, prompt-cache tokens are priced as
+input.
+
+- **What is charged.** The usage the provider reports in each response:
+  - Anthropic-shaped: `input_tokens` and `output_tokens`, and cache tokens.
+    Streamed, from `message_start` and the last `message_delta`.
+  - OpenAI-shaped: `prompt_tokens` and `completion_tokens`, or the
+    responses API's `input_tokens` and `output_tokens`, with cached tokens
+    apart.
+
+  A token budget counts every token, cache tokens included. A cost
+  budget counts them at the node's prices, by the model the response
+  names, or else the request.
+- **What the proxy changes.**
+  - It removes the request's `Accept-Encoding`, so responses arrive
+    uncompressed and can be read.
+  - A streamed OpenAI chat completion reports usage only if the request
+    sets `stream_options.include_usage`. The proxy sets it, and takes the
+    extra usage chunk out of the response again, so the client sees what
+    it asked for. Requests to paths ending `/completions` are therefore
+    sent without `Content-Length`.
+- **When it is refused.** A request once the budget is spent, before it is
+  sent: a narrated 403 with reason `budget`. Calls already in flight are
+  charged as they finish, so a budget can be overrun by what they cost.
+  Under a cost budget, a request naming a model the node has no price for
+  is refused too, since the budget could not be kept.
+- **Estimates.** A successful response with no usage the proxy can read
+  (another API shape, a compressed response) is charged an estimate: a
+  token per four bytes each way, flagged as estimated. An error response
+  without usage is not charged. A response cut off is charged what it
+  reported so far, flagged.
+- **Nested runs share their parent's budget,** as for limits: a sub-agent
+  cannot get a fresh one. Audit layers record a would-refuse instead.
+- **Records.** Each call is a `usage` event, with its tokens, cost and the
+  budget's total after it. `agentctl events <run>` lists the run's spend
+  by host and model. For each budget the run owns, it shows the total,
+  nested runs included, and when the budget was reached. Spending is kept
+  in `<state-dir>/counters.json`, so a node agent restart does not refill
+  a budget.
 
 ## 7. Running agents
 
@@ -444,8 +517,10 @@ The adoption path, per agent workload (design §7.10):
    ```
    This replays the recorded runs against the draft: hosts, paths, models,
    MCP calls and execs. A request a model rule would decide, from a run
-   that did not record its model, is listed as not replayable. It exits 1 if anything would be denied. Review each violation:
-   widen the profile, or accept the denial.
+   that did not record its model, is listed as not replayable. Budgets are
+   not replayed, since spending depends on the order of calls and on
+   prices; the report names them. It exits 1 if anything would be denied.
+   Review each violation: widen the profile, or accept the denial.
 4. **Shadow live.** Install the profile with `mode: audit`, then `SIGHUP` the
    node agent. Decisions are recorded as `would-deny` and nothing is blocked.
 5. **Enforce.** Set `mode: enforce` and reload. Exec rules are enforced
@@ -491,7 +566,7 @@ root-only, because pins govern every run on the node.
 ## 10. TLS termination
 
 A host is terminated when some rule needs what is inside TLS: `http` method
-or path rules, `model` lists, MCP server rules, or content rules. Termination is node-wide; the receipt's
+or path rules, `model` lists, budgets, MCP server rules, or content rules. Termination is node-wide; the receipt's
 posture table lists each terminated host and the rules that caused it.
 Everything else is tunnelled untouched, with the origin's own certificate.
 
@@ -933,6 +1008,9 @@ agentctl events --json <run-id>
 | `needs termination` | A rule needs method, path or model, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
 | `413` on a large upload | The body is over `-inspect-max-body`, and a content rule, a model rule or remote MCP covers the host. Raise the limit, scope the content rule with `to:`, or give the upload's path a rule without a model list. |
 | `415` from the proxy | A content or model rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| `403` "spent the budget of rule …" | The run, or the run it is nested in, has spent that rule's budget (§6 Budgets). `agentctl events` shows the spend. |
+| `403` "this node has no price for model …" | The rule has a cost budget, and the node's `ModelPrices` has no entry matching the model. Add one and send `SIGHUP`. |
+| A run's spend is marked `estimated` | The responses carried no usage the proxy could read: another API shape, or a compressed response. |
 | `403` "not allowed by rule … Allowed: …" | The request named a model the rule's `model` list does not admit (§6 Models). |
 | `403` "names no model" or "is not a JSON object" on an upload | A model rule decided a request whose body carries no top-level `model`. Give its path a rule of its own above the model rule. |
 | `429` with `Retry-After` | A `rate-limit` rule or `connections_per_min` (§6 Limits). The narration names the rule or profile. |
@@ -983,6 +1061,11 @@ They check:
   bodies naming none or two refused, gzip decoded, a GET passed, a query
   parameter checked; a run observed under `"*"` drafted into a model list,
   replayed clean, and the stricter profile's refusal found by `check`;
+- budgets: usage charged from Anthropic-shaped responses, streamed and
+  not, and an OpenAI-shaped stream given `include_usage` with the extra
+  chunk removed; `Accept-Encoding` removed; the call past the budget
+  refused before it was sent; an unpriced model refused; the spend in
+  `agentctl events`;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 
@@ -1025,6 +1108,8 @@ ignore the proxy, it checks:
   limit counted as sent; a `duration` that kills the run;
 - a model list on a host terminated for it alone: an admitted model
   passed, another refused;
+- a budget shared with a nested run: the parent's and the nested run's
+  calls charged to the parent, the nested run refused by it;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

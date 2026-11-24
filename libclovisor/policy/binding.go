@@ -86,7 +86,7 @@ func ParseDocument(data []byte) (*AgentProfile, *ProfileCeiling, error) {
 		}
 		return nil, &c, nil
 	default:
-		return nil, nil, fmt.Errorf("kind must be AgentProfile or ProfileCeiling, got %q", head.Kind)
+		return nil, nil, fmt.Errorf("kind must be AgentProfile, ProfileCeiling or ModelPrices, got %q", head.Kind)
 	}
 }
 
@@ -125,6 +125,8 @@ func (c *ceiling) matches(caller Caller) bool {
 type Set struct {
 	Compiled *Compiled
 	ceilings []*ceiling
+	// Prices is the node's price list (milestone 5.4), if it has one.
+	Prices *ModelPrices
 }
 
 // NewSet compiles profiles and validates ceilings against them. Names in
@@ -400,6 +402,10 @@ type EffectiveDecision struct {
 	// Models are the model lists of the rules that decided, in every
 	// layer: the request must name a model each admits (milestone 5.3).
 	Models []ModelCheck
+	// Budgets are the budgets of the rules that decided, in every layer:
+	// the request is refused once any enforced one is spent, and charged
+	// to each (milestone 5.4).
+	Budgets []BudgetCheck
 }
 
 // Decide evaluates an egress attempt against every layer. Any
@@ -442,6 +448,10 @@ func (e *Effective) decide(decide func(*CompiledProfile) Decision) EffectiveDeci
 		if d.Action == ActionRateLimit && d.rate != nil {
 			out.Rates = append(out.Rates, RateHit{Profile: l.Profile, Layer: l.Profile.Name, Rule: d.Rule,
 				Requests: d.rate.requests, Per: d.rate.per, Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce})
+		}
+		if d.budget != nil {
+			out.Budgets = append(out.Budgets, BudgetCheck{Profile: l.Profile, Layer: l.Profile.Name, Rule: d.Rule,
+				Tokens: d.budget.tokens, CostUSD: d.budget.cost, Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce})
 		}
 		if d.models != nil {
 			out.Models = append(out.Models, ModelCheck{Layer: l.Profile.Name, Rule: d.Rule, Allow: d.models.allow,

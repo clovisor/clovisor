@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,6 +124,22 @@ type CounterStore struct {
 // RunCounters are what is counted for one run.
 type RunCounters struct {
 	EgressBytes uint64 `json:"egress_bytes,omitempty"`
+	// Spend is what the run spent of the budgets it owns, by layer/rule
+	// (milestone 5.4), nested runs included.
+	Spend map[string]*BudgetSpend `json:"spend,omitempty"`
+}
+
+// clone copies c, its spend included.
+func (c *RunCounters) clone() RunCounters {
+	out := *c
+	if c.Spend != nil {
+		out.Spend = make(map[string]*BudgetSpend, len(c.Spend))
+		for k, v := range c.Spend {
+			sp := *v
+			out.Spend[k] = &sp
+		}
+	}
+	return out
 }
 
 // OpenCounterStore loads the store at path, or starts an empty one.
@@ -150,7 +167,7 @@ func (s *CounterStore) Get(run string) RunCounters {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if c := s.runs[run]; c != nil {
-		return *c
+		return c.clone()
 	}
 	return RunCounters{}
 }
@@ -164,9 +181,9 @@ func (s *CounterStore) Update(run string, f func(*RunCounters)) {
 		c = &RunCounters{}
 		s.runs[run] = c
 	}
-	before := *c
+	before := c.clone()
 	f(c)
-	if *c != before {
+	if !reflect.DeepEqual(*c, before) {
 		s.dirty = true
 	}
 }
@@ -231,7 +248,10 @@ type Limiter struct {
 	bytes   byteCounter // nil: no kernel (credential identity)
 	store   *CounterStore
 	buckets *RateBuckets
-	now     func() time.Time
+	// Ledger, if set, keeps budgets (milestone 5.4); a run's spend is
+	// written to its metadata as it ends.
+	Ledger *BudgetLedger
+	now    func() time.Time
 
 	mu    sync.Mutex
 	state map[string]*limitState
@@ -271,6 +291,12 @@ func (l *Limiter) RunEnded(runID string, runCg uint64) {
 			l.api.reg.Update(runID, func(m *RunMeta) { m.EgressBytes = &n })
 		}
 		l.bytes.ForgetRunBytes(runCg)
+	}
+	if b := ownedBudgets(l.store.Get(runID)); len(b) > 0 {
+		l.api.reg.Update(runID, func(m *RunMeta) { m.Budgets = b })
+	}
+	if l.Ledger != nil {
+		l.Ledger.forget(runID)
 	}
 	l.store.Delete(runID)
 	if l.buckets != nil {

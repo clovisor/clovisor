@@ -100,6 +100,7 @@ place:
 | Content rules: deny, redact (keeping the length) or record matches in request bodies and query strings, on every host the profile names unless scoped; bodies held and checked whole, with limits that fail closed; remote MCP bodies moved off buffered mode; Envoy's `ext_proc` circuit breaker raised. | [5.1 status](#51-status-2026-11-23) |
 | Limits: duration ends a run, `connections_per_min` and `rate-limit` rules answer 429, and `egress_bytes` is counted and capped in the kernel, then revoked; nested runs charge their parents; byte counts persisted. | [5.2 status](#52-status-2026-11-23) |
 | Model allow-lists: a rule's `model` list checked against the JSON body's top-level `model` and a `model` query parameter; bodies naming none, or naming it twice, refused; models recorded per request, drafted by learn from runs observed under `"*"`, replayed by check. | [5.3 status](#53-status-2026-11-24) |
+| Budgets: a rule's `budget` of tokens and dollars, charged from the usage in each response, streamed or not, at prices from a node `ModelPrices` document; `include_usage` set on OpenAI streams and its chunk removed again; refused once spent, and for unpriced models under a cost budget; nested runs charge their parents; spend persisted and reported. | [5.4 status](#54-status-2026-11-24) |
 
 ---
 
@@ -3604,6 +3605,122 @@ Verified:
 - `make integration-transparent`, now twenty-one checks: `tp-models`, on a
   host terminated for its model rule alone, passed an admitted model and
   refused another, from a client ignoring the proxy.
+
+#### 5.4 status (2026-11-24)
+
+Implemented:
+
+- **`budget: { tokens, cost_usd }`** on an egress rule, either or both.
+  Compile errors: neither set, a negative amount, a `cidr` destination,
+  `no_terminate`, a `deny` rule. A budgeted rule's hosts are terminated,
+  and the receipt places it as `ext_proc (response: usage)`.
+- **Prices** are a `kind: ModelPrices` document in the policy directory:
+  root-owned, reloaded on `SIGHUP`, at most one. Entries are globs with
+  input, output, and optional cache-read and cache-write prices per
+  million tokens; the first match wins. They are node configuration, never
+  part of a profile (finding 5).
+- **Ownership** is as for limits (5.2): a budget belongs to the outermost
+  run holding its layer, so a nested run's calls are charged to its
+  parent's budget. Spending is kept in the counter store, so a node agent
+  restart does not refill a budget.
+- **Refusal.** At headers, a request whose budget is spent gets a narrated
+  403 with reason `budget`, naming the owning run if it is an ancestor. At
+  body, under an enforced cost budget, a request naming a model the node
+  has no price for is refused, since the budget could not be kept. Audit
+  layers record a would-refuse.
+- **Following the response.** A budgeted request with a body is followed
+  to the end of its response:
+  - request body held, response headers and body streamed through;
+  - `Accept-Encoding` removed, so responses arrive readable.
+
+  Usage is read from:
+  - a JSON response's `usage`;
+  - each SSE event's `usage`, `message.usage` or `response.usage`, keeping
+    the largest of each count (Anthropic's are cumulative).
+
+  The shapes read are:
+  - Anthropic: input, output and cache tokens apart;
+  - OpenAI chat: `prompt_tokens` less `cached_tokens`, `completion_tokens`;
+  - OpenAI responses: `input_tokens` less `cached_tokens`, `output_tokens`.
+- **`include_usage`.** A streamed OpenAI chat completion reports usage only
+  if asked (5.0 spikes). For a request to a path ending `/completions`
+  with `"stream": true`, `ext_proc` adds `stream_options.include_usage`,
+  keeping every other key and value as sent, and drops `Content-Length` at
+  headers so the body may grow. If it added it, it takes the usage-only
+  chunk out of the response, passing the stream on event by event. A
+  client that asked for usage itself keeps its chunk.
+- **Charging,** once per call, when the response ends or its stream does:
+  - usage reported: charged as reported, flagged if the response was cut
+    off;
+  - none, on a success: an estimate of a token per four bytes each way,
+    flagged;
+  - none, on an error status: not charged.
+
+  Cost is at the price of the model the response names, or else the
+  request; a call with no price is charged tokens only, and counted as
+  unpriced.
+- **Records.** A `usage` event per call with its tokens, cost, flags and
+  each budget's total after it. A `spend` summary by host and model. On
+  the owning run, `budgets` with the totals, nested runs included, and a
+  limit entry when a budget is reached or refuses. `agentctl events` shows
+  them. `check` names budgeted rules as not replayed.
+
+Decisions:
+
+- **Refuse once spent, without reserving.** A request's cost is known only
+  from its response, so the overrun is bounded by the calls in flight, as
+  finding 2 expected. Reserving an estimate (say, from `max_tokens`) would
+  bound it tighter. It is left for later, since a wrong estimate refuses
+  calls the budget could pay for.
+- **Take out the usage chunk `ext_proc` asked for.** It has empty
+  `choices`, which a client that never asked for it may not expect. The
+  stream is then passed on whole events at a time, which costs nothing a
+  client can see, since an SSE client acts on whole events anyway.
+- **Estimate rather than pass.** A call with no readable usage still
+  spends: an estimate, flagged, keeps a budget from being bypassed by an
+  unexpected response shape. Error responses are not charged, since
+  providers do not bill them.
+- **Unpriced models are refused only under a cost budget.** A token budget
+  needs no price. Under a cost budget, a call that could not be priced
+  would spend without being counted.
+
+Limits:
+
+- A host that is both budgeted and a governed remote MCP server has its
+  responses read for MCP, not usage; such calls are not charged.
+- Under a budget alone, a request body compressed in an encoding
+  `ext_proc` cannot decode is sent as is. Its model is unknown and `include_usage` cannot be set, so an
+  OpenAI stream from it is charged an estimate.
+
+Verified:
+
+- Unit tests:
+  - compile errors, placement, posture and decisions across layers;
+  - parsing prices, and costs with and without cache prices;
+  - usage in every shape;
+  - `include_usage` rewriting;
+  - `ext_proc` with JSON and SSE responses split across chunks, the
+    injected chunk removed and a client's own kept, estimates, errors, a
+    cut-off stream, an unpriced model, a spent budget, and a nested run
+    charging its parent with an audit layer alongside;
+  - the counter store's spend across a restart, the recorder, and loading
+    prices.
+- `make integration`, profile `it-budget`, against a model API in the
+  test origin:
+  - Anthropic calls, streamed and not, charged as reported, the origin
+    seeing no `Accept-Encoding`;
+  - an OpenAI stream given `include_usage`, the client receiving no usage
+    chunk;
+  - the call that passed the 1,000-token budget let through, and the next
+    refused before it was sent;
+  - an unpriced model refused;
+  - `agentctl events` showing 1,140 tokens over four calls, the spend by
+    model, and when the budget was reached.
+- `make integration-transparent`, now twenty-two checks: under
+  `tp-budget`, a parent's call and its nested run's first spent the
+  parent's 500 tokens; the nested run's second was refused by its
+  parent's budget, and the parent's timeline shows 600 tokens over two
+  calls, nested runs included.
 
 #### Proposed decisions
 

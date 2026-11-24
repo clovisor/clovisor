@@ -48,6 +48,9 @@ type RunTimeline struct {
 	EndReason   string     `json:"end_reason,omitempty"`
 	EgressBytes *uint64    `json:"egress_bytes,omitempty"`
 	Limits      []LimitHit `json:"limits,omitempty"`
+	// Budgets are what the run spent of the budgets it owns, nested runs
+	// included (milestone 5.4).
+	Budgets []BudgetState `json:"budgets,omitempty"`
 
 	// Complete is true only if the node agent saw the run from cgroup
 	// creation to removal without interruption. Otherwise events may be
@@ -134,6 +137,23 @@ type RunSummary struct {
 	// ModelsDropped.
 	Models        []ModelUse `json:"models,omitempty"`
 	ModelsDropped int        `json:"models_dropped,omitempty"`
+	// Spend is the run's own budgeted model calls (milestone 5.4), by host
+	// and model: tokens, and cost at the node's prices.
+	Spend []SpendUse `json:"spend,omitempty"`
+}
+
+// SpendUse aggregates one run's budgeted calls to one model on one host.
+type SpendUse struct {
+	Host      string       `json:"host"`
+	Model     string       `json:"model,omitempty"`
+	Requests  int          `json:"requests"`
+	Usage     policy.Usage `json:"usage"`
+	CostUSD   float64      `json:"cost_usd"`
+	Estimated int          `json:"estimated,omitempty"` // no usage in the response: estimated from bytes
+	Unpriced  int          `json:"unpriced,omitempty"`  // no price for the model: tokens only
+	Partial   int          `json:"partial,omitempty"`   // the response did not complete
+	Uncharged int          `json:"uncharged,omitempty"` // error responses without usage
+	Refused   int          `json:"refused,omitempty"`   // refused before they were sent
 }
 
 // ModelUse aggregates requests that named one model on one path. Model is
@@ -279,7 +299,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, model, drop, socket, unix, gap
+	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, model, usage, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -328,6 +348,8 @@ type TimelineEvent struct {
 
 type contentKey struct{ host, layer, rule, reason string }
 
+type spendKey struct{ host, model string }
+
 type modelKey struct {
 	host                        string
 	port                        uint16
@@ -356,6 +378,7 @@ type runState struct {
 	mcp     map[mcpKey]*MCPUse
 	content map[contentKey]*ContentUse
 	models  map[modelKey]*ModelUse
+	spend   map[spendKey]*SpendUse
 	// callFor names the call a cgroup belongs to; calls counts events
 	// per call.
 	callFor func(cgroupID uint64) string
@@ -515,6 +538,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		mcp:      make(map[mcpKey]*MCPUse),
 		content:  make(map[contentKey]*ContentUse),
 		models:   make(map[modelKey]*ModelUse),
+		spend:    make(map[spendKey]*SpendUse),
 		calls:    make(map[string]*CallSummary),
 		callFor: func(cg uint64) string {
 			if r.Meta == nil {
@@ -542,6 +566,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for i := range prev.Summary.Content {
 				u := prev.Summary.Content[i]
 				st.content[contentKey{u.Host, u.Layer, u.Rule, u.Reason}] = &u
+			}
+			for i := range prev.Summary.Spend {
+				u := prev.Summary.Spend[i]
+				st.spend[spendKey{u.Host, u.Model}] = &u
 			}
 			for i := range prev.Summary.Models {
 				u := prev.Summary.Models[i]
@@ -810,6 +838,79 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Note:     d.Where + ": " + strings.Join(notes, "; "),
 		}, r.MaxEvents)
 
+	case EventUsage:
+		d := ev.Data.(UsageData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		k := spendKey{d.Host, d.Model}
+		u := st.spend[k]
+		if u == nil {
+			if len(st.spend) >= MaxModelUses {
+				k = spendKey{d.Host, "(other models)"}
+				u = st.spend[k]
+			}
+			if u == nil {
+				u = &SpendUse{Host: k.host, Model: k.model}
+				st.spend[k] = u
+			}
+		}
+		u.Requests++
+		var note string
+		switch {
+		case d.Refused != "":
+			u.Refused++
+			note = "refused: " + d.Refused
+		case !d.Charged:
+			u.Uncharged++
+			note = fmt.Sprintf("not charged: status %d with no usage", d.Status)
+		default:
+			u.Usage.Input += d.Usage.Input
+			u.Usage.Output += d.Usage.Output
+			u.Usage.CacheRead += d.Usage.CacheRead
+			u.Usage.CacheWrite += d.Usage.CacheWrite
+			note = fmt.Sprintf("%d in, %d out", d.Usage.Input, d.Usage.Output)
+			if c := d.Usage.CacheRead + d.Usage.CacheWrite; c > 0 {
+				note += fmt.Sprintf(", %d cache", c)
+			}
+			if d.Priced {
+				u.CostUSD += d.CostUSD
+				note += fmt.Sprintf(", $%.6f", d.CostUSD)
+			} else {
+				u.Unpriced++
+				note += ", unpriced"
+			}
+			if d.Estimated {
+				u.Estimated++
+				note += " (estimated: no usage in the response)"
+			}
+			if d.Partial {
+				u.Partial++
+				note += " (response incomplete)"
+			}
+			for _, b := range d.Budgets {
+				of := ""
+				if b.Run != "" {
+					of = " of run " + b.Run
+				}
+				note += fmt.Sprintf("; budget %s/%s%s now %d tokens, $%.4f", b.Layer, b.Rule, of, b.Tokens, b.CostUSD)
+			}
+		}
+		st.add(TimelineEvent{
+			Time:     ev.Timestamp,
+			Type:     "usage",
+			CgroupID: ev.CgroupID,
+			Method:   d.Method,
+			DstName:  d.Host,
+			DstPort:  d.Port,
+			Path:     d.Path,
+			Model:    d.Model,
+			Rule:     d.Rule,
+			Layer:    d.Layer,
+			Note:     note,
+		}, r.MaxEvents)
+
 	case EventModel:
 		d := ev.Data.(ModelData)
 		st := r.state(ev, "")
@@ -1032,7 +1133,7 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	if len(m.Children) > 0 {
 		tl.Children = m.Children
 	}
-	tl.EndReason, tl.EgressBytes, tl.Limits = m.EndReason, m.EgressBytes, m.Limits
+	tl.EndReason, tl.EgressBytes, tl.Limits, tl.Budgets = m.EndReason, m.EgressBytes, m.Limits, m.Budgets
 	if len(m.Calls) > 0 {
 		tl.Calls = make([]CallSummary, 0, len(m.Calls))
 		for _, c := range m.Calls {
@@ -1093,6 +1194,18 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 			return a.Layer+"/"+a.Rule < b.Layer+"/"+b.Rule
 		}
 		return a.Reason < b.Reason
+	})
+
+	tl.Summary.Spend = nil
+	for _, u := range st.spend {
+		tl.Summary.Spend = append(tl.Summary.Spend, *u)
+	}
+	sort.Slice(tl.Summary.Spend, func(i, j int) bool {
+		a, b := tl.Summary.Spend[i], tl.Summary.Spend[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		return a.Model < b.Model
 	})
 
 	tl.Summary.Models = nil

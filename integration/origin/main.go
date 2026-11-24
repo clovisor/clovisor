@@ -20,6 +20,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -91,6 +92,8 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{"len": len(b), "content_length": r.Header.Get("Content-Length"),
 				"chunked": len(r.TransferEncoding) > 0, "body": string(b[:min(len(b), 256)])})
+		case r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/chat/completions":
+			serveModel(w, r)
 		case r.URL.Path == "/headers":
 			hs := map[string]string{}
 			for k, v := range r.Header {
@@ -153,4 +156,67 @@ func serveMCP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": m.ID, "result": result})
+}
+
+// serveModel is a model API shaped like Anthropic's messages or OpenAI's
+// chat completions (milestone 5.4): 100 input tokens (40 for OpenAI),
+// max_tokens output tokens, streamed or not. The reply's text says what
+// arrived: whether include_usage was set, and the Accept-Encoding.
+func serveModel(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Model         string `json:"model"`
+		Stream        bool   `json:"stream"`
+		MaxTokens     int    `json:"max_tokens"`
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.MaxTokens == 0 {
+		req.MaxTokens = 50
+	}
+	usage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	text := fmt.Sprintf("include_usage=%v accept-encoding=%q", usage, r.Header.Get("Accept-Encoding"))
+	flush := func() {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	event := func(name string, v interface{}) {
+		b, _ := json.Marshal(v)
+		if name != "" {
+			fmt.Fprintf(w, "event: %s\n", name)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flush()
+	}
+	type obj = map[string]interface{}
+	anthropic := r.URL.Path == "/v1/messages"
+	switch {
+	case anthropic && !req.Stream:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(obj{"type": "message", "model": req.Model, "content": []obj{{"type": "text", "text": text}},
+			"usage": obj{"input_tokens": 100, "output_tokens": req.MaxTokens}})
+	case anthropic:
+		w.Header().Set("Content-Type", "text/event-stream")
+		event("message_start", obj{"type": "message_start", "message": obj{"model": req.Model, "usage": obj{"input_tokens": 100, "output_tokens": 1}}})
+		event("content_block_delta", obj{"type": "content_block_delta", "delta": obj{"type": "text_delta", "text": text}})
+		event("message_delta", obj{"type": "message_delta", "usage": obj{"output_tokens": req.MaxTokens}})
+		event("message_stop", obj{"type": "message_stop"})
+	case !req.Stream:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(obj{"model": req.Model, "choices": []obj{{"message": obj{"content": text}}},
+			"usage": obj{"prompt_tokens": 40, "completion_tokens": req.MaxTokens}})
+	default:
+		w.Header().Set("Content-Type", "text/event-stream")
+		var u interface{}
+		event("", obj{"model": req.Model, "choices": []obj{{"delta": obj{"content": text}}}, "usage": u})
+		if usage {
+			event("", obj{"model": req.Model, "choices": []obj{}, "usage": obj{"prompt_tokens": 40, "completion_tokens": req.MaxTokens}})
+		}
+		io.WriteString(w, "data: [DONE]\n\n")
+	}
 }

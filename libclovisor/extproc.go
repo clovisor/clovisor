@@ -113,6 +113,8 @@ type ExtProcServer struct {
 	// Rates are the connection and request allowances (milestone 5.2),
 	// shared with the limiter, which forgets a run's as it ends.
 	Rates *RateBuckets
+	// Budgets keeps model call budgets (milestone 5.4); nil: none charged.
+	Budgets *BudgetLedger
 }
 
 type resolved struct {
@@ -241,12 +243,16 @@ func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
 			if mcp != nil {
 				resp = s.onMCPResponseHeaders(mcp, r.ResponseHeaders)
+			} else if b := st.budgetStream(); b != nil {
+				resp = s.onBudgetResponseHeaders(b, r.ResponseHeaders)
 			} else {
 				resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extprocv3.HeadersResponse{}}}
 			}
 		case *extprocv3.ProcessingRequest_ResponseBody:
 			if mcp != nil {
 				resp = s.onMCPResponseBody(mcp, r.ResponseBody.GetBody(), r.ResponseBody.GetEndOfStream())
+			} else if b := st.budgetStream(); b != nil {
+				resp = s.onBudgetResponseBody(b, r.ResponseBody.GetBody(), r.ResponseBody.GetEndOfStream())
 			} else {
 				resp = &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_ResponseBody{ResponseBody: &extprocv3.BodyResponse{}}}
 			}
@@ -384,7 +390,12 @@ func (s *ExtProcServer) resolvesTo(host string, a netip.Addr) bool {
 // if any, is for a request whose body or MCP traffic ext_proc inspects.
 func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *streamState) {
 	resp, o := s.decideHeaders(ctx, req, h)
-	if resp.GetImmediateResponse() != nil || (o.mcp == nil && !o.content && len(o.models) == 0) {
+	hasBody := !h.GetEndOfStream()
+	if !hasBody {
+		// A request with no body calls no model: nothing to charge.
+		o.budgets = nil
+	}
+	if resp.GetImmediateResponse() != nil || (o.mcp == nil && !o.content && len(o.models) == 0 && len(o.budgets) == 0) {
 		return resp, nil
 	}
 	hm := h.GetHeaders()
@@ -397,8 +408,16 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 		d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, reason, msg
 		return s.denyStatus(d, o.runID, code), nil
 	}
-	hasBody := !h.GetEndOfStream()
 	enc := ""
+	if hasBody && !o.content && len(o.models) == 0 {
+		// Budgets alone: an encoding that cannot be read only means the
+		// model and size are unknown, and include_usage cannot be set.
+		if e, ok := bodyEncoding(headerValue(hm, "content-encoding")); ok {
+			enc = e
+		} else {
+			enc = encodingUnreadable
+		}
+	}
 	if hasBody && (o.content || len(o.models) > 0) {
 		ce := headerValue(hm, "content-encoding")
 		e, ok := bodyEncoding(ce)
@@ -424,6 +443,20 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	if hasBody {
 		st.body = &heldBody{d: d, runID: o.runID, runCg: o.runCg, leaf: o.leaf, eff: o.eff, content: o.content, models: o.models, queryModel: o.queryModel, encoding: enc, max: maxBody}
 	}
+	if len(o.budgets) > 0 && o.mcp == nil {
+		// Budgets (milestone 5.4): follow the response to read its usage.
+		// Responses are asked for uncompressed, so they can be read; a
+		// request that may need include_usage set loses its length.
+		st.budget = &budgetStream{owners: o.budgets, d: d, runID: o.runID, leaf: o.leaf, runCg: o.runCg,
+			mayInject: mayInjectUsage(d.Path), max: maxBody}
+		remove := []string{"accept-encoding"}
+		if st.budget.mayInject {
+			remove = append(remove, "content-length")
+		}
+		resp.GetRequestHeaders().Response = &extprocv3.CommonResponse{HeaderMutation: &extprocv3.HeaderMutation{RemoveHeaders: remove}}
+		resp.ModeOverride = budgetModes
+		return resp, st
+	}
 	switch {
 	case o.mcp != nil:
 		resp.ModeOverride = mcpModes
@@ -448,11 +481,13 @@ type headerOutcome struct {
 	// queryModel: the query string named an admitted model, so a body
 	// need not name one too.
 	queryModel bool
-	d          HTTPData
-	runID      string
-	runCg      uint64
-	leaf       uint64
-	eff        *policy.Effective
+	// budgets are the budgets the request is charged to (milestone 5.4).
+	budgets []budgetOwner
+	d       HTTPData
+	runID   string
+	runCg   uint64
+	leaf    uint64
+	eff     *policy.Effective
 }
 
 func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, headerOutcome) {
@@ -503,6 +538,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	}
 	runID, eff, isRun, cg, runCg := "", (*policy.Effective)(nil), false, uint64(0), uint64(0)
 	var models []policy.ModelCheck
+	var budgets []budgetOwner
 	var src, dst netip.AddrPort
 	var err1, err2 error
 	if transparentHTTP {
@@ -660,6 +696,14 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 				return r, headerOutcome{}
 			}
 		}
+		if phase == policy.PhaseRequest && ed.Allowed() && len(ed.Budgets) > 0 && (d.Decision != policy.ActionDeny || !d.Enforced) {
+			// Budgets (milestone 5.4): refused once spent.
+			budgets = s.budgetOwners(ed, eff, runID)
+			if !s.checkBudgets(&d, budgets, runID) {
+				s.record(cg, runCg, runID, d)
+				return s.deny(d, runID), headerOutcome{}
+			}
+		}
 	} else {
 		d.Reason = "unprofiled run"
 	}
@@ -667,7 +711,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	if d.Decision == policy.ActionDeny && d.Enforced {
 		return s.deny(d, runID), headerOutcome{}
 	}
-	out := headerOutcome{d: d, runID: runID, runCg: runCg, leaf: cg, eff: eff}
+	out := headerOutcome{d: d, runID: runID, runCg: runCg, leaf: cg, eff: eff, budgets: budgets}
 	if eff != nil && phase == policy.PhaseRequest && eff.InspectsContent(host) {
 		// Content rules cover this host (milestone 5.1): check the query
 		// string now, and hold the body.

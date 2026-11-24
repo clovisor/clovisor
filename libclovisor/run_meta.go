@@ -44,6 +44,9 @@ type RunMeta struct {
 	EgressBytes *uint64 `json:"egress_bytes,omitempty"`
 	// Limits are the limits the run reached, and what was done.
 	Limits []LimitHit `json:"limits,omitempty"`
+	// Budgets are what the run spent of the budgets it owns, nested runs
+	// included (milestone 5.4).
+	Budgets []BudgetState `json:"budgets,omitempty"`
 }
 
 // LimitHit is one limit a run reached (milestone 5.2).

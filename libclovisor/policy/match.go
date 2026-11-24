@@ -149,6 +149,8 @@ type Decision struct {
 	rate *compiledRate
 	// models is the deciding rule's model list (milestone 5.3).
 	models *compiledModels
+	// budget is the deciding rule's budget (milestone 5.4).
+	budget *compiledBudget
 	// Deferred is set at PhaseConnect when the first matching rule needs
 	// method or path. The connection is let through to termination, and
 	// each request inside it gets its own decision. Offline, it means the
@@ -208,7 +210,7 @@ func (cp *CompiledProfile) Decide(req Request) Decision {
 		if !r.matchesDestination(req) {
 			continue
 		}
-		if (r.http != nil || r.models != nil) && req.Phase == PhaseConnect {
+		if (r.http != nil || r.models != nil || r.budget != nil) && req.Phase == PhaseConnect {
 			// Only an HTTP request can tell whether this rule or a later
 			// one decides, or which model it names; the destination is
 			// terminated for that.
@@ -217,7 +219,7 @@ func (cp *CompiledProfile) Decide(req Request) Decision {
 		if !r.matchesHTTP(req) {
 			continue
 		}
-		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate, models: r.models}
+		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate, models: r.models, budget: r.budget}
 	}
 	return Decision{Action: cp.DefaultAction, Message: cp.defaultMessage(req)}
 }

@@ -95,6 +95,7 @@ type compiledRule struct {
 	http    *HTTPMatch
 	rate    *compiledRate
 	models  *compiledModels
+	budget  *compiledBudget
 	src     EgressRule
 }
 
@@ -176,7 +177,6 @@ var notYet = map[string]string{
 	"mode ask":        "the approval UI (Phase 5)",
 	"action ask":      "the approval UI (Phase 5)",
 	"action redirect": "transparent mode (Phase 3)",
-	"budget":          "budgets (Phase 5)",
 	"exec hash":       "IMA hash verification (Phase 4)",
 	"sampling ask":    "the approval UI (Phase 5)",
 }
@@ -364,7 +364,7 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 			cr.models = c.model(where, r)
 		}
 		if r.Budget != nil {
-			c.unsupported(where, "budget")
+			cr.budget = c.budget(where, r)
 		}
 
 		if r.HTTP != nil {
@@ -412,15 +412,18 @@ func onlyPort80(ports []uint16) bool {
 func (c *compiler) placeEgress(r EgressRule) Placement {
 	pl := Placement{Rule: r.Name, Tier: "2"}
 	switch {
-	case r.HTTP != nil || r.Model != nil:
-		switch {
-		case r.HTTP == nil:
-			pl.EnforcedBy = "ext_proc (body: model field)"
-		case r.Model == nil:
-			pl.EnforcedBy = "ext_proc (method and path)"
-		default:
-			pl.EnforcedBy = "ext_proc (method and path; body: model field)"
+	case r.HTTP != nil || r.Model != nil || r.Budget != nil:
+		var by []string
+		if r.HTTP != nil {
+			by = append(by, "method and path")
 		}
+		if r.Model != nil {
+			by = append(by, "body: model field")
+		}
+		if r.Budget != nil {
+			by = append(by, "response: usage")
+		}
+		pl.EnforcedBy = "ext_proc (" + strings.Join(by, "; ") + ")"
 		if onlyPort80(r.To.Ports) {
 			pl.Notes = append(pl.Notes, "plaintext HTTP")
 		} else {
@@ -428,6 +431,9 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 		}
 		if r.Model != nil {
 			pl.Notes = append(pl.Notes, modelNotes(r)...)
+		}
+		if r.Budget != nil {
+			pl.Notes = append(pl.Notes, budgetNotes(r)...)
 		}
 	case len(r.To.FQDN) > 0:
 		pl.EnforcedBy = "ext_proc (CONNECT authority or Host)"
@@ -445,7 +451,7 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 			pl.Notes = append(pl.Notes, "matches every host")
 		}
 	}
-	if r.Action != ActionDeny && r.HTTP == nil && r.Model == nil && len(r.To.FQDN) > 0 && !onlyPort80(r.To.Ports) {
+	if r.Action != ActionDeny && r.HTTP == nil && r.Model == nil && r.Budget == nil && len(r.To.FQDN) > 0 && !onlyPort80(r.To.Ports) {
 		pl.Notes = append(pl.Notes, "not terminated: domain-fronting exposed (design §7.5)")
 	}
 	if r.Action == ActionTagAndLog {
@@ -662,19 +668,22 @@ func (c *compiler) posture(profiles []*AgentProfile) []DestPosture {
 				if r.NoTerminate {
 					d.noTerm = append(d.noTerm, p.Metadata.Name+"/"+r.Name)
 				}
-				if r.HTTP != nil || r.Model != nil {
+				if r.HTTP != nil || r.Model != nil || r.Budget != nil {
 					d.needs = true
 					d.needers[p.Metadata.Name] = true
 					if !onlyPort80(r.To.Ports) {
 						d.plain = false
 					}
-					what := "http"
-					switch {
-					case r.HTTP == nil:
-						what = "model"
-					case r.Model != nil:
-						what = "http, model"
+					var whats []string
+					for _, w := range []struct {
+						on   bool
+						name string
+					}{{r.HTTP != nil, "http"}, {r.Model != nil, "model"}, {r.Budget != nil, "budget"}} {
+						if w.on {
+							whats = append(whats, w.name)
+						}
 					}
+					what := strings.Join(whats, ", ")
 					d.why = append(d.why, fmt.Sprintf("%s (%s: %s)", p.Metadata.Name, r.Name, what))
 				}
 			}
