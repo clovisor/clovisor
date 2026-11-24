@@ -168,7 +168,7 @@ func (e *Effective) Net() NetGrant {
 	g := e.Ceiling
 	enforcing := false
 	for _, l := range e.Layers {
-		if l.Profile.Mode != ModeEnforce {
+		if !l.Profile.Enforcing() {
 			continue
 		}
 		enforcing = true

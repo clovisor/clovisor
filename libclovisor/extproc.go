@@ -67,6 +67,8 @@ type HTTPData struct {
 	// name, which the node's resolver had answered with the address for
 	// this run (transparent mode).
 	ResolvedName string
+	// Ask is how a request an ask rule held was settled (milestone 5.5).
+	Ask *AskData
 }
 
 // ExtProcServer decides proxied requests for runs (milestone 2.3). It
@@ -115,6 +117,9 @@ type ExtProcServer struct {
 	Rates *RateBuckets
 	// Budgets keeps model call budgets (milestone 5.4); nil: none charged.
 	Budgets *BudgetLedger
+	// Asks holds requests for a person's decision (milestone 5.5); nil:
+	// ask rules refuse.
+	Asks *AskQueue
 }
 
 type resolved struct {
@@ -214,6 +219,8 @@ func (s *ExtProcServer) Close() {
 func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
 	var st *streamState // set when this stream's body or JSON-RPC is inspected
 	defer func() { st.done(s) }()
+	// A held ask extends Envoy's timer for the message it answers.
+	ctx := withExtender(stream.Context(), func(d time.Duration) error { return stream.Send(overrideTimeout(d)) })
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -227,7 +234,7 @@ func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer
 		switch r := req.GetRequest().(type) {
 		case *extprocv3.ProcessingRequest_RequestHeaders:
 			st.done(s)
-			resp, st = s.onHeaders(stream.Context(), req, r.RequestHeaders)
+			resp, st = s.onHeaders(ctx, req, r.RequestHeaders)
 		case *extprocv3.ProcessingRequest_RequestBody:
 			if st != nil && st.body != nil {
 				var pre *extprocv3.ProcessingResponse
@@ -681,6 +688,19 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			d.Message = fmt.Sprintf("Content rules cover %s, but this proxy cannot read what is sent inside this TLS tunnel. "+
 				"An operator must restart Envoy with the current configuration.", host)
 		}
+		if len(ed.WouldAsk) > 0 && d.Reason == "" {
+			d.Reason = "audit: would ask"
+		}
+		if ed.Asks() && d.Decision == policy.ActionAsk {
+			// Ask (milestone 5.5): held for a person. A tunnel Envoy
+			// terminates is asked about request by request instead.
+			if phase == policy.PhaseConnect && terminated {
+				d.Decision, d.Reason = policy.ActionAllow, "terminated: asked per request"
+			} else if code := s.ask(ctx, &d, ed, runID, askWhat(d)); code != 0 {
+				s.record(cg, runCg, runID, d)
+				return s.denyStatus(d, runID, code), headerOutcome{}
+			}
+		}
 		if d.Decision != policy.ActionDeny || !d.Enforced {
 			// Limits (milestone 5.2). A connection: a CONNECT, or plain
 			// HTTP from the run itself. A request: anything but a CONNECT
@@ -733,7 +753,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	}
 	if eff != nil && phase == policy.PhaseRequest && eff.GovernsRemoteMCP(host) {
 		// A remote MCP server for this run: inspect its JSON-RPC.
-		out.mcp = &remoteMCP{host: policy.NormalizeHost(host), runID: runID, runCg: runCg, eff: eff}
+		out.mcp = &remoteMCP{host: policy.NormalizeHost(host), runID: runID, runCg: runCg, eff: eff, ctx: ctx}
 	}
 	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
 		RequestHeaders: &extprocv3.HeadersResponse{},

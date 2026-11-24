@@ -782,6 +782,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Layer:     d.Layer,
 			WouldDeny: d.WouldDeny,
 			Reason:    d.Reason,
+			Note:      askNote(d.Ask),
 		}, r.MaxEvents)
 
 	case EventContent:
@@ -983,6 +984,7 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Layer:     d.Layer,
 			WouldDeny: d.WouldDeny,
 			Reason:    d.Reason,
+			Note:      askNote(d.Ask),
 
 			Transparent:  d.Transparent,
 			OrigDst:      d.OrigDst,

@@ -230,7 +230,7 @@ func TestEnvoyBootstrap(t *testing.T) {
 	s := string(b)
 	for _, want := range []string{`"path": "/run/clovisor/envoy-admin.sock"`, `"path": "/run/clovisor/extproc.sock"`,
 		`"failure_mode_allow": false`, `"port_value": 18000`, `"connect_matcher"`,
-		`"max_message_timeout": "30s"`, `"max_requests": 1000000`} {
+		`"max_message_timeout": "300s"`, `"max_requests": 1000000`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("bootstrap lacks %s", want)
 		}

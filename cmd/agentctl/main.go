@@ -55,6 +55,9 @@ func printUsage(code int) {
 	fmt.Println("                                    Show a tool's pinned and changed definitions")
 	fmt.Println("  agentctl pins approve <server> (<tool> <hash> | --all)")
 	fmt.Println("                                    Accept changed definitions as the new pins (root)")
+	fmt.Println("  agentctl pending [--all]          List requests held for a decision (ask rules); --all: recent ones too")
+	fmt.Println("  agentctl approve [--remember] <id>")
+	fmt.Println("  agentctl deny [--remember] <id>   Decide a held request; --remember: requests like it, for the rest of the run")
 	fmt.Println("  agentctl cgroups                  List active run cgroups (cgroup identity)")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -858,6 +861,9 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if e.Reason != "" {
 				detail += " [" + e.Reason + "]"
 			}
+			if e.Note != "" {
+				detail += " (" + e.Note + ")"
+			}
 		case "http":
 			detail = fmt.Sprintf("%s %s%s -> %s", e.Method, net.JoinHostPort(e.DstName, strconv.Itoa(int(e.DstPort))), e.Path, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -874,6 +880,9 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			}
 			if e.Reason != "" {
 				detail += " [" + e.Reason + "]"
+			}
+			if e.Note != "" {
+				detail += " (" + e.Note + ")"
 			}
 		case "dns":
 			detail = fmt.Sprintf("%s %s %s from %s", e.Query, e.QType, e.RCode, e.Server)
@@ -1267,6 +1276,11 @@ func main() {
 		}
 	case "pins":
 		if err := pinsCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "pending", "approve", "deny":
+		if err := asksCommand(command, os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

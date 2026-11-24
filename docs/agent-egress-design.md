@@ -101,6 +101,7 @@ place:
 | Limits: duration ends a run, `connections_per_min` and `rate-limit` rules answer 429, and `egress_bytes` is counted and capped in the kernel, then revoked; nested runs charge their parents; byte counts persisted. | [5.2 status](#52-status-2026-11-23) |
 | Model allow-lists: a rule's `model` list checked against the JSON body's top-level `model` and a `model` query parameter; bodies naming none, or naming it twice, refused; models recorded per request, drafted by learn from runs observed under `"*"`, replayed by check. | [5.3 status](#53-status-2026-11-24) |
 | Budgets: a rule's `budget` of tokens and dollars, charged from the usage in each response, streamed or not, at prices from a node `ModelPrices` document; `include_usage` set on OpenAI streams and its chunk removed again; refused once spent, and for unpriced models under a cost budget; nested runs charge their parents; spend persisted and reported. | [5.4 status](#54-status-2026-11-24) |
+| Ask: `action: ask`, `mode: ask` and `sampling: ask` hold a request in the node agent's queue until a person decides over the run API, or its timeout; decisions refused from inside a run, and needing root with credential identity; remembered decisions; held requests capped; open question 3 answered for host deployments. | [5.5 status](#55-status-2026-11-24) |
 
 ---
 
@@ -3722,6 +3723,117 @@ Verified:
   parent's budget, and the parent's timeline shows 600 tokens over two
   calls, nested runs included.
 
+#### 5.5 status (2026-11-24)
+
+Implemented:
+
+- **`action: ask`** on an egress rule, with an optional
+  `ask: { timeout, on_timeout }`. `spec.ask` sets a profile's defaults.
+  The timeout runs from 1s to 4m, by default 2m; `on_timeout` is `deny`
+  (the default) or `allow`. The rule's `message` is shown to whoever
+  decides.
+- **`mode: ask`** is enforce, except that what the egress default would
+  refuse is asked about, with `spec.ask`'s settings.
+  - Explicit deny rules still deny.
+  - Exec, Unix sockets, UDP and ICMP are enforced, since a system call
+    cannot wait for a person.
+  - The receipt has a `(mode ask)` entry saying so.
+- **`sampling: ask`** holds an MCP server's `sampling/createMessage`,
+  remote (in the response stream) or local (in the gateway, in its own
+  goroutine, so the server's other messages keep flowing). Denied, the
+  local server gets a JSON-RPC error and the remote one gets nothing, as
+  before; the client never sees it.
+- **Layers.** An enforcing layer's ask holds the request; an enforcing
+  deny in another layer still refuses first; an audit layer records
+  `would ask`. With several asks, the shortest timeout applies, and a
+  timeout allows only if every ask allows on timeout.
+- **Holding, in `ext_proc`.** At headers it extends Envoy's message timer
+  once, to the timeout plus 10 seconds, and waits on the queue. Envoy's
+  `max_message_timeout` is now 300s.
+  - A tunnel Envoy does not terminate is asked about once.
+  - On a terminated host the CONNECT passes, and each request is asked
+    about.
+  - A client that goes away cancels the stream, and the request is
+    settled as abandoned.
+- **The queue** is in the node agent:
+  - IDs, the run and its owner, what was asked, the rule and its message;
+  - for sampling, the start of the request's params.
+
+  It holds at most 256 requests, 32 per run; past that, a narrated 503.
+  Settled requests stay listed for 10 minutes. The node agent logs each
+  request as it is held and as it is settled.
+- **Deciding,** over the run API (`pending`, `ask_decide`), with
+  `agentctl pending [--all]`, `approve` and `deny`.
+  - `--remember` makes a decision stand for the rest of the run, for that
+    rule on that host, and works on a request already timed out or
+    abandoned.
+  - A run's end settles what it holds and forgets its remembered
+    decisions.
+- **Who decides.** Never from inside a run (cgroup identity knows that
+  from the caller's cgroup). Otherwise, the run's owner or root with
+  cgroup identity, and root only with credential identity.
+- **Records.** Each held request's HTTP or MCP record carries its id,
+  outcome, who decided and how long it waited, shown in `agentctl events`.
+  `check` lists what a profile would ask about.
+
+Decisions:
+
+- **No decisions from inside a run.** A decision grants what policy did
+  not; an agent able to approve its own requests makes ask pointless. With
+  credential identity a run's processes are indistinguishable from their
+  owner's, so only root decides there. An agent itself running as root
+  could still approve itself, which the guide says.
+- **Ask at headers.** Whoever decides sees the method, host and path. Not
+  the body: holding at the body would delay asking until a large upload
+  has arrived, and ask is for whether a write should happen, not for its
+  content, which content rules check.
+- **4 minutes at most.** A held stream carries no traffic, and Envoy ends
+  streams idle for 5 minutes. Raising the idle timeout would loosen it for
+  every stream on the node; remembered decisions cover clients that time
+  out sooner.
+- **Mode ask does not open DNS.** The resolver answers a name only if a
+  rule could allow or ask about it. Forwarding every name, so that the
+  default could ask about it, is what DNS tunnelling needs.
+- **Remember by rule and host.** Narrower (by path) would ask again for
+  every package a resolver fetches; broader (by rule) would let one
+  approval for a host cover another.
+
+Limits:
+
+- Held requests and remembered decisions live in memory: a node agent
+  restart drops them, and the held clients get an error.
+- Envoy honours one timer extension per stream. A request held at headers
+  whose body is then checked for content rules has no extension left. A
+  body taking more than 200 ms to check (over about 1 MiB) is expected to
+  get Envoy's 504, as an unextended hold did in the 5.0 spike; this was
+  not tested.
+- Many clients time out well before 2 minutes (pip after 15 seconds). They
+  see a connection error, not the narration; `--remember` lets the retry
+  pass.
+
+Verified:
+
+- Unit tests:
+  - compile errors, placements, decisions across layers, mode ask
+    (explicit denies, names), sampling;
+  - the queue: approve, deny, remember (also after abandoning), timeouts
+    both ways, a client going away, the per-run cap, a run ending;
+  - `ext_proc` holding a CONNECT and a request, the timer extension, a
+    terminated CONNECT passed, no queue;
+  - the gateway holding a sampling request and refusing it to the server;
+  - the run API refusing an owner's decision with credential identity.
+- `make integration`, profile `it-ask`:
+  - a read held and approved with `agentctl approve`;
+  - the next denied with `--remember`, and the third refused without
+    asking;
+  - a POST no one decided let through after its 2s timeout;
+  - each outcome, and who decided, in `agentctl events` and
+    `agentctl pending --all`.
+- `make integration-transparent`, now twenty-three checks: under
+  `tp-ask` (mode ask), `agentctl pending` from inside the run was refused,
+  the ask rule's name resolved and an unlisted one did not, and the held
+  request was approved from outside and reached the origin.
+
 #### Proposed decisions
 
 - **Budgets are eventually consistent.** A small overrun is acceptable;
@@ -3788,6 +3900,10 @@ Verified:
    [§5.3](#53-attribution-identity-the-async-problem).
 3. **`ext_proc` ask-hold concurrency bound** — how many held streams before
    Envoy workers are at risk, and what is the right shed behavior.
+   *Answered for host deployments in 5.5:* the 5.0 spike held 4,000 with
+   other traffic unaffected once the `ext_proc` circuit breaker was
+   raised. The node agent holds at most 256, 32 per run, and refuses past
+   that with a narrated 503.
 4. **Reconcile loop for orphaned runs** — node agent restarts, harness crashes,
    cgroups outliving their policy entries. Standard controller reconcile, but the
    fail-closed ordering needs care.

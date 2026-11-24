@@ -19,7 +19,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +59,7 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end, call, call_end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status
+	Op       string   `json:"op"` // create, attach, end, call, call_end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status, pending, ask_decide
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
@@ -79,6 +81,12 @@ type RunAPIRequest struct {
 	PinsAll   bool   `json:"pins_all,omitempty"` // pins: include pins with no pending change
 	// CallName labels a tool call (op call): the harness's name for it.
 	CallName string `json:"call_name,omitempty"`
+	// AskID, Approve and Remember decide a held request (op ask_decide);
+	// AsksAll lists recently settled requests too (op pending).
+	AskID    string `json:"ask_id,omitempty"`
+	Approve  bool   `json:"approve,omitempty"`
+	Remember bool   `json:"remember,omitempty"`
+	AsksAll  bool   `json:"asks_all,omitempty"`
 }
 
 // RunAPIResponse is the agent's reply to each request.
@@ -111,6 +119,8 @@ type RunAPIResponse struct {
 	Approved []string   `json:"approved,omitempty"`
 	// status:
 	Status *NodeStatus `json:"status,omitempty"`
+	// pending, ask_decide:
+	Asks []PendingAsk `json:"asks,omitempty"`
 }
 
 // RunRegistry holds metadata for runs created through the API until the
@@ -263,6 +273,8 @@ type RunAPIServer struct {
 	MCP *MCPGateway
 	// Pins is the node's tool-definition pin store, if MCP is governed.
 	Pins *PinStore
+	// Asks is the queue of requests held for a person (milestone 5.5).
+	Asks *AskQueue
 	// TrustBundle and NodeCACert are handed to runs when the proxy
 	// terminates TLS.
 	TrustBundle, NodeCACert string
@@ -304,6 +316,22 @@ type boundRun struct {
 	cgroupID uint64
 	eff      *policy.Effective // replaced, never mutated, under RunAPIServer.mu
 	started  time.Time
+}
+
+// ownerOf is the uid a live run belongs to, or -1.
+func (s *RunAPIServer) ownerOf(runID string) int {
+	s.mu.Lock()
+	b := s.bound[runID]
+	s.mu.Unlock()
+	if b != nil {
+		return b.uid
+	}
+	if s.reg != nil {
+		if m, ok := s.reg.Get(runID); ok {
+			return m.UID
+		}
+	}
+	return -1
 }
 
 // runLink is one run in a chain of nested runs.
@@ -716,6 +744,8 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		return ac.mcpRegister(req)
 	case "pins", "pin_approve":
 		return ac.pins(req)
+	case "pending", "ask_decide":
+		return ac.asks(req)
 	case "status":
 		if ac.s.Status == nil {
 			return fail("status unavailable")
@@ -1410,6 +1440,18 @@ func (rc *RunAPIClient) ApprovePin(server, tool, hash string) (RunAPIResponse, e
 	return rc.call(RunAPIRequest{Op: "pin_approve", PinServer: server, PinTool: tool, PinHash: hash})
 }
 
+// Pending lists requests held for a decision; with all, recently settled
+// ones too (milestone 5.5).
+func (rc *RunAPIClient) Pending(all bool) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "pending", AsksAll: all})
+}
+
+// DecideAsk approves or denies a held request; remember makes the
+// decision stand for the rest of the run.
+func (rc *RunAPIClient) DecideAsk(id string, approve, remember bool) (RunAPIResponse, error) {
+	return rc.call(RunAPIRequest{Op: "ask_decide", AskID: id, Approve: approve, Remember: remember})
+}
+
 // Revoke denies all further egress for a live run.
 func (rc *RunAPIClient) Revoke(runID string) (RunAPIResponse, error) {
 	return rc.call(RunAPIRequest{Op: "revoke", RunID: runID})
@@ -1580,4 +1622,54 @@ func (rc *RunAPIClient) Call(name string, command []string) (RunAPIResponse, err
 func (rc *RunAPIClient) CallEnd(exitCode *int) error {
 	_, err := rc.call(RunAPIRequest{Op: "call_end", ExitCode: exitCode})
 	return err
+}
+
+// asks lists and decides requests held for a person (milestone 5.5). A
+// decision grants what policy did not, so it is never taken from inside
+// a run: an agent must not approve its own requests. With cgroup identity
+// that is known from the caller's cgroup, and a run's owner may decide on
+// its requests. With credential identity a run's processes are in no
+// cgroup and run as its owner, so only root decides.
+func (ac *apiConn) asks(req RunAPIRequest) RunAPIResponse {
+	q := ac.s.Asks
+	if q == nil {
+		return fail("this node agent holds no requests for approval (no proxy and no MCP gateway)")
+	}
+	uid := int(ac.cred.Uid)
+	if ac.s.cm != nil {
+		cg, err := procCgroup(int(ac.cred.Pid))
+		if err != nil {
+			return fail("cannot read caller's cgroup: %v", err)
+		}
+		if ac.s.inAgents(cg) {
+			return fail("requests held for approval cannot be seen or decided from inside a run")
+		}
+	}
+	see := func(p PendingAsk) bool { return uid == 0 || p.UID == uid }
+	if req.Op == "pending" {
+		return RunAPIResponse{OK: true, Asks: q.List(see, req.AsksAll)}
+	}
+	if req.AskID == "" {
+		return fail("ask_decide needs a request id (agentctl pending lists them)")
+	}
+	if uid != 0 && ac.s.cm == nil {
+		return fail("with credential identity only root decides on held requests: a run's processes run as its owner, " +
+			"so a decision by the owner could be the agent's own. Use sudo agentctl")
+	}
+	by := fmt.Sprintf("uid %d", uid)
+	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil {
+		by = fmt.Sprintf("%s (uid %d)", u.Username, uid)
+	}
+	p, err := q.Decide(req.AskID, req.Approve, req.Remember, by, func(p PendingAsk) error {
+		if !see(p) {
+			return fmt.Errorf("request %s belongs to another user's run", req.AskID)
+		}
+		return nil
+	})
+	if err != nil {
+		return fail("%v", err)
+	}
+	log.Printf("run api: %s %s request %s of run %s (%s)%s", by, map[bool]string{true: "approved", false: "denied"}[req.Approve],
+		p.ID, p.RunID, p.What, map[bool]string{true: ", remembered for the run", false: ""}[req.Remember])
+	return RunAPIResponse{OK: true, Asks: []PendingAsk{p}}
 }

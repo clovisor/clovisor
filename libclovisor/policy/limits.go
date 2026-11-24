@@ -191,7 +191,7 @@ func (e *Effective) Limits() []LayerLimits {
 	for _, l := range e.Layers {
 		if l.Profile.Limits.Any() {
 			out = append(out, LayerLimits{Profile: l.Profile, Layer: l.Profile.Name,
-				Enforced: l.Profile.Mode == ModeEnforce, CompiledLimits: l.Profile.Limits})
+				Enforced: l.Profile.Enforcing(), CompiledLimits: l.Profile.Limits})
 		}
 	}
 	return out

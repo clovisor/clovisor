@@ -96,6 +96,7 @@ type compiledRule struct {
 	rate    *compiledRate
 	models  *compiledModels
 	budget  *compiledBudget
+	ask     *compiledAsk
 	src     EgressRule
 }
 
@@ -133,6 +134,11 @@ type CompiledProfile struct {
 	UnixAllow []string
 	// Net is the udp and icmp blocks, validated (milestone 4.7).
 	Net NetGrant
+
+	// askDefault is spec.ask, for ask rules, the mode ask default and
+	// sampling ask; samplingAsk is sampling's (milestone 5.5).
+	askDefault  *compiledAsk
+	samplingAsk *compiledAsk
 
 	content []*compiledContent
 	// Limits are the limits block, parsed (milestone 5.2).
@@ -174,11 +180,8 @@ var methodRE = regexp.MustCompile(`^[A-Z]+$`)
 // phase (design §10) that delivers them. Compiling them is an error: a
 // rule that looks enforced but is not is worse than no rule (§7.1).
 var notYet = map[string]string{
-	"mode ask":        "the approval UI (Phase 5)",
-	"action ask":      "the approval UI (Phase 5)",
 	"action redirect": "transparent mode (Phase 3)",
 	"exec hash":       "IMA hash verification (Phase 4)",
-	"sampling ask":    "the approval UI (Phase 5)",
 }
 
 type compiler struct {
@@ -255,13 +258,18 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 		Profile:       p,
 	}
 	switch p.Spec.Mode {
-	case ModeAudit, ModeEnforce:
-	case "ask":
-		c.unsupported("spec.mode", "mode ask")
+	case ModeAudit, ModeEnforce, ModeAsk:
 	case "":
-		c.errf("spec.mode", "is required: audit or enforce")
+		c.errf("spec.mode", "is required: audit, enforce or ask")
 	default:
-		c.errf("spec.mode", "must be audit or enforce, got %q", p.Spec.Mode)
+		c.errf("spec.mode", "must be audit, enforce or ask, got %q", p.Spec.Mode)
+	}
+	cp.askDefault = c.askConfig("spec.ask", p.Spec.Ask, nil)
+	if p.Spec.Mode == ModeAsk && p.Spec.Egress.Default == ActionDeny {
+		cp.Placements = append(cp.Placements, Placement{Rule: "(mode ask)", Tier: "2",
+			EnforcedBy: "ext_proc: what the egress default would refuse is " + cp.askDefault.describe(),
+			Notes: []string{"explicit deny rules still deny; exec, unix, udp and icmp are enforced, since a syscall cannot wait for a person",
+				"transparent mode: the resolver does not answer names only the default would ask about; forwarding every name would open DNS tunnelling. Name the hosts in ask rules"}})
 	}
 
 	c.egress(p, cp)
@@ -342,7 +350,9 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 		case ActionAllow, ActionDeny, ActionTagAndLog:
 		case ActionRateLimit:
 			cr.rate = c.rate(where, r)
-		case "ask", "redirect":
+		case ActionAsk:
+			cr.ask = c.askConfig(where, r.Ask, cp.askDefault)
+		case "redirect":
 			c.unsupported(where, "action "+r.Action)
 		case ContentActionRedact:
 			c.errf(where, "redact is an action for content rules (spec.content), not egress rules")
@@ -393,7 +403,7 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 		}
 
 		cp.Rules = append(cp.Rules, cr)
-		cp.Placements = append(cp.Placements, c.placeEgress(r))
+		cp.Placements = append(cp.Placements, c.placeEgress(r, cr))
 	}
 }
 
@@ -409,7 +419,7 @@ func onlyPort80(ports []uint16) bool {
 	return true
 }
 
-func (c *compiler) placeEgress(r EgressRule) Placement {
+func (c *compiler) placeEgress(r EgressRule, cr *compiledRule) Placement {
 	pl := Placement{Rule: r.Name, Tier: "2"}
 	switch {
 	case r.HTTP != nil || r.Model != nil || r.Budget != nil:
@@ -457,6 +467,12 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 	if r.Action == ActionTagAndLog {
 		pl.Notes = append(pl.Notes, "allowed and tagged in the audit log")
 	}
+	if r.Action == ActionAsk && cr.ask != nil {
+		pl.Notes = append(pl.Notes, cr.ask.describe())
+		if r.HTTP == nil && r.Model == nil && r.Budget == nil {
+			pl.Notes = append(pl.Notes, "asked once per tunnel; on a terminated host, once per request")
+		}
+	}
 	if r.Action == ActionRateLimit && r.Rate != nil {
 		pl.Notes = append(pl.Notes, fmt.Sprintf("allowed up to %d requests per %s, shared with the run's nested runs; beyond it, a narrated 429",
 			r.Rate.Requests, r.Rate.Per))
@@ -499,7 +515,7 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 		e.RequireTrustedPath = true // the earlier name
 	}
 	enforceable := c.opts.ExecEnforceable()
-	if p.Spec.Mode == ModeEnforce && !e.AuditOnly && !enforceable {
+	if (p.Spec.Mode == ModeEnforce || p.Spec.Mode == ModeAsk) && !e.AuditOnly && !enforceable {
 		c.errf("exec", "exec rules cannot be enforced by this deployment: gating exec needs transparent mode with BPF LSM. "+
 			"Set exec.audit_only: true to keep them as audit-only, or remove the exec block")
 	}
@@ -625,17 +641,20 @@ func (c *compiler) mcp(p *AgentProfile, cp *CompiledProfile) {
 	if m.Sampling != nil {
 		switch m.Sampling.Action {
 		case ActionAllow, ActionDeny:
-		case "ask":
-			c.unsupported("mcp.sampling", "sampling ask")
+		case ActionAsk:
+			cp.samplingAsk = c.askConfig("mcp.sampling", m.Sampling.Ask, cp.askDefault)
 		default:
-			c.errf("mcp.sampling", "action must be allow or deny, got %q", m.Sampling.Action)
+			c.errf("mcp.sampling", "action must be allow, deny or ask, got %q", m.Sampling.Action)
+		}
+		if m.Sampling.Ask != nil && m.Sampling.Action != ActionAsk {
+			c.errf("mcp.sampling", "ask: is only valid with action ask")
 		}
 		if m.Sampling.Action == ActionDeny && strings.TrimSpace(m.Sampling.Message) == "" {
 			c.errf("mcp.sampling", "a deny needs a message (design §7.7)")
 		}
 		cp.Placements = append(cp.Placements, Placement{
 			Rule: "mcp/sampling", Tier: "2", EnforcedBy: "ext_proc and the local MCP gateway (server-to-client stream)",
-			Notes: []string{"sampling " + m.Sampling.Action},
+			Notes: append([]string{"sampling " + m.Sampling.Action}, samplingAskNote(cp)...),
 		})
 	}
 }
@@ -886,4 +905,11 @@ func UnixCovers(a, b string) bool {
 		return strings.HasPrefix(strings.TrimSuffix(b, "*"), pa)
 	}
 	return a == b
+}
+
+func samplingAskNote(cp *CompiledProfile) []string {
+	if cp.samplingAsk == nil {
+		return nil
+	}
+	return []string{"the server's request is " + cp.samplingAsk.describe()}
 }

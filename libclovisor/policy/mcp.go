@@ -104,6 +104,12 @@ func (cp *CompiledProfile) DecideMCP(r MCPRequest) (Decision, bool) {
 		if m.Sampling != nil && m.Sampling.Message != "" {
 			msg = m.Sampling.Message
 		}
+		if m.Sampling != nil && m.Sampling.Action == ActionAsk && cp.samplingAsk != nil {
+			if m.Sampling.Message == "" {
+				msg = fmt.Sprintf("MCP server %s asks for a model completion (sampling).", r.Server)
+			}
+			return Decision{Action: ActionAsk, Rule: "sampling", Message: msg, ask: cp.samplingAsk}, true
+		}
 		return Decision{Action: ActionDeny, Rule: "sampling", Message: msg}, true
 	}
 	if s == nil {
@@ -144,7 +150,7 @@ func (e *Effective) DecideMCP(r MCPRequest) EffectiveDecision {
 			continue
 		}
 		if !d.Allowed() {
-			if l.Profile.Mode == ModeEnforce {
+			if l.Profile.Enforcing() {
 				return EffectiveDecision{Decision: d, Enforced: true, Layer: l.Profile.Name, WouldDeny: out.WouldDeny}
 			}
 			out.WouldDeny = append(out.WouldDeny, l.Profile.Name)
@@ -156,6 +162,17 @@ func (e *Effective) DecideMCP(r MCPRequest) EffectiveDecision {
 		if out.Rule == "" {
 			out.Rule = d.Rule
 		}
+		if d.Action == ActionAsk {
+			if l.Profile.Enforcing() && d.ask != nil {
+				out.AskHits = append(out.AskHits, AskHit{Layer: l.Profile.Name, Rule: d.Rule, Message: d.Message,
+					Timeout: d.ask.timeout, AllowOnTimeout: d.ask.allowOnTimeout})
+			} else {
+				out.WouldAsk = append(out.WouldAsk, l.Profile.Name)
+			}
+		}
+	}
+	if len(out.AskHits) > 0 {
+		out.Action = ActionAsk
 	}
 	return out
 }
@@ -185,7 +202,7 @@ func (e *Effective) GovernsRemoteMCP(host string) bool {
 // a drifted tool definition is blocked rather than only recorded.
 func (e *Effective) Enforcing() bool {
 	for _, l := range e.Layers {
-		if l.Profile.Mode == ModeEnforce {
+		if l.Profile.Enforcing() {
 			return true
 		}
 	}

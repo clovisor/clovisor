@@ -42,6 +42,8 @@ type CheckReport struct {
 	// Unverifiable: allowed at host level, but the deciding rule needs
 	// method or path, which audit data does not record.
 	Unverifiable []CheckFinding
+	// Asks would be held for a person's decision (milestone 5.5).
+	Asks []CheckFinding
 	// NotGoverned: traffic the deployment does not decide (with an
 	// explicit proxy: loopback, DNS, other UDP, raw IP connects by
 	// non-proxy-aware clients; with transparent mode, same-run loopback).
@@ -206,6 +208,8 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				case dec.Deferred:
 					f.Decision = "deferred"
 					add("unverifiable", labels[i], f, tl.RunID, d.Count)
+				case dec.Action == policy.ActionAsk:
+					add("egress-ask", labels[i], f, tl.RunID, d.Count)
 				case !dec.Allowed():
 					add("egress-deny", labels[i], f, tl.RunID, d.Count)
 				default:
@@ -297,11 +301,14 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 			rep.Allowed = append(rep.Allowed, f)
 		case "unverifiable":
 			rep.Unverifiable = append(rep.Unverifiable, f)
+		case "egress-ask", "http-ask", "mcp-ask":
+			f.Kind = strings.TrimSuffix(k.kind, "-ask")
+			rep.Asks = append(rep.Asks, f)
 		default:
 			rep.NotGoverned = append(rep.NotGoverned, f)
 		}
 	}
-	for _, s := range [][]CheckFinding{rep.Violations, rep.Allowed, rep.Unverifiable, rep.NotGoverned} {
+	for _, s := range [][]CheckFinding{rep.Violations, rep.Allowed, rep.Asks, rep.Unverifiable, rep.NotGoverned} {
 		sort.SliceStable(s, func(i, j int) bool {
 			if s[i].Kind != s[j].Kind {
 				return s[i].Kind < s[j].Kind
@@ -354,6 +361,15 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 		}
 		return "rule " + f.Rule + runs(f)
 	})
+	if len(rep.Asks) > 0 {
+		section("Would be held for a person's decision", rep.Asks, func(f CheckFinding) string {
+			rule := "the profile's default (mode ask)"
+			if f.Rule != "" {
+				rule = "rule " + f.Rule
+			}
+			return rule + runs(f)
+		})
+	}
 	if len(rep.Unverifiable) > 0 {
 		section("Depends on what audit data lacks (method, path or model)", rep.Unverifiable, func(f CheckFinding) string {
 			return "first matching rule " + f.Rule + runs(f)
@@ -388,6 +404,8 @@ func egressFinding(add addFinding, kind, what string, dec policy.Decision, runID
 	case dec.Deferred:
 		f.Decision = "deferred"
 		add("unverifiable", what, f, runID, n)
+	case dec.Action == policy.ActionAsk:
+		add(kind+"-ask", what, f, runID, n)
 	case !dec.Allowed():
 		add(kind+"-deny", what, f, runID, n)
 	default:
@@ -530,7 +548,9 @@ func checkMCP(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) {
 			continue
 		}
 		f := CheckFinding{Decision: dec.Action, Rule: dec.Rule, Message: dec.Message}
-		if dec.Allowed() {
+		if dec.Action == policy.ActionAsk {
+			add("mcp-ask", what, f, tl.RunID, u.Calls)
+		} else if dec.Allowed() {
 			add("mcp-allow", what, f, tl.RunID, u.Calls)
 		} else {
 			add("mcp-deny", what, f, tl.RunID, u.Calls)

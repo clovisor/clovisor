@@ -392,7 +392,7 @@ func (e *Effective) ScanContent(host, what string, data []byte, redactable bool)
 	host = NormalizeHost(host)
 	var v ContentVerdict
 	for _, l := range e.Layers {
-		enforce := l.Profile.Mode == ModeEnforce
+		enforce := l.Profile.Enforcing()
 		for _, cc := range l.Profile.content {
 			if !cc.applies(host) {
 				continue

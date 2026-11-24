@@ -265,7 +265,7 @@ spec:
 `
 	errs := compileErrors(t, doc)
 	for _, want := range []string{
-		"package-registries): action ask cannot be enforced yet: it needs the approval UI (Phase 5)",
+		"package-registries): ask.timeout must be between 1s and 4m0s",
 		"billing.internal must be terminated for research-agent (billing-paths: http), but research-agent/payments-api asserts no_terminate",
 		"quiet-deny): a deny rule needs a message",
 		"ssh-paths): http: needs a hostname destination",
@@ -285,8 +285,8 @@ spec:
 	if e := compileErrors(t, strings.Replace(goodProfile, "default: deny\n    rules:", "default: maybe\n    rules:", 1)); !strings.Contains(e, "egress.default: must be allow or deny") {
 		t.Errorf("bad default accepted: %s", e)
 	}
-	if e := compileErrors(t, strings.Replace(goodProfile, "mode: enforce", "mode: ask", 1)); !strings.Contains(e, "mode ask cannot be enforced yet") {
-		t.Errorf("mode ask accepted: %s", e)
+	if e := compileErrors(t, strings.Replace(goodProfile, "mode: enforce", "mode: ask", 1)); e != "" {
+		t.Errorf("mode ask refused: %s", e)
 	}
 	wild := strings.Replace(goodProfile, `fqdn: ["mirror.internal"], ports: [80]`, `fqdn: ["*.internal"]`, 1)
 	if e := compileErrors(t, wild); !strings.Contains(e, "*.internal must be terminated") || !strings.Contains(e, "payments asserts no_terminate") {

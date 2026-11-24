@@ -45,6 +45,9 @@ type Spec struct {
 	ICMP    *ICMP         `yaml:"icmp,omitempty" json:"icmp,omitempty"`
 	Content []ContentRule `yaml:"content,omitempty" json:"content,omitempty"`
 	Limits  *Limits       `yaml:"limits,omitempty" json:"limits,omitempty"`
+	// Ask is the default for ask rules, mode ask and sampling ask
+	// (milestone 5.5).
+	Ask *Ask `yaml:"ask,omitempty" json:"ask,omitempty"`
 }
 
 // Egress is the egress block.
@@ -99,7 +102,8 @@ type Budget struct {
 	CostUSD float64 `yaml:"cost_usd,omitempty" json:"cost_usd,omitempty"`
 }
 
-// Ask configures ask-mode approval.
+// Ask configures ask-mode approval: how long a request is held, and
+// whether it is denied (the default) or allowed when no one decides.
 type Ask struct {
 	Timeout   string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 	OnTimeout string `yaml:"on_timeout,omitempty" json:"on_timeout,omitempty"`
@@ -180,6 +184,7 @@ type ResourceRules struct {
 type Sampling struct {
 	Action  string `yaml:"action" json:"action"`
 	Message string `yaml:"message,omitempty" json:"message,omitempty"`
+	Ask     *Ask   `yaml:"ask,omitempty" json:"ask,omitempty"`
 }
 
 // ContentRule is a content pattern (milestone 5.1), checked against

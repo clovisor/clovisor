@@ -152,6 +152,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("limits", e.testLimits)
 	t.Run("models", e.testModels)
 	t.Run("budgets", e.testBudgets)
+	t.Run("ask", e.testAsk)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -560,6 +561,78 @@ EOS`); err != nil {
 
 	out, _ = e.agentRun("it-budget", `sh /tmp/unpriced.sh`)
 	expect(t, out, `this node has no price for model \"mystery-1\"`, "} 403")
+}
+
+// waitPending polls agentctl pending until it lists a pending request for
+// what, and returns its id.
+func (e *env) waitPending(t *testing.T, what string) (string, string) {
+	t.Helper()
+	re := regexp.MustCompile(`(?m)^([0-9a-f]{8})\s+\S+\s+pending\s+` + regexp.QuoteMeta(what))
+	var out string
+	for i := 0; i < 100; i++ {
+		out, _, _ = e.sh("/it/bin/agentctl pending")
+		if m := re.FindStringSubmatch(out); m != nil {
+			return m[1], out
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no pending request for %s:\n%s", what, out)
+	return "", ""
+}
+
+func (e *env) testAsk(t *testing.T) {
+	// Ask (milestone 5.5): the run's first read is held and approved, its
+	// second denied and remembered, so its third is refused without
+	// asking; a POST no one decides is let through after its 2s timeout.
+	if _, errOut, err := e.sh(`cat > /tmp/ask.sh <<'EOS'
+echo "first: $(curl -s https://origin.test/allowed)"
+echo "second: $(curl -s https://origin.test/allowed)"
+echo "third: $(curl -s https://origin.test/allowed)"
+echo "echo: $(curl -s -o /dev/null -w '%{http_code}' --data-binary x https://origin.test/echo)"
+EOS`); err != nil {
+		t.Fatal(errOut)
+	}
+	type result struct{ out, errOut string }
+	done := make(chan result, 1)
+	go func() {
+		out, errOut, _ := e.sh("/it/bin/agentctl run --profile it-ask -- sh /tmp/ask.sh")
+		done <- result{out, errOut}
+	}()
+	id, list := e.waitPending(t, "GET origin.test/allowed")
+	expect(t, list, "it-ask/read", ", then deny", id+": The agent wants to read /allowed.")
+	out, errOut, err := e.sh("/it/bin/agentctl approve " + id)
+	if err != nil {
+		t.Fatalf("approve: %v\n%s%s", err, out, errOut)
+	}
+	expect(t, out, "Approved "+id+": GET origin.test/allowed")
+	id2, _ := e.waitPending(t, "GET origin.test/allowed")
+	if id2 == id {
+		t.Fatalf("the approved request still pending")
+	}
+	out, _, _ = e.sh("/it/bin/agentctl deny --remember " + id2)
+	expect(t, out, "Denied "+id2, "Later requests like it are denied for the rest of run")
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not finish")
+	}
+	expect(t, r.out, "first: origin.test GET /allowed",
+		"second: {", "A person declined GET origin.test/allowed (rule read of profile it-ask).",
+		"third: {", "A person declined requests like GET origin.test/allowed for this run",
+		"echo: 200")
+	m := runIDRE.FindStringSubmatch(r.errOut)
+	if m == nil {
+		t.Fatalf("no run:\n%s%s", r.out, r.errOut)
+	}
+	shown, _, err := e.sh("/it/bin/agentctl events " + m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "ask "+id+": approved by root (uid 0) after", "ask "+id2+": denied by root (uid 0)",
+		": remembered by root (uid 0)", ": timed out after 2")
+	out, _, _ = e.sh("/it/bin/agentctl pending --all")
+	expect(t, out, id+"  ", "approved by root (uid 0)", "denied by root (uid 0) (remembered)", "timed out")
 }
 
 func (e *env) testPinDrift(t *testing.T) {

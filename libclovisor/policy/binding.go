@@ -406,6 +406,11 @@ type EffectiveDecision struct {
 	// the request is refused once any enforced one is spent, and charged
 	// to each (milestone 5.4).
 	Budgets []BudgetCheck
+	// AskHits are the enforcing layers that hold the request for a
+	// person's decision (milestone 5.5); WouldAsk the audit layers that
+	// would have. Action is ask when there are any hits.
+	AskHits  []AskHit
+	WouldAsk []string
 }
 
 // Decide evaluates an egress attempt against every layer. Any
@@ -427,7 +432,7 @@ func (e *Effective) decide(decide func(*CompiledProfile) Decision) EffectiveDeci
 	for _, l := range e.Layers {
 		d := decide(l.Profile)
 		if !d.Allowed() {
-			if l.Profile.Mode == ModeEnforce {
+			if l.Profile.Enforcing() {
 				return EffectiveDecision{Decision: d, Enforced: true, Layer: l.Profile.Name, WouldDeny: out.WouldDeny}
 			}
 			out.WouldDeny = append(out.WouldDeny, l.Profile.Name)
@@ -447,18 +452,29 @@ func (e *Effective) decide(decide func(*CompiledProfile) Decision) EffectiveDeci
 		}
 		if d.Action == ActionRateLimit && d.rate != nil {
 			out.Rates = append(out.Rates, RateHit{Profile: l.Profile, Layer: l.Profile.Name, Rule: d.Rule,
-				Requests: d.rate.requests, Per: d.rate.per, Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce})
+				Requests: d.rate.requests, Per: d.rate.per, Message: d.Message, Enforced: l.Profile.Enforcing()})
+		}
+		if d.Action == ActionAsk {
+			if l.Profile.Enforcing() && d.ask != nil {
+				out.AskHits = append(out.AskHits, AskHit{Layer: l.Profile.Name, Rule: d.Rule, Message: d.Message,
+					Timeout: d.ask.timeout, AllowOnTimeout: d.ask.allowOnTimeout})
+			} else {
+				out.WouldAsk = append(out.WouldAsk, l.Profile.Name)
+			}
 		}
 		if d.budget != nil {
 			out.Budgets = append(out.Budgets, BudgetCheck{Profile: l.Profile, Layer: l.Profile.Name, Rule: d.Rule,
-				Tokens: d.budget.tokens, CostUSD: d.budget.cost, Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce})
+				Tokens: d.budget.tokens, CostUSD: d.budget.cost, Message: d.Message, Enforced: l.Profile.Enforcing()})
 		}
 		if d.models != nil {
 			out.Models = append(out.Models, ModelCheck{Layer: l.Profile.Name, Rule: d.Rule, Allow: d.models.allow,
-				Message: d.Message, Enforced: l.Profile.Mode == ModeEnforce, m: d.models})
+				Message: d.Message, Enforced: l.Profile.Enforcing(), m: d.models})
 		}
 	}
 	out.Deferred = deferred
+	if len(out.AskHits) > 0 {
+		out.Action = ActionAsk
+	}
 	return out
 }
 
@@ -494,7 +510,7 @@ func (e *Effective) UnixAllow(uid int) ([]string, bool) {
 	var acc []string
 	enforcing := false
 	for _, l := range e.Layers {
-		if l.Profile.Mode != ModeEnforce {
+		if !l.Profile.Enforcing() {
 			continue
 		}
 		pats := l.Profile.UnixAllow

@@ -450,6 +450,30 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		na.limiter.Ledger = xp.Budgets
 	}
 	api.OnRunStart, api.OnRunEnd = na.limiter.RunStarted, na.limiter.RunEnded
+	if xp != nil || gw != nil {
+		// Ask (milestone 5.5): requests held for a person's decision.
+		asks := NewAskQueue()
+		asks.OnChange = func(p PendingAsk) {
+			if p.State == AskPending {
+				fmt.Printf("ask: run %s holds request %s for a decision: %s (profile %s); agentctl approve %s, or deny it, within %s\n",
+					p.RunID, p.ID, p.What, p.Layer, p.ID, p.Expires.Sub(p.Created).Round(time.Second))
+			} else {
+				fmt.Printf("ask: request %s of run %s: %s%s\n", p.ID, p.RunID, p.State, map[bool]string{true: " by " + p.By, false: ""}[p.By != ""])
+			}
+		}
+		api.Asks = asks
+		if xp != nil {
+			xp.Asks = asks
+		}
+		if gw != nil {
+			gw.Asks = asks
+		}
+		ended := api.OnRunEnd
+		api.OnRunEnd = func(runID string, runCg uint64) {
+			ended(runID, runCg)
+			asks.ForgetRun(runID)
+		}
+	}
 	na.limiter.Resume()
 
 	return na, nil

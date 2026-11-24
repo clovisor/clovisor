@@ -1,0 +1,14 @@
+# Ask (milestone 5.5), in mode ask: other.test by an ask rule, and what
+# the default would refuse is asked about too.
+kind: AgentProfile
+metadata: { name: tp-ask }
+spec:
+  mode: ask
+  ask: { timeout: 30s }
+  egress:
+    default: deny
+    rules:
+      - name: other
+        to: { fqdn: ["other.test"], ports: [443] }
+        action: ask
+        message: "The agent wants other.test."

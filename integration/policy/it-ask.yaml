@@ -1,0 +1,17 @@
+kind: AgentProfile
+metadata: { name: it-ask }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: read
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed"] }
+        action: ask
+        message: "The agent wants to read /allowed."
+      - name: echo
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [POST], paths: ["/echo"] }
+        action: ask
+        ask: { timeout: 2s, on_timeout: allow }

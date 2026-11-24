@@ -86,6 +86,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("duration", e.testDuration)
 	t.Run("models", e.testTransparentModels)
 	t.Run("budgets", e.testTransparentBudgets)
+	t.Run("ask", e.testTransparentAsk)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -663,6 +664,39 @@ func (e *env) testTransparentBudgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(t, shown, "Budget    rule llm (profile tp-budget): 600 of 500 tokens, $0.0066 in 2 requests, nested runs included")
+}
+
+func (e *env) testTransparentAsk(t *testing.T) {
+	script := e.script("ask", `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+echo "inside: $(/it/bin/agentctl pending 2>&1)"
+getent hosts other.test >/dev/null && echo "dns other: resolved" || echo "dns other: refused"
+getent hosts unlisted.test >/dev/null && echo "dns unlisted: resolved" || echo "dns unlisted: refused"
+echo "other: $(curl -s -o /dev/null -w %{http_code} https://other.test/x)"
+`)
+	type result struct{ out, errOut string }
+	done := make(chan result, 1)
+	go func() {
+		out, errOut, _ := e.sh("/it/bin/agentctl run --profile tp-ask -- " + script)
+		done <- result{out, errOut}
+	}()
+	id, _ := e.waitPending(t, "GET other.test/x")
+	if out, errOut, err := e.sh("/it/bin/agentctl approve " + id); err != nil {
+		t.Fatalf("approve: %v\n%s%s", err, out, errOut)
+	}
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not finish")
+	}
+	// From inside the run, held requests are neither listed nor decided.
+	expect(t, r.out, "inside: Error: node agent: requests held for approval cannot be seen or decided from inside a run",
+		"dns other: resolved", "dns unlisted: refused", "other: 200")
+	m := runIDRE.FindStringSubmatch(r.errOut)
+	if m == nil {
+		t.Fatalf("no run:\n%s%s", r.out, r.errOut)
+	}
+	expect(t, e.timeline(m[1]), `"ask `+id+`: approved by root (uid 0) after`, `"unlisted.test"`)
 }
 
 func (e *env) testDuration(t *testing.T) {

@@ -225,9 +225,9 @@ spec:
 
 | Block | What it governs | Enforced by | Section |
 |---|---|---|---|
-| `mode` | `enforce` refuses; `audit` records what enforce would refuse | | |
+| `mode` | `enforce` refuses; `audit` records what enforce would refuse; `ask` is enforce, but asks a person about what the egress default would refuse | | §6 Ask |
 | `egress` | Destinations by name, address, port, method and path, first match wins; a rule's `model` list limits the models its requests may name, and its `budget` the tokens and cost of its model calls | the proxy; in transparent mode every TCP connect goes there | §6 Models, §6 Budgets, §10, §11 |
-| `mcp` | MCP servers and their tools, sampling | the gateway and the proxy | §9 |
+| `mcp` | MCP servers and their tools, sampling (`allow`, `deny` or `ask`) | the gateway and the proxy | §9 |
 | `exec` | Which binaries a run may execute | BPF LSM | §11 |
 | `unix` | Unix sockets outside the run | BPF LSM | §11 |
 | `udp` | UDP destinations besides DNS, exact `ip:port` | the kernel, transparent mode | §11 |
@@ -410,6 +410,77 @@ input.
   in `<state-dir>/counters.json`, so a node agent restart does not refill
   a budget.
 
+### Ask
+
+`action: ask` holds a request until a person approves or denies it.
+
+```yaml
+spec:
+  mode: enforce                # or ask: see below
+  ask: { timeout: 2m }         # defaults for this profile's asks
+  egress:
+    default: deny
+    rules:
+      - name: packages
+        to: { fqdn: ["pypi.org", "files.pythonhosted.org"] }
+        action: ask
+        message: "The agent wants to install a package."   # shown to whoever decides
+      - name: issue-writes
+        to: { fqdn: ["api.github.com"] }
+        http: { methods: [POST, PATCH] }
+        action: ask
+        ask: { timeout: 1m, on_timeout: deny }   # deny is the default
+  mcp:
+    sampling: { action: ask }  # a server asking to run the model
+```
+
+Deciding, from outside the run:
+
+```sh
+agentctl pending                       # what is held, for how long, and what then
+agentctl approve 3f2a9c1b              # let this request through
+agentctl deny --remember 3f2a9c1b      # refuse it, and later ones like it
+agentctl pending --all                 # recent decisions too
+```
+
+- **What is held.** A request through the proxy, at its headers, so
+  whoever decides sees the method, host and path, not the body. A tunnel
+  to a host that is not terminated is asked about once. On a terminated
+  host, each request is.
+- **Remembering.** `--remember` makes the decision stand for the rest of
+  the run, for requests the same rule asks about on the same host. It works
+  on a request that already timed out or whose client gave up. Clients
+  with short timeouts (pip waits 15 seconds) often give up before anyone
+  decides; approve with `--remember`, and their retry passes.
+- **Timeouts.** `ask.timeout` is from 1s to 4m, by default 2m. A held
+  request has no traffic, and Envoy ends a stream idle for 5 minutes.
+  `on_timeout` decides then: `deny` (the default) or `allow`. A refusal
+  is a narrated 403 saying whether a person declined or no one decided.
+- **Who decides.** A decision grants what policy did not, so it is never
+  taken from inside a run: an agent must not approve itself.
+  - With cgroup identity, the run's owner or root may decide, from
+    outside any run.
+  - With credential identity, a run's processes are in no cgroup and run
+    as its owner, so only root decides (`sudo agentctl approve`). An agent
+    that itself runs as root could approve its own requests.
+- **`mode: ask`** is enforce, except that what the egress default would
+  refuse is asked about instead. Explicit deny rules still deny. Exec,
+  Unix sockets, UDP and ping are enforced as in enforce mode, since a
+  system call cannot wait for a person. In transparent mode the resolver
+  does not answer names that only the default would ask about, since
+  forwarding every name would open DNS tunnelling. Give such hosts an ask
+  rule.
+- **`sampling: ask`** holds an MCP server's request for a model
+  completion. `agentctl pending` shows the start of what it asks the
+  model. Denied, the server is told so; the client never sees it.
+- **Limits.** The node holds at most 256 requests, 32 per run; past that,
+  503 with a narration. Held requests and remembered decisions are kept in
+  memory, so a node agent restart drops them, and their clients get an
+  error.
+- **Records.** The timeline shows each held request's outcome, who decided
+  and how long it waited; audit layers record `would ask`. `agentctl
+  check` lists what a profile would ask about.
+
 ## 7. Running agents
 
 ```sh
@@ -543,7 +614,7 @@ those URLs carry the run's secret.
 - answers denied `tools/call` and `resources/read` in place;
 - filters `tools/list`;
 - removes server-initiated `sampling/createMessage` requests from event
-  streams.
+  streams, or holds them for a person under `sampling: ask` (§6 Ask).
 
 Bodies are inspected only for runs whose own profile names the host.
 
@@ -1008,6 +1079,10 @@ agentctl events --json <run-id>
 | `needs termination` | A rule needs method, path or model, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
 | `413` on a large upload | The body is over `-inspect-max-body`, and a content rule, a model rule or remote MCP covers the host. Raise the limit, scope the content rule with `to:`, or give the upload's path a rule without a model list. |
 | `415` from the proxy | A content or model rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| A request hangs, then `403` "no one gave it within …" | An ask rule held it and no one decided. `agentctl pending` lists held requests; the node agent's log names each as it is held. |
+| `agentctl pending` or `approve` "from inside a run" | Decisions are refused from inside any run (§6 Ask). Run it from another terminal. |
+| `approve` "only root decides" | Credential identity: use `sudo agentctl approve`. |
+| `503` "not held" | The node or the run holds as many requests for approval as it may. Decide some, or wait. |
 | `403` "spent the budget of rule …" | The run, or the run it is nested in, has spent that rule's budget (§6 Budgets). `agentctl events` shows the spend. |
 | `403` "this node has no price for model …" | The rule has a cost budget, and the node's `ModelPrices` has no entry matching the model. Add one and send `SIGHUP`. |
 | A run's spend is marked `estimated` | The responses carried no usage the proxy could read: another API shape, or a compressed response. |
@@ -1066,6 +1141,10 @@ They check:
   chunk removed; `Accept-Encoding` removed; the call past the budget
   refused before it was sent; an unpriced model refused; the spend in
   `agentctl events`;
+- ask: a held request approved from outside the run, the next denied with
+  `--remember` and the one after refused without asking, a request no one
+  decided let through by `on_timeout: allow`, and the decisions in the
+  timeline and in `agentctl pending --all`;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 
@@ -1110,6 +1189,9 @@ ignore the proxy, it checks:
   passed, another refused;
 - a budget shared with a nested run: the parent's and the nested run's
   calls charged to the parent, the nested run refused by it;
+- mode ask: `agentctl pending` refused from inside the run, an ask rule's
+  name resolved and the default's not, and a held request approved by the
+  run's owner;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

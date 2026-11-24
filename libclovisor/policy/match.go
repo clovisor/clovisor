@@ -151,6 +151,8 @@ type Decision struct {
 	models *compiledModels
 	// budget is the deciding rule's budget (milestone 5.4).
 	budget *compiledBudget
+	// ask is an ask's timeout and what happens then (milestone 5.5).
+	ask *compiledAsk
 	// Deferred is set at PhaseConnect when the first matching rule needs
 	// method or path. The connection is let through to termination, and
 	// each request inside it gets its own decision. Offline, it means the
@@ -219,7 +221,10 @@ func (cp *CompiledProfile) Decide(req Request) Decision {
 		if !r.matchesHTTP(req) {
 			continue
 		}
-		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate, models: r.models, budget: r.budget}
+		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate, models: r.models, budget: r.budget, ask: r.ask}
+	}
+	if cp.Mode == ModeAsk && cp.DefaultAction == ActionDeny {
+		return Decision{Action: ActionAsk, Message: cp.defaultMessage(req), ask: cp.askDefault}
 	}
 	return Decision{Action: cp.DefaultAction, Message: cp.defaultMessage(req)}
 }
@@ -293,7 +298,7 @@ func (cp *CompiledProfile) ExecLayer() (ExecLayer, bool) {
 		return ExecLayer{}, false
 	}
 	l := ExecLayer{DefaultAllow: cp.exec.Default == ActionAllow, RequireTrusted: cp.exec.RequireTrustedPath,
-		Enforce: cp.Mode == ModeEnforce && !cp.exec.AuditOnly, Prefixes: cp.exec.prefixes}
+		Enforce: cp.Enforcing() && !cp.exec.AuditOnly, Prefixes: cp.exec.prefixes}
 	for p := range cp.exec.allow {
 		l.Exact = append(l.Exact, p)
 	}
@@ -322,6 +327,10 @@ func (cp *CompiledProfile) DecideName(name string) Decision {
 	var first Decision
 	for p := range ports {
 		d := cp.Decide(Request{Host: name, Port: p, Phase: PhaseConnect})
+		if d.Action == ActionAsk && d.Rule == "" {
+			// Mode ask's default: names are not forwarded on its account.
+			d = Decision{Action: ActionDeny}
+		}
 		if d.Allowed() {
 			// The port is not part of a name decision.
 			return Decision{Action: d.Action, Rule: d.Rule}

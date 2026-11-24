@@ -101,8 +101,9 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 			// Fail closed: without a decision, nothing passes.
 			"failure_mode_allow": false,
 			// ext_proc may extend the timer for one message: to check a
-			// large body (milestone 5.1).
-			"max_message_timeout": "30s",
+			// large body (milestone 5.1), or to hold a request for a
+			// person's decision, at most 4m (milestone 5.5).
+			"max_message_timeout": "300s",
 			// Lets ext_proc turn on body processing for the streams that
 			// need it (remote MCP) and only those.
 			"allow_mode_override": true,

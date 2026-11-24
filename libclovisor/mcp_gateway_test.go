@@ -104,7 +104,12 @@ type gwFixture struct {
 
 func newGateway(t *testing.T, pinPath string) *gwFixture {
 	t.Helper()
-	p, _ := policy.Parse([]byte(gwProfile))
+	return newGatewayWith(t, pinPath, gwProfile)
+}
+
+func newGatewayWith(t *testing.T, pinPath, profile string) *gwFixture {
+	t.Helper()
+	p, _ := policy.Parse([]byte(profile))
 	comp, diags := policy.Compile(policy.Options{Linux: true}, p)
 	if len(diags) > 0 {
 		t.Fatal(diags)
@@ -265,5 +270,41 @@ func TestMCPGateway(t *testing.T) {
 	delete(f.g.api.runByCg, ownCgroupID(t))
 	if code, _, v := f.post(t, session, call(9, "tools/list", "")); code != 403 || !bytes.Contains([]byte(fmt.Sprint(v)), []byte("governed agent runs only")) {
 		t.Fatalf("non-run client: %d %v", code, v)
+	}
+}
+
+// sampling: ask holds the server's request for a person; denied, the
+// server is answered with a refusal, and the decision recorded.
+func TestMCPGatewaySamplingAsk(t *testing.T) {
+	prof := strings.Replace(gwProfile, `sampling: { action: deny, message: "Servers may not drive the model here." }`,
+		`sampling: { action: ask, ask: { timeout: 1m } }`, 1)
+	f := newGatewayWith(t, filepath.Join(t.TempDir(), "pins.json"), prof)
+	f.g.Asks = NewAskQueue()
+	run := &mcpRun{runID: "r1", cgID: ownCgroupID(t), uid: 1000}
+	f.g.Register(run, []MCPServerSpec{{Name: "fs", Command: []string{"/usr/bin/fake-fs", "/ok"}}})
+	_, session, _ := f.post(t, "", call(1, "initialize", `{"protocolVersion":"2025-06-18"}`))
+	done := make(chan map[string]interface{}, 1)
+	go func() {
+		_, _, v := f.post(t, session, call(2, "tools/call", `{"name":"ask_model","arguments":{}}`))
+		done <- v
+	}()
+	ps := waitPending(t, f.g.Asks, 1)
+	if ps[0].Kind != "sampling" || ps[0].What != "sampling/createMessage from MCP server fs" || ps[0].UID != 1000 || ps[0].Detail != "{}" {
+		t.Fatalf("pending: %+v", ps[0])
+	}
+	f.g.Asks.Decide(ps[0].ID, false, false, "alice", func(PendingAsk) error { return nil })
+	v := <-done
+	if txt, _ := resultText(v); !strings.Contains(txt, "request for a model completion was not approved (denied)") {
+		t.Fatalf("server's answer: %q", txt)
+	}
+	var got []string
+	for len(f.events) > 0 {
+		d := (<-f.events).Data.(MCPData)
+		if d.Ask != nil {
+			got = append(got, d.Method+" "+d.Decision+" "+d.Reason+" "+d.Ask.By)
+		}
+	}
+	if strings.Join(got, ",") != "sampling/createMessage deny ask: denied alice" {
+		t.Errorf("records: %q", got)
 	}
 }

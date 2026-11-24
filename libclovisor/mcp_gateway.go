@@ -74,6 +74,19 @@ type MCPData struct {
 	Layer     string
 	WouldDeny []string
 	Reason    string // e.g. "tool definition changed since pinned"
+	// Ask is how a held sampling request was settled (milestone 5.5).
+	Ask *AskData
+}
+
+// settleAsk records an ask's outcome on a decision.
+func settleAsk(data *MCPData, d policy.EffectiveDecision, allowed bool, a *AskData) {
+	data.Ask, data.Reason = a, "ask: "+a.State
+	data.Layer, data.Rule = d.AskHits[0].Layer, d.AskHits[0].Rule
+	if allowed {
+		data.Decision, data.Enforced = policy.ActionAllow, false
+	} else {
+		data.Decision, data.Enforced = policy.ActionDeny, true
+	}
 }
 
 var mcpNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
@@ -110,6 +123,9 @@ type MCPGateway struct {
 
 	srv *http.Server
 	ln  net.Listener
+
+	// Asks holds sampling requests for a person (milestone 5.5).
+	Asks *AskQueue
 
 	// launch prepares a server's command; replaced in tests, which cannot
 	// create cgroups or change uid.
@@ -854,6 +870,12 @@ func (p *mcpProc) readLoop(stdout io.Reader) {
 			if eff == nil {
 				d = policy.EffectiveDecision{Decision: policy.Decision{Action: policy.ActionAllow}}
 			}
+			if d.Asks() {
+				// Held for a person, without holding up the server's other
+				// messages.
+				go p.askSampling(m, line, d)
+				continue
+			}
 			p.g.record(p.srv.run, mcpData(p.srv.spec.Name, m.Method, "", d))
 			if !d.Allowed() {
 				p.write(rpcError(m.ID, -32001, d.Message))
@@ -864,5 +886,43 @@ func (p *mcpProc) readLoop(stdout io.Reader) {
 		case p.out <- line:
 		default: // no GET stream draining it; drop rather than block
 		}
+	}
+}
+
+// askSampling holds a server's sampling request for a person's decision,
+// then passes it to the client or answers the server with a refusal.
+func (p *mcpProc) askSampling(m rpcMsg, line []byte, d policy.EffectiveDecision) {
+	name := p.srv.spec.Name
+	data := mcpData(name, m.Method, "", d)
+	hit := d.AskHits[0]
+	var a *AskData
+	allowed := false
+	if q := p.g.Asks; q == nil {
+		a = &AskData{State: "no approval queue"}
+	} else {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			select {
+			case <-p.done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		timeout, allowOnTimeout := d.AskTimeout()
+		r := q.Ask(ctx, PendingAsk{RunID: p.srv.run.runID, UID: p.srv.run.uid, Kind: "sampling",
+			What: "sampling/createMessage from MCP server " + name, Host: "mcp:" + name, Layer: hit.Layer, Rule: hit.Rule,
+			Message: hit.Message, Detail: samplingDetail(m.Params)}, timeout, allowOnTimeout)
+		allowed, a = r.Allowed, &AskData{ID: r.ID, State: r.State, By: r.By, Waited: r.Waited}
+	}
+	settleAsk(&data, d, allowed, a)
+	p.g.record(p.srv.run, data)
+	if !allowed {
+		p.write(rpcError(m.ID, -32001, fmt.Sprintf("MCP server %s's request for a model completion was not approved (%s).", name, a.State)))
+		return
+	}
+	select {
+	case p.out <- line:
+	default:
 	}
 }

@@ -9,6 +9,7 @@ package clovisor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ type remoteMCP struct {
 	runID string
 	runCg uint64
 	eff   *policy.Effective
+	// ctx is the stream's: a held sampling ask ends with it.
+	ctx context.Context
 
 	toolsList map[string]bool // ids of tools/list requests in this POST
 	sse       bool
@@ -280,7 +283,18 @@ func (s *ExtProcServer) mcpEvent(m *remoteMCP, ev []byte) []byte {
 	switch {
 	case msg.Method == "sampling/createMessage" && msg.isRequest():
 		d := m.decide("sampling", "", "")
-		s.recordMCP(m, mcpData(m.host, msg.Method, "", d))
+		data := mcpData(m.host, msg.Method, "", d)
+		if d.Asks() {
+			// sampling: ask (milestone 5.5): held for a person.
+			ok, a := s.askSampling(m, d, samplingDetail(msg.Params))
+			settleAsk(&data, d, ok, a)
+			s.recordMCP(m, data)
+			if !ok {
+				return nil
+			}
+			return ev
+		}
+		s.recordMCP(m, data)
 		if !d.Allowed() {
 			return nil
 		}
