@@ -245,6 +245,14 @@ func removeCgroupTree(path string) error {
 	return nil
 }
 
+// AdoptRunCgroup records the cgroup of a run that outlived an earlier
+// node agent (milestone 6.1), so it can be ended like one created here.
+func (cm *CgroupManager) AdoptRunCgroup(runID, path string) {
+	cm.mu.Lock()
+	cm.runMap[runID] = path
+	cm.mu.Unlock()
+}
+
 // GetRunCgroupPath returns the path for a run cgroup
 func (cm *CgroupManager) GetRunCgroupPath(runID string) (string, bool) {
 	cm.mu.Lock()

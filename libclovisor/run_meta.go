@@ -47,6 +47,9 @@ type RunMeta struct {
 	// Budgets are what the run spent of the budgets it owns, nested runs
 	// included (milestone 5.4).
 	Budgets []BudgetState `json:"budgets,omitempty"`
+	// Restored are when a restarted node agent gave the run its grants
+	// back (milestone 6.1).
+	Restored []time.Time `json:"restored,omitempty"`
 }
 
 // LimitHit is one limit a run reached (milestone 5.2).

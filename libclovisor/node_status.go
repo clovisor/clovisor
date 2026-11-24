@@ -41,4 +41,7 @@ type NodeStatus struct {
 	// Sockets is what the BPF LSM socket hooks do (milestones 4.1, 4.3).
 	Sockets    string `json:"sockets,omitempty"`
 	ActiveRuns int    `json:"active_runs"`
+	// Restored is what the node agent did at start with runs that
+	// outlived the previous one (milestone 6.1).
+	Restored string `json:"restored,omitempty"`
 }

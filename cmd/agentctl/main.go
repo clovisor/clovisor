@@ -547,6 +547,9 @@ func showStatus() error {
 		fmt.Printf("Sockets       %s\n", s.Sockets)
 	}
 	fmt.Printf("Active runs   %d\n", s.ActiveRuns)
+	if s.Restored != "" {
+		fmt.Printf("Restored      %s at start\n", s.Restored)
+	}
 	fmt.Printf("Lost events   %d (ring buffer full), %d suppressed (a run over its event budget)\n", s.LostEvents, s.SuppressedEvents)
 	return nil
 }
@@ -749,6 +752,9 @@ func printTimeline(tl *clovisor.RunTimeline) {
 	}
 	if tl.EndReason != "" {
 		fmt.Printf("Ended by  the node agent: %s\n", tl.EndReason)
+	}
+	for _, at := range tl.Restored {
+		fmt.Printf("Restored  %s: the node agent restarted, and gave the run its grants back\n", at.Local().Format(time.RFC3339))
 	}
 	if tl.EgressBytes != nil {
 		fmt.Printf("Egress    %d bytes, nested runs included\n", *tl.EgressBytes)

@@ -156,6 +156,17 @@ func (r *RunRegistry) AddCall(runID string, c CallMeta) {
 	}
 }
 
+// IndexCall attributes a restored run's open call's cgroup to it again
+// (milestone 6.1); the call is already in the run's record.
+func (r *RunRegistry) IndexCall(runID string, c CallMeta) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls[c.CgroupID] = c.ID
+	if ncg := r.nestedCg[runID]; ncg != 0 {
+		r.nested[c.CgroupID] = ncg
+	}
+}
+
 // PutNested records a nested run, started from inside parent, whose
 // cgroup is cg; the parent's record lists it as a child.
 func (r *RunRegistry) PutNested(m RunMeta, cg uint64) {
@@ -281,6 +292,10 @@ type RunAPIServer struct {
 	// Events receives run start and end with credential identity, where
 	// no cgroup mkdir or rmdir reports them.
 	Events chan<- AuditEvent
+	// GrantsPath is where live runs' grants are kept across node agent
+	// restarts (milestone 6.1); "" keeps none.
+	GrantsPath string
+	grantMu    sync.Mutex
 
 	nextCg uint64            // credential identity: synthetic run ids
 	tokens map[string]string // credential identity: token -> run id
@@ -304,9 +319,14 @@ type RunAPIServer struct {
 	byCg    map[uint64]*boundRun
 	runByCg map[uint64]string // every live run, profiled or not, and its child cgroups
 	runCg   map[string]uint64 // run id -> the run's own cgroup id
-	closing bool
-	done    chan struct{}
-	wg      sync.WaitGroup
+	// restored are runs given back their grants at start that no
+	// connection owns yet, with when the reaper first found them empty;
+	// creators, every live run's agentctl, which may claim one.
+	restored map[string]time.Time
+	creators map[string]procIdentity
+	closing  bool
+	done     chan struct{}
+	wg       sync.WaitGroup
 }
 
 // boundRun is a live run's effective policy.
@@ -510,6 +530,8 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		parentOf:   map[string]string{},
 		children:   map[string][]string{},
 		endReasons: map[string]string{},
+		restored:   map[string]time.Time{},
+		creators:   map[string]procIdentity{},
 		nextCg:     credentialCgBase,
 		done:       make(chan struct{}),
 	}, nil
@@ -522,6 +544,7 @@ func (s *RunAPIServer) reap() {
 	if s.cm == nil {
 		return
 	}
+	s.endUnclaimed()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, cg := range s.cm.ListActiveCgroups() {
@@ -536,6 +559,41 @@ func (s *RunAPIServer) reap() {
 			continue
 		}
 		log.Printf("run api: removed orphaned run cgroup %s", cg.Path)
+	}
+}
+
+// restoredGrace is how long a restored run's cgroup must stay empty
+// before the reaper ends it: long enough for its agentctl, whose child
+// has just exited, to report the exit code itself.
+const restoredGrace = 10 * time.Second
+
+// endUnclaimed ends restored runs no agentctl has claimed once their
+// cgroups have been empty for restoredGrace.
+func (s *RunAPIServer) endUnclaimed() {
+	var done []string
+	now := time.Now()
+	s.mu.Lock()
+	for runID, empty := range s.restored {
+		path, ok := s.cm.GetRunCgroupPath(runID)
+		if !ok {
+			continue
+		}
+		if populated, err := cgroupPopulated(path); err != nil || populated {
+			s.restored[runID] = time.Time{}
+			continue
+		}
+		if empty.IsZero() {
+			s.restored[runID] = now
+			continue
+		}
+		if now.Sub(empty) >= restoredGrace {
+			done = append(done, runID)
+		}
+	}
+	s.mu.Unlock()
+	for _, r := range done {
+		log.Printf("run api: restored run %s is empty and no client reported its end; ending it", r)
+		s.endRun(r, nil)
 	}
 }
 
@@ -731,6 +789,11 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 		if ac.callID != "" {
 			return fail("this connection holds a call: send call_end")
 		}
+		if ac.runID == "" && req.RunID != "" {
+			if err := ac.claim(strings.TrimPrefix(req.RunID, RunPrefix)); err != nil {
+				return fail("%v", err)
+			}
+		}
 		return ac.end(req.ExitCode)
 	case "call":
 		return ac.call(req)
@@ -859,6 +922,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	}
 	if err == nil {
 		ac.s.active[runID] = true
+		ac.s.creators[runID] = procIdentityOf(ac.cred.Pid)
 		ac.s.runByCg[id] = runID
 		ac.s.runCg[runID] = id
 		if eff != nil {
@@ -905,6 +969,7 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 	} else {
 		ac.s.reg.Put(meta)
 	}
+	ac.s.saveGrants()
 	if ac.s.cm == nil {
 		ac.s.emit(EventRunStart, runID, id)
 	}
@@ -1190,6 +1255,7 @@ func (s *RunAPIServer) applyLayer(runID string, layer policy.Layer, permit func(
 			}
 		})
 	}
+	s.saveGrants()
 	if len(kids) > 0 {
 		log.Printf("run api: run %s: %s %s, and its nested runs %s", runID, layer.Source, layer.Profile.Name, strings.Join(kids, ", "))
 	} else {
@@ -1209,6 +1275,24 @@ func (ac *apiConn) end(exitCode *int) RunAPIResponse {
 	delete(ac.s.endReasons, runID)
 	ac.s.mu.Unlock()
 	return RunAPIResponse{OK: true, RunID: runID, EndReason: why}
+}
+
+// claim makes a run restored at start (milestone 6.1) this connection's,
+// for its agentctl to report its end after the node agent restarted.
+// Only the process that created it may: the same pid and start time.
+func (ac *apiConn) claim(runID string) error {
+	me := procIdentityOf(ac.cred.Pid)
+	ac.s.mu.Lock()
+	defer ac.s.mu.Unlock()
+	if _, ok := ac.s.restored[runID]; !ok {
+		return fmt.Errorf("run %s is not awaiting its client", runID)
+	}
+	if c := ac.s.creators[runID]; me.PID == 0 || c != me {
+		return fmt.Errorf("run %s was created by another process", runID)
+	}
+	delete(ac.s.restored, runID)
+	ac.runID, ac.cgID = runID, ac.s.runCg[runID]
+	return nil
 }
 
 // abandon ends a run whose client went away without "end", unless the
@@ -1305,6 +1389,8 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 		}
 	}
 	delete(s.runCg, runID)
+	delete(s.restored, runID)
+	delete(s.creators, runID)
 	delete(s.callSeq, runID)
 	delete(s.liveCalls, runID)
 	delete(s.children, runID)
@@ -1321,6 +1407,7 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 		}
 	}
 	s.mu.Unlock()
+	s.saveGrants()
 	if nested && s.OnNestedEnd != nil {
 		s.OnNestedEnd(cgID)
 	}
@@ -1355,8 +1442,10 @@ func (s *RunAPIServer) descendants(runID string) []string {
 
 // RunAPIClient is the client side of the run API.
 type RunAPIClient struct {
-	c  *net.UnixConn
-	mc *msgConn
+	c     *net.UnixConn
+	mc    *msgConn
+	path  string
+	runID string // from Create, to report the end after a node agent restart
 }
 
 // DialRunAPI connects to the node agent.
@@ -1365,7 +1454,7 @@ func DialRunAPI(path string) (*RunAPIClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot reach the node agent at %s (is it running?): %w", path, err)
 	}
-	return &RunAPIClient{c: c, mc: newMsgConn(c)}, nil
+	return &RunAPIClient{c: c, mc: newMsgConn(c), path: path}, nil
 }
 
 // Close closes the connection. If the run has not ended, the node agent
@@ -1396,7 +1485,11 @@ func (rc *RunAPIClient) call(req RunAPIRequest, fds ...int) (RunAPIResponse, err
 
 // Create asks for a new run, optionally requesting a profile.
 func (rc *RunAPIClient) Create(command []string, cwd, profile string) (RunAPIResponse, error) {
-	return rc.call(RunAPIRequest{Op: "create", Command: command, Cwd: cwd, Profile: profile})
+	resp, err := rc.call(RunAPIRequest{Op: "create", Command: command, Cwd: cwd, Profile: profile})
+	if err == nil {
+		rc.runID = resp.RunID
+	}
+	return resp, err
 }
 
 // Profiles lists what the caller may request.
@@ -1465,9 +1558,25 @@ func (rc *RunAPIClient) Attach(pidfd int) error {
 
 // End reports the exit code (nil if unknown) and ends the run. It returns
 // why the node agent had ended it already, if it had.
+//
+// If the node agent restarted during the run, the connection is gone; the
+// new node agent restored the run (milestone 6.1), so End reconnects and
+// claims it by its id, as the process that created it.
 func (rc *RunAPIClient) End(exitCode *int) (string, error) {
 	resp, err := rc.call(RunAPIRequest{Op: "end", ExitCode: exitCode})
-	return resp.EndReason, err
+	if err == nil || resp.Error != "" || rc.runID == "" || rc.path == "" {
+		return resp.EndReason, err
+	}
+	nc, derr := DialRunAPI(rc.path)
+	if derr != nil {
+		return "", fmt.Errorf("%w (and reconnecting: %v)", err, derr)
+	}
+	defer nc.Close()
+	resp, err2 := nc.call(RunAPIRequest{Op: "end", RunID: rc.runID, ExitCode: exitCode})
+	if err2 != nil {
+		return "", fmt.Errorf("%w (and after reconnecting: %v)", err, err2)
+	}
+	return resp.EndReason, nil
 }
 
 // ActiveRuns counts runs whose agentctl connection is open.

@@ -113,6 +113,7 @@ place:
 | Integration tests for the gaps: content rules and `connections_per_min` under transparent mode, and `sampling: ask` on a remote MCP server's event stream; operator guide gains Phase 5 records, incident response for held requests, and security notes. Phase 5 complete. | [5.8 status](#58-status-2026-11-24), [operator guide](operator-guide.md) |
 | Phase 6 broken into milestones: restart recovery first, since a restarted node agent forgets what runs were granted; then TLS uprobes for visibility only, per library (libssl, Go, Node and Bun), capturing request lines and headers, not bodies. | [Phase 6 plan](#phase-6-plan-2026-11-24) |
 | 6.0 spikes: a node agent restart lifts every rule from runs in progress, revocations included; uprobes read requests from libssl, GnuTLS and Go 1.25 and 1.26 but tax every process using the library unless attached per process, which needs each exec held until attached; the Bun-built `claude` binary cannot be hooked; about 5 µs per TLS call in a VM. | [6.0 spike results](#60-spike-results-2026-11-24) |
+| Restart recovery: live runs' grants kept in a root-owned file at each change and restored, bound version and kernel state included, before the first heartbeat; old LSM links kept until then; unrestorable runs revoked; `agentctl run` reconnects to report the exit code. Found: status said healthy before the first heartbeat. | [6.1 status](#61-status-2026-11-24) |
 
 ---
 
@@ -2923,7 +2924,7 @@ forced DNS, for runs with an enforcing profile where BPF LSM is active.
 
 Limits:
 
-- Runs that outlive a node agent restart come back unprofiled, so their
+- *Fixed in 6.1: runs keep their grants across a restart.* Runs that outlive a node agent restart come back unprofiled, so their
   Unix connects are recorded, not refused, as with egress since Phase 2.
 - A daemon reached through an allowed socket acts with its own authority.
   That is what the root and bypass notes are for.
@@ -4271,6 +4272,101 @@ Findings that change the plan:
   the time. Capture is opt-in per profile as well as per node, so the
   runs that pay are the ones being learned from.
 
+#### 6.1 status (2026-11-24)
+
+Implemented, with cgroup identity:
+
+- **Grants file.** `<state-dir>/grants.json`, root's, mode 0600, rewritten
+  whole (temp file and rename) whenever a live run's grants change: at
+  create, nested create, clamp, revoke, a limit, and end. It holds, per
+  run:
+  - its cgroup id and path, uid, parent and start time;
+  - its layers, by profile version, with built-in layers (revoked, limit
+    reached) by kind and message;
+  - its ceiling's UDP and ICMP;
+  - its record (command, calls);
+  - the `agentctl` that created it, by pid and start time.
+
+  The profile documents those versions name are stored with them, once
+  each.
+- **Restore,** in the node agent's start-up, after BPF is loaded and before
+  the run API, `ext_proc`, the resolver or the heartbeat start:
+  - A run is restored only if its cgroup is still there with the same id.
+    A nested run is restored only if its parent was.
+  - Each layer is rebuilt from its stored document, compiled with this
+    node's options, which keeps the run on the version it was bound to
+    (§5.6). Its version is checked against the one recorded.
+  - The run is then bound as `create` binds a new one: the run API's maps,
+    the registry, the limiter, and the kernel's exec, Unix, network and
+    nested-run maps. Open tool calls keep their attribution, and call
+    numbering resumes.
+  - A run whose layers cannot be rebuilt is revoked, with the reason in its
+    narration and timeline.
+  - The file is rewritten without the runs that ended meanwhile.
+- **Fail closed meanwhile.** With runs to restore, the node agent writes no
+  heartbeat until the heartbeat loop starts, after the restore, so connects
+  from runs are refused until then. In transparent enforce, the previous
+  node agent's pinned LSM links are unpinned but kept open, and so still
+  attached, until the restore has written the new maps. Their own maps hold
+  the same runs' exec and Unix policy.
+- **Ending.** `agentctl`'s `End` reconnects if the node agent restarted, and
+  claims the run by id. Only the process that created it may claim it, by
+  pid and start time. A restored run no client claims is ended once its
+  cgroup has been empty for 10 seconds.
+- **Reporting.** `agentctl status` has a `Restored` line, and timelines a
+  `restored` list.
+
+Found on the way:
+
+- **Status said healthy before the first heartbeat.** "Healthy" meant only
+  that no health check had failed yet. With the first beat held back, a run
+  could see `EPERM` while status said `Healthy yes`. Healthy now also needs
+  a heartbeat written, and the heartbeat loop beats as soon as it starts.
+
+Decisions:
+
+- **Restore the bound version, not the current one.** A restart is not a
+  policy change. A run keeps the version it was bound to, as it does across
+  a `SIGHUP` reload. Only a version that no longer compiles here, which
+  needs a node change, revokes the run.
+- **A root-owned file, not the timelines.** Timelines belong to the run's
+  user, who could edit a clamp or revocation out of one. A grants file
+  anyone else can write stops the node agent from starting.
+- **Only the creating process may claim a run,** so the exit code in a
+  timeline comes from the process that saw it.
+
+Limits:
+
+- Requests held for a person (5.5) and rate allowances (5.2) are not kept:
+  held clients get an error, and allowances start full.
+- Credential identity keeps nothing: run secrets live in memory, so the
+  proxy refuses restored runs' requests, failing closed, as before.
+- Kept LSM links bridge only transparent enforce, where they are pinned. In
+  audit nothing is refused, so nothing needs bridging.
+
+Verified:
+
+- Unit tests:
+  - restoring runs that are nested, clamped, revoked, unprofiled, ended
+    meanwhile, and missing their profile document (revoked, with the
+    reason);
+  - a run keeping its bound version after the profile was edited;
+  - the kernel and limiter told of each run;
+  - call numbering resumed;
+  - claiming a run by its creator only;
+  - ending an unclaimed run once its cgroup was empty;
+  - refusing a grants file others can write.
+- `make integration-transparent`, now twenty-seven checks, with a
+  `restart` check that repeats the 6.0 experiment. Two runs under `tp`
+  were started, one revoked, and the node agent restarted. After the
+  restart:
+  - the path rule (403), the unlisted host, its name and the untrusted exec
+    were refused as before, and the allowed request passed;
+  - the revoked run stayed revoked;
+  - status reported 2 runs restored;
+  - `agentctl run` reported the exit code;
+  - the timeline lists the restore.
+
 ---
 
 ## 11. Non-goals and honest limits
@@ -4333,9 +4429,9 @@ Findings that change the plan:
    that with a narrated 503.
 4. **Reconcile loop for orphaned runs** — node agent restarts, harness crashes,
    cgroups outliving their policy entries. Standard controller reconcile, but the
-   fail-closed ordering needs care. *Planned in 6.1:* grants persisted and
-   restored before the node reports healthy; a run whose grants cannot be
-   restored is revoked.
+   fail-closed ordering needs care. *Answered in 6.1:* grants persisted at
+   each change and restored before the first heartbeat; a run whose grants
+   cannot be rebuilt is revoked; unclaimed restored runs end once empty.
 5. **Explicit-proxy identity** — per-run listener or per-run credential, and how
    a laptop harness obtains either without a privileged helper. See
    [§4.3](#43-two-deployment-modes). *Answered in Phase 2:* the cgroup by

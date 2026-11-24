@@ -51,6 +51,9 @@ type RunTimeline struct {
 	// Budgets are what the run spent of the budgets it owns, nested runs
 	// included (milestone 5.4).
 	Budgets []BudgetState `json:"budgets,omitempty"`
+	// Restored are when a restarted node agent gave the run its grants
+	// back (milestone 6.1).
+	Restored []time.Time `json:"restored,omitempty"`
 
 	// Complete is true only if the node agent saw the run from cgroup
 	// creation to removal without interruption. Otherwise events may be
@@ -1145,6 +1148,7 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 		tl.Children = m.Children
 	}
 	tl.EndReason, tl.EgressBytes, tl.Limits, tl.Budgets = m.EndReason, m.EgressBytes, m.Limits, m.Budgets
+	tl.Restored = m.Restored
 	if len(m.Calls) > 0 {
 		tl.Calls = make([]CallSummary, 0, len(m.Calls))
 		for _, c := range m.Calls {

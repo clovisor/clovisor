@@ -48,6 +48,7 @@ type NodeAgent struct {
 	lsm        bool
 	quic       bool
 	execHash   bool // the kernel's exec hook hashes files (milestone 5.7)
+	restored   RestoreReport
 	relay      *QUICRelay
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
@@ -268,6 +269,14 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		if recorder, err = NewRunRecorder(agentsDir, opts.OutDir, registry); err != nil {
 			return nil, err
 		}
+		// Runs that outlived the previous node agent (milestone 6.1): no
+		// heartbeat, so their connects are refused, until they have their
+		// grants back.
+		if n, err := PendingGrants(d.Grants()); err != nil {
+			return nil, fmt.Errorf("grants: %w (move it aside to start anyway: the runs it lists then come back unprofiled)", err)
+		} else if n > 0 && t.Mode != TransparentOff {
+			t.DeferBeat = true
+		}
 		if audit, err = NewAgentAuditWithBPF(opts.BPFObjPath, agentsDir, agentsID, level, opts.Transparent); err != nil {
 			return nil, fmt.Errorf("failed to create agent audit: %w", err)
 		}
@@ -292,6 +301,8 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	}
 	if credential {
 		api.Events = httpEvents
+	} else {
+		api.GrantsPath = d.Grants()
 	}
 	api.Transparent = opts.Transparent.Mode
 	if resolver != nil {
@@ -505,6 +516,21 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			ended(runID, runCg)
 			asks.ForgetRun(runID)
 		}
+	}
+	// Give runs that outlived the previous node agent their grants back,
+	// before anything serves and before the first heartbeat.
+	rep, err := api.Restore()
+	if err != nil {
+		api.Close()
+		closeAudit()
+		return nil, fmt.Errorf("restoring runs: %w", err)
+	}
+	if rep.Restored+rep.Gone > 0 {
+		fmt.Printf("restore: %s\n", rep)
+	}
+	na.restored = rep
+	if r := audit.reader; r != nil {
+		r.ReleaseHeldLSM()
 	}
 	na.limiter.Resume()
 
@@ -1088,6 +1114,9 @@ func (na *NodeAgent) Status() NodeStatus {
 	}
 	if na.api != nil {
 		s.ActiveRuns = na.api.ActiveRuns()
+		if r := na.restored; r.Restored+r.Gone > 0 {
+			s.Restored = r.String()
+		}
 	}
 	return s
 }

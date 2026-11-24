@@ -609,6 +609,7 @@ type EBPFReader struct {
 	// the node agent's view of whether the proxy can serve runs.
 	health    atomic.Value // func() error
 	unhealthy atomic.Bool
+	beaten    atomic.Bool // a heartbeat has been written
 
 	gateMu    sync.Mutex
 	gateCg    string
@@ -618,6 +619,9 @@ type EBPFReader struct {
 	// execProg is on_lsm_exec_hash or on_lsm_exec (see loadExec), apart
 	// from lsm because LoadAndAssign would try to fill it.
 	execProg *ebpf.Program
+	// heldLSM are the previous node agent's LSM links, kept attached
+	// until restored runs have their policy in the new maps.
+	heldLSM  []link.Link
 	lsmState string // what the socket hooks do, for status
 	execMu   sync.Mutex
 	execKeys map[uint64][]bpfExecKey // exec_allow entries written, per run
@@ -667,10 +671,14 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		r.Close()
 		return nil, fmt.Errorf("failed to write BPF config: %w", err)
 	}
-	// A heartbeat before any hook can see a connect.
-	if err := r.beat(); err != nil {
-		r.Close()
-		return nil, err
+	// A heartbeat before any hook can see a connect, unless runs await
+	// their grants: then the heartbeat loop's first beat, once they have
+	// them, is the first.
+	if !t.DeferBeat {
+		if err := r.beat(); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 
 	for _, t := range []struct {
@@ -1022,7 +1030,13 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		path := r.pinPath(name)
 		if old, err := link.LoadPinnedLink(path, nil); err == nil {
 			old.Unpin()
-			old.Close()
+			if t.DeferBeat {
+				// Still attached while open: its maps hold the policy of
+				// the runs being restored (milestone 6.1).
+				r.heldLSM = append(r.heldLSM, old)
+			} else {
+				old.Close()
+			}
 		}
 		if pin {
 			if err := os.MkdirAll(t.PinDir, 0o700); err != nil {
@@ -1101,6 +1115,15 @@ func ExecHashSupported(objPath string) bool {
 	return true
 }
 
+// ReleaseHeldLSM detaches the previous node agent's LSM programs, once
+// the runs they governed have their policy in this one's maps.
+func (r *EBPFReader) ReleaseHeldLSM() {
+	for _, l := range r.heldLSM {
+		l.Close()
+	}
+	r.heldLSM = nil
+}
+
 // LSMState says what the BPF LSM socket hooks do on this node.
 func (r *EBPFReader) LSMState() string { return r.lsmState }
 
@@ -1166,6 +1189,7 @@ func (r *EBPFReader) beat() error {
 	if err := r.objs.Heartbeat.Put(uint32(0), uint64(ts.Nano())); err != nil {
 		return fmt.Errorf("heartbeat: %w", err)
 	}
+	r.beaten.Store(true)
 	return nil
 }
 
@@ -1179,31 +1203,35 @@ func (r *EBPFReader) heartbeatLoop() {
 	defer close(r.beatDone)
 	tick := time.NewTicker(r.transparent.Stale / 3)
 	defer tick.Stop()
+	now := make(chan time.Time, 1)
+	now <- time.Now() // the first beat at once: with DeferBeat, nothing has beaten yet
 	for {
 		select {
 		case <-r.done:
 			return
+		case <-now:
 		case <-tick.C:
-			if f, _ := r.health.Load().(func() error); f != nil {
-				if err := f(); err != nil {
-					if !r.unhealthy.Swap(true) {
-						log.Printf("transparent: unhealthy, heartbeat stopped (connects from runs will be refused): %v", err)
-					}
-					continue
+		}
+		if f, _ := r.health.Load().(func() error); f != nil {
+			if err := f(); err != nil {
+				if !r.unhealthy.Swap(true) {
+					log.Printf("transparent: unhealthy, heartbeat stopped (connects from runs will be refused): %v", err)
 				}
-				if r.unhealthy.Swap(false) {
-					log.Printf("transparent: healthy again, heartbeat resumed")
-				}
+				continue
 			}
-			if err := r.beat(); err != nil {
-				log.Printf("bpf: %v", err)
+			if r.unhealthy.Swap(false) {
+				log.Printf("transparent: healthy again, heartbeat resumed")
 			}
+		}
+		if err := r.beat(); err != nil {
+			log.Printf("bpf: %v", err)
 		}
 	}
 }
 
-// Healthy reports whether the last health check passed.
-func (r *EBPFReader) Healthy() bool { return !r.unhealthy.Load() }
+// Healthy reports whether the last health check passed and a heartbeat
+// has been written: until then the kernel refuses connects from runs.
+func (r *EBPFReader) Healthy() bool { return r.beaten.Load() && !r.unhealthy.Load() }
 
 // LostFor returns and clears a run's missing events: those lost to a full
 // ring buffer, and those suppressed because the run spent its event
@@ -1314,6 +1342,7 @@ func (r *EBPFReader) Close() {
 			r.rd.Close()
 			r.wg.Wait()
 		}
+		r.ReleaseHeldLSM()
 		r.objs.Close()
 		r.lsm.Close()
 		if r.execProg != nil {

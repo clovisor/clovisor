@@ -101,7 +101,7 @@ shaping agent behaviour, not for containing a hostile one.
 | | As root | As a user (Linux) | As a user (macOS) |
 |---|---|---|---|
 | Runtime: sockets, Envoy bootstrap, trust bundle | `/run/clovisor` (`/var/run/clovisor` on macOS) | `$XDG_RUNTIME_DIR/clovisor` | `~/Library/Application Support/Clovisor/run` |
-| State: timelines, node CA, tool pins | `/var/lib/clovisor` (`/Library/Application Support/Clovisor` on macOS) | `$XDG_STATE_HOME/clovisor` or `~/.local/state/clovisor` | `~/Library/Application Support/Clovisor` |
+| State: timelines, node CA, tool pins, counters, live runs' grants | `/var/lib/clovisor` (`/Library/Application Support/Clovisor` on macOS) | `$XDG_STATE_HOME/clovisor` or `~/.local/state/clovisor` | `~/Library/Application Support/Clovisor` |
 
 `-runtime-dir` and `-state-dir` move them; the individual path flags (`-socket`,
 `-out`, `-ca-dir`, …) override single files. `agentctl` looks for a user-level
@@ -129,10 +129,36 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 
 Signals: `SIGHUP` reloads the policy directory (a bad edit is rejected and the
 policy in force stays); `SIGINT`/`SIGTERM` stop the agent, leaving live runs
-running. With cgroup identity a restarted node agent resumes their timelines.
-With credential identity run secrets live only in the node agent's memory:
-after a restart, live runs' requests are refused and their timelines stay
-partial, so restart between runs.
+running. With credential identity run secrets live only in the node agent's
+memory: after a restart, live runs' requests are refused and their timelines
+stay partial, so restart between runs.
+
+**Restarting with cgroup identity.** Runs going across a node agent restart
+keep what they were granted:
+- **What is kept.** The node agent writes each live run's grants to
+  `<state-dir>/grants.json` (root's, mode 0600) whenever they change: at
+  start, clamp, revoke, a limit, a nested run, and the run's end. That
+  covers the profile version the run was bound to, clamps, revocations and
+  nesting.
+- **Restoring.** A restarted node agent gives each run whose cgroup is still
+  there its grants back, kernel state included, before it serves anything.
+  It keeps the run on its bound version even if the policy directory changed
+  meanwhile. Runs that ended meanwhile are dropped.
+- **Until then, fail closed.** In transparent enforce, connects from runs are
+  refused until the restore is done, and the previous node agent's exec and
+  Unix socket hooks stay attached until the new ones hold the same policy.
+- **A run that cannot be restored** (its profile no longer compiles on this
+  node, say) is revoked, with a narrated reason, never left unprofiled.
+- **Ending.** `agentctl run` reconnects to report its run's exit code. A
+  restored run whose `agentctl` is gone is ended once its cgroup has been
+  empty for 10 seconds.
+- **Records.** `agentctl status` says what was restored at start; the run's
+  timeline lists when (`restored`). Requests held for a person (§6 Ask) and
+  rate allowances are not kept.
+
+A `grants.json` that is not root's, or that others can write, stops the node
+agent from starting. Move it aside to start anyway: the runs it lists then
+come back unprofiled.
 
 ## 5. Run Envoy
 
@@ -863,7 +889,8 @@ transparent listener; it checks Envoy every second over the admin socket.
 If either is down, or Envoy still runs a bootstrap from before transparent
 mode, then within `-transparent-stale` every connect and DNS query from a run
 is refused until both are back. A restarted node agent swaps its programs
-into the pinned links with no gap.
+into the pinned links with no gap, and restores live runs' grants before its
+first heartbeat (§4 Restarting).
 
 **Check it:** `agentctl status` shows the mode, whether the node is healthy
 and why not, Envoy's process and cgroup, whether the proxy is gated, and
@@ -1199,6 +1226,8 @@ agentctl events --json <run-id>
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination the run did not look up through the node (a hard-coded address) needs a `cidr` rule. |
 | A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
+| A run is revoked with "the node agent restarted and could not restore its policy" | Its grants could not be rebuilt after a restart: the reason follows. Start the run again. |
+| `grants: ... must be owned by root` at start | `<state-dir>/grants.json` has the wrong owner or mode. Fix it, or move it aside to start without restoring runs (they come back unprofiled). |
 | A pinned binary fails with `Permission denied` after an upgrade (transparent) | Its content no longer matches the `hash` in `exec.allow`; the timeline's `exec_path` note names the content that ran. Add its `sha256sum` to the entry (up to four), then remove the old one. |
 | `exec hashes unavailable` in the node agent's log | The kernel lacks `bpf_ima_file_hash` (5.18) or the TAI clock (5.19), so exec is decided by path alone and enforcing profiles with hashes do not load. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS, `-udp-allow`, and what both the ceiling's and the profile's `udp.allow` name. Check `udp_refused` and the connect events in the timeline. |
@@ -1302,5 +1331,9 @@ ignore the proxy, it checks:
   name resolved and the default's not, and a held request approved by the
   run's owner;
 - `check --transparent` on the recorded runs;
+- restart: a run going across a node agent restart refused the same things
+  after it as before (a path rule, an unlisted host and its name, an
+  untrusted exec), a run revoked before it stayed revoked, `agentctl status`
+  reported both restored, and `agentctl run` reported the exit code;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

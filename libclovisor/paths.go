@@ -84,6 +84,9 @@ func (d Dirs) Pins() string          { return filepath.Join(d.State, "mcp-pins.j
 func (d Dirs) Runs() string          { return filepath.Join(d.State, "runs") }
 func (d Dirs) Counters() string      { return filepath.Join(d.State, "counters.json") }
 
+// Grants is where live runs' grants are kept across restarts (6.1).
+func (d Dirs) Grants() string { return filepath.Join(d.State, "grants.json") }
+
 // systemUpstreamCA is the trust store Envoy verifies origins against.
 func systemUpstreamCA() string {
 	for _, p := range systemBundles {

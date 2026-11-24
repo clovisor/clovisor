@@ -489,7 +489,32 @@ func RevokedProfile() *CompiledProfile {
 	}
 	cp := c.Profiles[0]
 	cp.DefaultMessage = "Egress for this run has been revoked."
+	cp.Builtin = BuiltinRevoked
 	return cp
+}
+
+// Built-in profiles: made by the node agent, not loaded from the policy
+// directory, so a restored run gets them back by kind and message
+// (milestone 6.1).
+const (
+	BuiltinRevoked = "revoked"
+	BuiltinLimit   = "limit"
+)
+
+// BuiltinProfile rebuilds a built-in profile: BuiltinRevoked, or
+// BuiltinLimit with its message. Any other kind is refused.
+func BuiltinProfile(kind, msg string) (*CompiledProfile, error) {
+	switch kind {
+	case BuiltinRevoked:
+		cp := RevokedProfile()
+		if msg != "" {
+			cp.DefaultMessage = msg
+		}
+		return cp, nil
+	case BuiltinLimit:
+		return LimitedProfile(msg), nil
+	}
+	return nil, fmt.Errorf("no built-in profile %q", kind)
 }
 
 // LimitedProfile is the profile the node agent layers onto a run that
@@ -499,6 +524,7 @@ func LimitedProfile(msg string) *CompiledProfile {
 	cp := RevokedProfile()
 	cp.Name = "limit-reached"
 	cp.DefaultMessage = msg
+	cp.Builtin = BuiltinLimit
 	return cp
 }
 

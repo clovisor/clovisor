@@ -135,6 +135,10 @@ type CompiledProfile struct {
 	Rules          []*compiledRule
 	Placements     []Placement
 	Profile        *AgentProfile
+	// Builtin names a profile the node agent made rather than loaded
+	// (BuiltinRevoked, BuiltinLimit); "" for profiles from the policy
+	// directory.
+	Builtin string
 
 	exec *compiledExec
 	mcp  *MCP

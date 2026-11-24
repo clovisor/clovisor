@@ -55,6 +55,12 @@ type TransparentOptions struct {
 	// enforce, UDP 443 from a run goes there and is decided by the
 	// server name in its Initial. 0: QUIC is refused like other UDP.
 	QUICPort uint16
+	// DeferBeat holds the first heartbeat back until the heartbeat loop
+	// starts, so connects from runs that outlived the previous node agent
+	// are refused until their grants are restored (milestone 6.1). It
+	// also keeps the previous node agent's pinned LSM programs attached
+	// until ReleaseHeldLSM, so their maps keep enforcing meanwhile.
+	DeferBeat bool
 	// ExecHash loads the exec program that hashes files (milestone 5.7),
 	// where ExecHashSupported says the kernel can; otherwise exec is
 	// decided by path alone.

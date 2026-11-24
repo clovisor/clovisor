@@ -35,6 +35,7 @@ func (r *EBPFReader) ProxyRefused() uint64                           { return 0 
 func (r *EBPFReader) GateProxy(string) error                         { return errors.New("needs Linux") }
 func (r *EBPFReader) GatedProxy() string                             { return "" }
 func (r *EBPFReader) LSMState() string                               { return "needs Linux" }
+func (r *EBPFReader) ReleaseHeldLSM()                                {}
 func (r *EBPFReader) SetUnixPolicy(uint64, []string, bool) error     { return nil }
 func (r *EBPFReader) ForgetUnixPolicy(uint64)                        {}
 func (r *EBPFReader) SetUnixNode([]string) error                     { return nil }

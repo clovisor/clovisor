@@ -92,6 +92,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("ask", e.testTransparentAsk)
 	t.Run("quic", e.testQUIC)
 	t.Run("check-transparent", e.testCheckTransparent)
+	t.Run("restart", e.testRestart)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -138,6 +139,16 @@ func (e *env) stopNodeAgent() error {
 	return nil
 }
 
+// startNodeAgent starts the node agent in the agent container, appending
+// to its log, as the suite runs it: transparent enforce with QUIC.
+func (e *env) startNodeAgent() {
+	e.run("exec", "-d", e.name("agent"), "sh", "-c",
+		"echo $$ > /run/node-agent.pid; exec /it/bin/node-agent -identity cgroup -bpf /it/bin/agent_audit.o"+
+			" -agents-cgroup "+e.agentsCgroup()+
+			" -policy-dir /etc/clovisor/policy -proxy-listen 127.0.0.1:18000 -envoy-upstream-ca /run/clovisor/upstream.pem"+
+			" -transparent enforce -quic -udp-allow "+e.originIP+":5000 >> /var/log/node-agent.log 2>&1")
+}
+
 // startTransparent brings up the origin (TLS, a banner port, a UDP echo),
 // a privileged agent container with the node agent in transparent
 // enforce mode, and Envoy in its network namespace.
@@ -182,11 +193,7 @@ chown -R root:root /etc/clovisor && chmod 755 /etc/clovisor/policy && chmod 644 
 cat /etc/ssl/certs/ca-certificates.crt /it/test-ca.crt > /run/clovisor/upstream.pem`); err != nil {
 		t.Fatalf("prepare agent: %v\n%s%s", err, out, errOut)
 	}
-	e.run("exec", "-d", e.name("agent"), "sh", "-c",
-		"echo $$ > /run/node-agent.pid; exec /it/bin/node-agent -identity cgroup -bpf /it/bin/agent_audit.o"+
-			" -agents-cgroup "+e.agentsCgroup()+
-			" -policy-dir /etc/clovisor/policy -proxy-listen 127.0.0.1:18000 -envoy-upstream-ca /run/clovisor/upstream.pem"+
-			" -transparent enforce -quic -udp-allow "+e.originIP+":5000 > /var/log/node-agent.log 2>&1")
+	e.startNodeAgent()
 	if out, errOut, err := e.sh(`for i in $(seq 50); do [ -S /run/clovisor/agent.sock ] && [ -f /run/clovisor/envoy.json ] && exit 0; sleep 0.1; done
 cat /var/log/node-agent.log; exit 1`); err != nil {
 		t.Fatalf("node agent did not start: %v\n%s%s", err, out, errOut)
@@ -628,6 +635,89 @@ except OSError:
 	e.timeline(id)
 	out, _, _ := e.sh("/it/bin/agentctl check --transparent --profile /etc/clovisor/policy/tp.yaml " + id)
 	expect(t, out, "as transparent enforce would decide", "dns    other.test", "udp    UDP 8.8.8.8:4443")
+}
+
+func (e *env) testRestart(t *testing.T) {
+	// Milestone 6.1: runs going when the node agent restarts keep what
+	// they were granted. Run A probes the same things before and after;
+	// run B, revoked before the restart, stays revoked. (In 6.0, after a
+	// restart, all of A's probes passed and B reached the origin.)
+	e.needLSM(t)
+	if _, errOut, err := e.sh("cp /bin/true /tmp/t; rm -f /tmp/go* /tmp/done*"); err != nil {
+		t.Fatal(errOut)
+	}
+	probe := e.script("restart", `for i in 0 1; do
+  while [ ! -f /tmp/go$i ]; do sleep 0.1; done
+  echo "R$i allowed $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/allowed)"
+  echo "R$i secret $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/secret)"
+  echo "R$i other $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://other.test/x)"
+  getent hosts other.test >/dev/null && echo "R$i dns-other resolved" || echo "R$i dns-other refused"
+  /tmp/t 2>/dev/null && echo "R$i exec-tmp ran" || echo "R$i exec-tmp refused"
+  touch /tmp/done$i
+done
+`)
+	revoked := e.script("revoked", `while [ ! -f /tmp/go1 ]; do sleep 0.1; done
+echo "B after $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/allowed)"
+`)
+	noProxy := "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp -- sh -c '"+noProxy+probe+"' > /tmp/ra.out 2>&1; echo exit=$? >> /tmp/ra.out")
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp -- sh -c '"+noProxy+revoked+"' > /tmp/rb.out 2>&1")
+	ids := map[string]string{}
+	for _, f := range []string{"ra", "rb"} {
+		for i := 0; i < 50 && ids[f] == ""; i++ {
+			out, _, _ := e.sh("cat /tmp/" + f + ".out")
+			if m := runIDRE.FindStringSubmatch(out); m != nil {
+				ids[f] = m[1]
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if ids["ra"] == "" || ids["rb"] == "" {
+		t.Fatalf("runs did not start: %v", ids)
+	}
+	if out, errOut, err := e.sh("/it/bin/agentctl revoke " + ids["rb"]); err != nil {
+		t.Fatalf("revoke: %v %s%s", err, out, errOut)
+	}
+	e.sh("touch /tmp/go0; while [ ! -f /tmp/done0 ]; do sleep 0.1; done")
+
+	if err := e.stopNodeAgent(); err != nil {
+		t.Fatal(err)
+	}
+	if _, errOut, err := e.sh("while kill -0 $(cat /run/node-agent.pid) 2>/dev/null; do sleep 0.1; done"); err != nil {
+		t.Fatal(errOut)
+	}
+	e.startNodeAgent()
+	if out, errOut, err := e.sh(`for i in $(seq 100); do /it/bin/agentctl status 2>/dev/null | grep -q 'Healthy       yes' && exit 0; sleep 0.1; done
+/it/bin/agentctl status; exit 1`); err != nil {
+		t.Fatalf("not healthy after restart: %v\n%s%s", err, out, errOut)
+	}
+	status, _, _ := e.sh("/it/bin/agentctl status")
+	expect(t, status, "Restored      2 runs restored at start")
+
+	e.sh("touch /tmp/go1; while [ ! -f /tmp/done1 ]; do sleep 0.1; done")
+	var a string
+	for i := 0; i < 100 && !strings.Contains(a, "exit="); i++ {
+		a, _, _ = e.sh("cat /tmp/ra.out")
+		time.Sleep(100 * time.Millisecond)
+	}
+	expect(t, a, "R0 allowed 200", "R0 secret 403", "R0 other 000", "R0 dns-other refused", "R0 exec-tmp refused",
+		"R1 allowed 200", "R1 secret 403", "R1 other 000", "R1 dns-other refused", "R1 exec-tmp refused", "exit=0")
+	if strings.Contains(a, "could not report the end") {
+		t.Errorf("agentctl did not reconnect to report the end:\n%s", a)
+	}
+	var b string
+	for i := 0; i < 100 && !strings.Contains(b, "B after"); i++ {
+		b, _, _ = e.sh("cat /tmp/rb.out")
+		time.Sleep(100 * time.Millisecond)
+	}
+	expect(t, b, "B after ")
+	if strings.Contains(b, "B after 200") {
+		t.Errorf("a run revoked before the restart reached the origin after it:\n%s", b)
+	}
+	tl := e.timeline(ids["ra"])
+	expect(t, tl, `"restored": [`, `"exit_code": 0`)
+	shown, _, _ := e.sh("/it/bin/agentctl events " + ids["ra"])
+	expect(t, shown, "Restored  ", "the node agent restarted, and gave the run its grants back")
 }
 
 func (e *env) testFailClosed(t *testing.T) {
