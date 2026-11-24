@@ -1,12 +1,13 @@
 # Clovisor II — An Agent Egress Control & Audit Engine
 
-**Status:** Phases 1 (audit), 2 (explicit proxy and MCP) and 3 (transparent
-mode on Linux) implemented ·
-**Date:** 2026-11-14, revised 2026-11-23 · **Repo:** `clovisor` ·
+**Status:** Phases 1 (audit), 2 (explicit proxy and MCP), 3 (transparent
+mode on Linux), 4 (kernel enforcement) and 5 (content, limits, budgets and
+approvals) implemented ·
+**Date:** 2026-11-14, revised 2026-11-24 · **Repo:** `clovisor` ·
 **Operating it:** [operator guide](operator-guide.md)
 
 > A design study on repointing Clovisor's architecture from Istio service-mesh
-> observability toward egress control and audit for AI agents. Phases 1 to 3
+> observability toward egress control and audit for AI agents. Phases 1 to 5
 > are implemented ([§10](#10-build-order)). Open questions are
 > collected in [§12](#12-open-questions). The 2026-11-19 design review and what
 > it changed are summarized under [Revision history](#revision-history).
@@ -104,6 +105,12 @@ place:
 | Ask: `action: ask`, `mode: ask` and `sampling: ask` hold a request in the node agent's queue until a person decides over the run API, or its timeout; decisions refused from inside a run, and needing root with credential identity; remembered decisions; held requests capped; open question 3 answered for host deployments. | [5.5 status](#55-status-2026-11-24) |
 | QUIC by name (opt-in, `-quic`): UDP 443 from runs sent by the connect hooks to a relay in the node agent, which reads the server name from the Initial packets and decides it as a CONNECT; refused, with a narrated `CONNECTION_REFUSED`, for hosts needing termination or a person, ECH and unnamed connections. | [5.6 status](#56-status-2026-11-24) |
 | Exec hashes: `exec.allow[].hash` pins a path's content, checked by `bpf_ima_file_hash` in a sleepable exec hook and cached per inode while its validators hold; other content refused whatever the default; a path-only hook loaded where the kernel cannot hash, and enforcing profiles with hashes refused there. Found: exact `exec.allow` paths had never matched in the kernel (fixed). | [5.7 status](#57-status-2026-11-24) |
+
+### 2026-11-24 — Phase 5 complete
+
+| Change | Where |
+|---|---|
+| Integration tests for the gaps: content rules and `connections_per_min` under transparent mode, and `sampling: ask` on a remote MCP server's event stream; operator guide gains Phase 5 records, incident response for held requests, and security notes. Phase 5 complete. | [5.8 status](#58-status-2026-11-24), [operator guide](operator-guide.md) |
 
 ---
 
@@ -4062,6 +4069,61 @@ Verified:
     second time from the cache;
   - rewritten on the host after it was cached, it was refused at once;
     restored, it ran.
+
+#### 5.8 status (2026-11-24)
+
+Each milestone had integration tests from when it landed; 5.8 filled
+what they left out:
+
+- **Transparent content and connection rate.** Under `tp-content`, with no
+  proxy settings in the run:
+  - a body to a host the transparent listener terminates was redacted in
+    place;
+  - one carrying an AWS key was refused with the rule's message;
+  - the seventh and eighth connections of a run allowed six a minute were
+    refused, by `connections_per_min`.
+- **`sampling: ask`.** The test MCP server answers a `summarize` call with
+  an event stream that holds a sampling request, then the result. Under
+  `it-ask`:
+  - the first sampling request was held, approved, and reached the client;
+  - the second was denied and cut out of the stream, while its call's
+    result still arrived;
+  - the timeline records both decisions and who made them.
+
+  The test MCP client now reads event streams.
+
+The operator guide gains:
+
+- what timelines record from Phase 5: content matches (names and counts,
+  not content), models, usage and spend, asks, limits and exec hashes;
+- refusing a held request during an incident;
+- security notes on content rules, budgets, prices and approvals;
+- the updated test lists.
+
+Verified: `make check`; `make integration`, thirteen checks; `make
+integration-transparent`, twenty-six. Nothing is left on the host.
+
+**Phase 5 complete.** On top of Phase 4, a run is bounded by:
+
+- what it sends: content rules on request bodies and query strings;
+- how long it runs, how fast it connects and requests, and how much it
+  sends;
+- which models it calls, and what it spends on them;
+- a person's approval, where policy cannot judge;
+- QUIC by server name, where a node opts in;
+- the content of the binaries it runs, where a profile pins them.
+
+Known gaps, carried forward:
+
+- `lsm_cgroup`, once cilium/ebpf can load it;
+- what an allowed host daemon does on a run's behalf;
+- nested runs sharing their tree's event budget and sockets;
+- QUIC connection migration and versions other than 1;
+- signature verification for exec, so upgrades pass without a policy
+  change;
+- a web UI for approvals.
+
+The proposed decisions below were applied in 5.4 and 5.5.
 
 #### Proposed decisions
 

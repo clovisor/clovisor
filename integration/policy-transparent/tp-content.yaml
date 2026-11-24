@@ -1,0 +1,19 @@
+# Content rules and a connection rate under transparent mode (milestones
+# 5.1 and 5.2): origin.test is terminated for the content rules, without
+# any proxy settings in the run.
+kind: AgentProfile
+metadata: { name: tp-content }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: echo
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET, POST], paths: ["/echo", "/allowed"] }
+        action: allow
+  content:
+    - { name: aws-keys, regex: "AKIA[0-9A-Z]{16}", action: deny, message: "AWS keys may not leave this run." }
+    - { name: tokens, regex: "tok_[a-z0-9]{8}", action: redact }
+  limits:
+    connections_per_min: 6

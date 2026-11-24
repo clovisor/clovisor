@@ -15,3 +15,12 @@ spec:
         http: { methods: [POST], paths: ["/echo"] }
         action: ask
         ask: { timeout: 2s, on_timeout: allow }
+      - { name: mcp, to: { fqdn: ["mcp.test"], ports: [443] }, action: allow }
+  mcp:
+    default: deny
+    servers:
+      - name: origin-mcp
+        match: { fqdn: "mcp.test" }
+        tools: { allow: ["summarize"] }
+    # A sampling request from the server waits for a person (milestone 5.5).
+    sampling: { action: ask, message: "The MCP server wants to call the model." }

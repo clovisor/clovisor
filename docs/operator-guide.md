@@ -1086,6 +1086,12 @@ Both only remove permissions, so the run's owner may use them as well as root.
 They take effect on the next request, without restarting the run. The
 timeline records who clamped and when.
 
+A run waiting for approval is listed by `agentctl pending`. Refuse what it
+waits for with `agentctl deny <id>`, and `--remember` to refuse the rest
+like it for the run (§6 Ask). A run that has spent its budget or reached a
+limit is already refused there; `agentctl events <run-id>` shows which, and
+by which profile.
+
 ## 13. Audit data
 
 ```sh
@@ -1100,7 +1106,16 @@ agentctl events --json <run-id>
   - the bound policy layers;
   - exec, connect and DNS events, with cgroup identity;
   - every proxy decision, with method and path where the proxy saw them;
-  - MCP registrations, calls and drift.
+  - MCP registrations, calls and drift;
+  - content rules that matched each request, by name and count, never the
+    matched content;
+  - the model each request a model rule decided named;
+  - each budgeted call's usage and charge, flagged where estimated, and
+    each rule's spend;
+  - each ask, who decided it and how long it waited;
+  - limits reached, and what they did (refused, revoked, ended);
+  - each executable's resolved path and trust, and its SHA-256 where a
+    profile pins it.
 
   The summary aggregates destinations, paths, tools, and denied and
   would-deny counts.
@@ -1137,6 +1152,15 @@ agentctl events --json <run-id>
   parent, but it can use what its parent hands it.
 - **Allowed interpreters run anything.** Exec rules gate binaries: `python3`
   allowed means any Python the run writes (design §7.6).
+- **Content rules match bytes as sent.** A secret re-encoded or split across
+  fields gets past them (§10 Content rules). They need the host terminated,
+  and they never apply to hosts marked `no_terminate`.
+- **Budgets can be overrun** by calls already in flight when they run out,
+  and are charged an estimate where a response carries no usage (§6
+  Budgets). Prices are node configuration; a profile cannot set them.
+- **Approvals come from outside the run.** The run API refuses decisions
+  from inside a run or its descendants, so an agent cannot approve itself.
+  With credential identity only root may decide.
 
 ## 15. Troubleshooting
 
@@ -1218,6 +1242,9 @@ They check:
   `--remember` and the one after refused without asking, a request no one
   decided let through by `on_timeout: allow`, and the decisions in the
   timeline and in `agentctl pending --all`;
+- `sampling: ask`: a sampling request in a remote MCP server's event
+  stream held, approved and passed to the client, then denied and cut
+  out while the tool call's result still arrived;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 
@@ -1261,6 +1288,9 @@ ignore the proxy, it checks:
   revoked with it;
 - per-run UDP and ping granted by profile and ceiling, refused elsewhere and
   to a sub-agent whose profile lacks them;
+- content rules with no proxy settings: a body redacted in place and one
+  refused with the rule's message, on a host terminated by the transparent
+  listener; and `connections_per_min`, past which connects were refused;
 - limits: a rate-limit rule's 429 on a terminated host; an upload past
   `egress_bytes` cut off in the kernel, the run revoked, and no more than the
   limit counted as sent; a `duration` that kills the run;

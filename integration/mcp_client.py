@@ -9,9 +9,19 @@ def rpc(i, method, params=None):
                                  {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
     if session:
         req.add_header("Mcp-Session-Id", session)
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=60) as r:
         session = r.headers.get("Mcp-Session-Id") or session
-        return json.loads(r.read())
+        if not r.headers.get("Content-Type", "").startswith("text/event-stream"):
+            return json.loads(r.read())
+        # An event stream: requests from the server, then the response.
+        for line in r.read().decode().splitlines():
+            if not line.startswith("data:"):
+                continue
+            msg = json.loads(line[5:])
+            if msg.get("method") == "sampling/createMessage":
+                print("sampling request: %s" % msg["params"]["messages"][0]["content"]["text"])
+            elif msg.get("id") == i:
+                return msg
 rpc(1, "initialize", {"protocolVersion": "2025-06-18"})
 print("tools:", ",".join(t["name"] for t in rpc(2, "tools/list")["result"]["tools"]))
 for i, tool in enumerate(sys.argv[1:], 3):

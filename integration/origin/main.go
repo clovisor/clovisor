@@ -115,7 +115,7 @@ type rpc struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
-var tools = []string{"search", "get_file", "delete_repo"}
+var tools = []string{"search", "get_file", "delete_repo", "summarize"}
 
 func serveMCP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -149,6 +149,21 @@ func serveMCP(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(m.Params, &p)
 		result = map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "origin ran " + p.Name}}}
+		if p.Name == "summarize" {
+			// An event stream: a sampling request to the client, then the
+			// result (milestone 5.5's sampling: ask).
+			w.Header().Set("Content-Type", "text/event-stream")
+			sampling, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": "srv-1", "method": "sampling/createMessage",
+				"params": map[string]interface{}{"maxTokens": 50, "messages": []map[string]interface{}{
+					{"role": "user", "content": map[string]string{"type": "text", "text": "Summarize the repository"}}}}})
+			done, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": m.ID, "result": result})
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", sampling)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", done)
+			return
+		}
 	default:
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": m.ID, "error": map[string]interface{}{"code": -32601, "message": "unknown method"}})

@@ -84,6 +84,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
+	t.Run("content", e.testTransparentContent)
 	t.Run("limits", e.testTransparentLimits)
 	t.Run("duration", e.testDuration)
 	t.Run("models", e.testTransparentModels)
@@ -652,6 +653,31 @@ except OSError as err:
 	if !strings.Contains(out, "\n2\n") {
 		t.Errorf("lookup not refused with the node agent down:\n%s", out)
 	}
+}
+
+func (e *env) testTransparentContent(t *testing.T) {
+	// Milestones 5.1 and 5.2 without proxy settings: content rules on a
+	// host terminated by the transparent listener, and a connection rate
+	// of 6 a minute, which the three content requests and three more fill.
+	s := e.script("content", `u=https://origin.test/echo
+echo "clean: $(curl -s --data-binary '{"a":"hello"}' $u)"
+echo "redact: $(curl -s --data-binary '{"t":"tok_abcd1234"}' $u)"
+echo "deny: $(curl -s -w ' %{http_code}' --data-binary '{"k":"AKIAABCDEFGHIJKLMNOP"}' $u)"
+for i in 4 5 6 7 8; do echo "conn$i: $(curl -s -o /dev/null -w '%{http_code}' https://origin.test/allowed)"; done
+`)
+	out, id := e.agentRun("tp-content", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
+	expect(t, out, `clean: {"body":"{\"a\":\"hello\"}"`, `redact: {"body":"{\"t\":\"************\"}"`,
+		"AWS keys may not leave this run.", "} 403", "conn4: 200", "conn5: 200", "conn6: 200")
+	for _, c := range []string{"conn7: 200", "conn8: 200"} {
+		if strings.Contains(out, c) {
+			t.Errorf("past connections_per_min: %s\n%s", c, out)
+		}
+	}
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "tp-content/aws-keys (deny)", "tp-content/tokens (redact)", "CONNECT origin.test:443 -> deny by tp-content [connections_per_min]")
 }
 
 func (e *env) testTransparentLimits(t *testing.T) {

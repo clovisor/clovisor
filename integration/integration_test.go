@@ -153,6 +153,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("models", e.testModels)
 	t.Run("budgets", e.testBudgets)
 	t.Run("ask", e.testAsk)
+	t.Run("sampling-ask", e.testSamplingAsk)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -590,6 +591,54 @@ func (e *env) waitPending(t *testing.T, what string) (string, string) {
 	}
 	t.Fatalf("no pending request for %s:\n%s", what, out)
 	return "", ""
+}
+
+func (e *env) testSamplingAsk(t *testing.T) {
+	// sampling: ask (milestone 5.5): a sampling request the MCP server
+	// sends in a tool call's event stream waits for a person. Approved,
+	// the client gets it; denied, it is cut out and the call's result
+	// still arrives.
+	type result struct{ out, errOut string }
+	done := make(chan result, 1)
+	go func() {
+		out, errOut, _ := e.sh("/it/bin/agentctl run --profile it-ask -- python3 /it/bin/mcp_client.py summarize summarize")
+		done <- result{out, errOut}
+	}()
+	what := "sampling/createMessage from MCP server mcp.test"
+	id, list := e.waitPending(t, what)
+	expect(t, list, id+": The MCP server wants to call the model.")
+	if out, errOut, err := e.sh("/it/bin/agentctl approve " + id); err != nil {
+		t.Fatalf("approve: %v\n%s%s", err, out, errOut)
+	}
+	id2, _ := e.waitPending(t, what)
+	if id2 == id {
+		t.Fatalf("the approved sampling request still pending")
+	}
+	if out, errOut, err := e.sh("/it/bin/agentctl deny " + id2); err != nil {
+		t.Fatalf("deny: %v\n%s%s", err, out, errOut)
+	}
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not finish")
+	}
+	expect(t, r.out, "tools: summarize\n", "sampling request: Summarize the repository", "call summarize: origin ran summarize")
+	if n := strings.Count(r.out, "sampling request:"); n != 1 {
+		t.Errorf("client saw %d sampling requests, want the approved one only:\n%s", n, r.out)
+	}
+	if n := strings.Count(r.out, "call summarize: origin ran summarize"); n != 2 {
+		t.Errorf("%d call results, want 2:\n%s", n, r.out)
+	}
+	m := runIDRE.FindStringSubmatch(r.errOut)
+	if m == nil {
+		t.Fatalf("no run:\n%s%s", r.out, r.errOut)
+	}
+	shown, _, err := e.sh("/it/bin/agentctl events " + m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "ask "+id+": approved by root (uid 0)", "ask "+id2+": denied by root (uid 0)")
 }
 
 func (e *env) testAsk(t *testing.T) {
