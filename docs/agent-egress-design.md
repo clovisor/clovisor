@@ -112,6 +112,7 @@ place:
 |---|---|
 | Integration tests for the gaps: content rules and `connections_per_min` under transparent mode, and `sampling: ask` on a remote MCP server's event stream; operator guide gains Phase 5 records, incident response for held requests, and security notes. Phase 5 complete. | [5.8 status](#58-status-2026-11-24), [operator guide](operator-guide.md) |
 | Phase 6 broken into milestones: restart recovery first, since a restarted node agent forgets what runs were granted; then TLS uprobes for visibility only, per library (libssl, Go, Node and Bun), capturing request lines and headers, not bodies. | [Phase 6 plan](#phase-6-plan-2026-11-24) |
+| 6.0 spikes: a node agent restart lifts every rule from runs in progress, revocations included; uprobes read requests from libssl, GnuTLS and Go 1.25 and 1.26 but tax every process using the library unless attached per process, which needs each exec held until attached; the Bun-built `claude` binary cannot be hooked; about 5 µs per TLS call in a VM. | [6.0 spike results](#60-spike-results-2026-11-24) |
 
 ---
 
@@ -4196,9 +4197,9 @@ the later ones never ship.
 |---|---|---|---|
 | **6.0** | Spikes | Restart: what a restarted node agent needs to restore each run's grants, and whether pinned kernel maps can carry them across. Uprobes on `SSL_write` and `SSL_read` (and their `_ex` forms) in libssl for curl and Python. Go `crypto/tls` in an unstripped binary across two Go versions, with probes on return instructions. The OpenSSL in Node and the BoringSSL in Bun. Whether rustls can be hooked at all. The cost per call and per megabyte. HTTP/2 rebuilt from captured bytes. Tying a TLS object to its socket and connect event. | Settles what restart and the kernel allow before product code depends on it. |
 | **6.1** | Restart recovery | Each run's grants written at bind, clamp, nest and revoke under `/var/lib/clovisor`, as counters are. On start, the node agent restores them, kernel maps included, before it reports healthy. Runs that ended meanwhile are dropped. A run whose profile version no longer loads is revoked with a narrated reason, not left unprofiled. `agentctl status` reports what was restored. | Closes open question 4: enforcement survives upgrades and crashes. |
-| **6.2** | libssl capture (audit) | Opt-in per node (`-uprobes`). Uprobes on the shared OpenSSL and BoringSSL libraries runs load, filtered to runs as the other hooks are. Bounded bytes per call to the node agent, which parses HTTP/1.1 and HTTP/2 into method, host, path and status, and MCP into methods and tool names. Records marked as seen in the process, for hosts the proxy did not terminate. Learn drafts path rules from them; check replays them as path rules would decide. | Path-level audit of hosts that cannot be terminated, with no CA. |
+| **6.2** | libssl capture (audit) | Opt-in per node (`-uprobes`) and per profile. *Revised after 6.0:* uprobes on OpenSSL, BoringSSL and GnuTLS, attached to each process of a run that asks for capture, which is held at exec until they are in place. Bounded bytes per call to the node agent, which parses HTTP/1.1 and HTTP/2 into method, host, path and status, and MCP into methods and tool names. Records marked as seen in the process, for hosts the proxy did not terminate. Learn drafts path rules from them; check replays them as path rules would decide. | Path-level audit of hosts that cannot be terminated, with no CA. |
 | **6.3** | Go `crypto/tls` | Run binaries' symbols read at exec, with the Go version from their build info. Offsets per supported version; probes on return instructions. Stripped or unsupported binaries recorded as not visible. | Go tools and agents (`gh`, `terraform`, Go-based harnesses). |
-| **6.4** | Bundled stacks | Node's OpenSSL and Bun's BoringSSL, where 6.0 shows their symbols are usable; others as the spike allows. | The runtimes coding agents run on. |
+| **6.4** | Bundled stacks | Official Node builds' OpenSSL, if its exported symbols hold up. *Revised after 6.0:* stripped binaries, the Bun-built `claude` among them, are reported as not visible rather than hooked. | The runtimes coding agents run on. |
 | **6.5** | Visibility report | Per run and destination: seen by the proxy, by a uprobe, by SNI alone, or not at all; in the timeline, `agentctl events` and the receipt. | An operator can see what audit missed, not just what it saw. |
 | **6.6** | Tests and docs | Integration tests for each milestone, privileged where they need the kernel: a restart in the middle of an enforcing run; captured requests from curl, Python, a Go binary and Node. Operator guide on restart, `-uprobes`, what is visible and what is not. | Phase 6 ships. |
 
@@ -4219,6 +4220,56 @@ spike says no. 6.5 after 6.2. 6.6 last.
   run, so a node turns them on with a flag, and the receipt says so.
 - **Restart fails closed.** A run whose grants cannot be restored is revoked
   and told why, never left unprofiled.
+
+#### 6.0 spike results (2026-11-24)
+
+Kernel 7.0 (aarch64) in a VMware VM, OpenSSL 3.5.5, GnuTLS from Ubuntu,
+Node 22 (the distribution's, linked to the system libssl), Go 1.25.9 and
+1.26.8, and the Bun-built `claude` binary (Bun 1.4.4). Code in
+`spikes/phase6/`. All traffic was to a local test server.
+
+| Question | Result |
+|---|---|
+| A restart, today | Two runs under `tp`, one revoked, across a node agent restart. Before: the path rule (403), an unlisted host (refused), its name (not resolved) and an untrusted exec (`EPERM`) were all refused, and the revoked run had no egress. After: **every one of them passed**, and the revoked run reached the origin. The proxy decided them as "unprofiled run"; `agentctl status` showed 0 active runs. `agentctl run` lost its run API connection, so neither timeline got an exit code. |
+| What a restart must restore | Each run's binding: layers, nesting and uid. The kernel's per-run exec, Unix and network maps are all derived from it, so replaying the binding rewrites them; no map needs pinning. The partial timelines written at shutdown hold the layers, but each is owned by the run's user, who could edit a clamp or a revocation out of it. |
+| libssl and GnuTLS | Request lines and HTTP/2 headers read from curl (HTTP/1.1 and 2), Python, Node's `https` and `fetch`, and git, which on Ubuntu uses GnuTLS through `libcurl-gnutls`. Writes must be read at return: Node calls `SSL_write` before its handshake completes and retries, so entry probes recorded each request three times. |
+| Go `crypto/tls` | `(*Conn).Write` at entry and `Read` at each of its 7 return instructions, stashed by goroutine (`x28`), worked unchanged on Go 1.25 and 1.26; HTTP/2 requests and statuses decoded. |
+| Bundled stacks | **The `claude` binary cannot be hooked by symbol.** Bun links BoringSSL statically, and the binary is stripped: 1,300 symbols, no `SSL_*`. The distribution's Node uses the system libssl, so it needs nothing beyond libssl. Official Node builds and rustls were not tried (no copies or toolchain here). |
+| Cost | Per call, counting only, against 0.9 µs for a 64-byte write from Python and 2.0 µs from Go: **about 5 µs more for libssl** (entry and return probes) and **6.5 µs for Go**. Copying plaintext added 0.5 µs or less. The syscall tracepoints added nothing measurable. 1 MB writes lost 5 to 15% of throughput. Traps are dear in a VM; bare metal is likely cheaper but was not measured. |
+| Who pays | **Every process on the node that uses the library.** A uprobe on a shared library traps in any process that maps it, and the cgroup test runs only after the trap: Python outside any run paid the same 5 µs. Attached to one process (`PID`), the kernel plants the breakpoint in that process alone: the outside process ran at full speed, and the probe survived `exec`. It does not follow `fork`. |
+| Attaching per process | 8 libssl probes took 14 to 21 ms to attach. Attaching from userspace on each exec lost the race to fast processes: of three runs each, Node was seen 3 times, Python 2, curl never. Stopping each process at exec (`bpf_send_signal(SIGSTOP)`) until its probes were attached, then `SIGCONT`, saw 9 of 9, for 0.2 to 14 ms per exec. |
+| HTTP/2 from bounded captures | With 4 KB per call, frames parsed across calls, and what a call wrote past the capture skipped by frame length: no HPACK errors, including 1,600 truncated bulk writes. |
+| TLS object to socket | The fd of the first read or write syscall inside a TLS call found every connection's socket. Python's first write returned before its socket was known, so records need filling in from later calls on the same object. |
+
+Findings that change the plan:
+
+- **Restart is the urgent milestone.** Today a restart does not degrade
+  enforcement to recording; it removes it, revocations included, until each
+  run ends. 6.1 restores bindings from a root-owned file written at each
+  change, not from the timelines. It replays them through the same path a
+  new binding takes, so kernel state follows, all before the node reports
+  healthy. `agentctl run` also needs to reconnect, to report the run's end.
+- **Uprobes must be attached per process.** Node-wide attachment taxes
+  every TLS call of every program on the node, inside runs or not. Per
+  process, only runs pay. Attachment must also be in place before the
+  process's first TLS call. A process is therefore stopped at exec until its
+  probes are attached, and continued after. That costs each exec in a run up
+  to about 15 ms, and a stopped process is briefly visible to a parent that
+  waits for stops, or to a debugger. Before 6.2, the hold needs a bound: the
+  kernel side skips it when the node agent's heartbeat is stale, and a
+  restarted node agent continues any run process left stopped.
+- **GnuTLS joins libssl in 6.2.** Ubuntu's git uses it, and its record
+  functions take the same arguments.
+- **6.4 loses its main target.** The coding agent most likely to run here
+  ships as a stripped Bun binary with BoringSSL inside. Hooking it would
+  mean matching machine code per build, which is not worth doing. 6.4 keeps
+  official Node builds, if their exported OpenSSL symbols hold up, and
+  reports stripped binaries as not visible. The proxy remains how such
+  agents are seen.
+- **Cost bounds what capture is for.** About 5 µs per TLS call, on every
+  call of a run's processes, suits audit and learning, not every run all
+  the time. Capture is opt-in per profile as well as per node, so the
+  runs that pay are the ones being learned from.
 
 ---
 
