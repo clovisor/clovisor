@@ -1,0 +1,12 @@
+kind: AgentProfile
+metadata: { name: it-models }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: llm
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [POST, GET], paths: ["/echo"] }
+        model: { allow: ["claude-sonnet-5-5*", "gpt-5"] }
+        action: allow

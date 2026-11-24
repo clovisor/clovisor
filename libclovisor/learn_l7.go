@@ -425,6 +425,7 @@ func (d *Draft) writeHTTPRule(p func(string, ...interface{}), r policy.EgressRul
 		p("      # %s to further paths were past the per-run cap and not recorded;", plural(g.dropped, "request"))
 		p("      # this rule denies them.")
 	}
+	d.writeModelComments(p, r)
 	p("      - name: %s", q(r.Name))
 	p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
 	ms := make([]string, len(r.HTTP.Methods))
@@ -443,6 +444,7 @@ func (d *Draft) writeHTTPRule(p func(string, ...interface{}), r policy.EgressRul
 		}
 		p("            - %s  # %s", q(path), plural(n, "request"))
 	}
+	writeModelLine(p, r)
 	p("        action: %s", r.Action)
 }
 

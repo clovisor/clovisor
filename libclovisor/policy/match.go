@@ -147,6 +147,8 @@ type Decision struct {
 	Message string // narration for a deny (design §7.7)
 	// rate is a rate-limit rule's allowance; Action is rate-limit.
 	rate *compiledRate
+	// models is the deciding rule's model list (milestone 5.3).
+	models *compiledModels
 	// Deferred is set at PhaseConnect when the first matching rule needs
 	// method or path. The connection is let through to termination, and
 	// each request inside it gets its own decision. Offline, it means the
@@ -206,15 +208,16 @@ func (cp *CompiledProfile) Decide(req Request) Decision {
 		if !r.matchesDestination(req) {
 			continue
 		}
-		if r.http != nil && req.Phase == PhaseConnect {
+		if (r.http != nil || r.models != nil) && req.Phase == PhaseConnect {
 			// Only an HTTP request can tell whether this rule or a later
-			// one decides; the destination is terminated for that.
+			// one decides, or which model it names; the destination is
+			// terminated for that.
 			return Decision{Action: ActionAllow, Rule: r.Name, Deferred: true}
 		}
 		if !r.matchesHTTP(req) {
 			continue
 		}
-		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate}
+		return Decision{Action: r.Action, Rule: r.Name, Message: r.Message, rate: r.rate, models: r.models}
 	}
 	return Decision{Action: cp.DefaultAction, Message: cp.defaultMessage(req)}
 }

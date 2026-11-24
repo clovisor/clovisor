@@ -99,6 +99,7 @@ place:
 | 5.0 spikes: request bodies must be streamed with `ext_proc`'s own cap (buffered stalls past 1 MiB, partial is fail-open); Envoy's default circuit breaker fails every request past 1,024 `ext_proc` streams; held asks work with a per-stream timeout override; QUIC names read in userspace; a BPF exec hash cache was never stale on ext4 and tmpfs. | [5.0 spike results](#50-spike-results-2026-11-23) |
 | Content rules: deny, redact (keeping the length) or record matches in request bodies and query strings, on every host the profile names unless scoped; bodies held and checked whole, with limits that fail closed; remote MCP bodies moved off buffered mode; Envoy's `ext_proc` circuit breaker raised. | [5.1 status](#51-status-2026-11-23) |
 | Limits: duration ends a run, `connections_per_min` and `rate-limit` rules answer 429, and `egress_bytes` is counted and capped in the kernel, then revoked; nested runs charge their parents; byte counts persisted. | [5.2 status](#52-status-2026-11-23) |
+| Model allow-lists: a rule's `model` list checked against the JSON body's top-level `model` and a `model` query parameter; bodies naming none, or naming it twice, refused; models recorded per request, drafted by learn from runs observed under `"*"`, replayed by check. | [5.3 status](#53-status-2026-11-24) |
 
 ---
 
@@ -3515,6 +3516,94 @@ Verified:
     past 256Ki stalled. The run was revoked within a second and its
     timeline shows 255,629 bytes sent.
   - `tp-brief`: `sleep 10` ended at 2s with the reason printed.
+
+#### 5.3 status (2026-11-24)
+
+Implemented:
+
+- **`model: { allow: […] }`** on an egress rule. Entries are globs, matched
+  without regard to case; at most 64 of up to 128 characters. Compile
+  errors: an empty list, a `cidr` destination, `no_terminate`, a `deny`
+  rule. A model rule's hosts are terminated, as for `http` rules, and the
+  receipt places it as `ext_proc (body: model field)` with notes on what
+  is read and what is refused.
+- **What is read.** The top-level `model` field of a JSON body, the shape
+  Anthropic- and OpenAI-style APIs take, and a `model` query parameter if
+  the request has one (OpenAI's realtime API names it there).
+  - `ext_proc` reads the object's keys itself. `encoding/json` would match
+    `"Model"` too, since it folds case; providers would not.
+  - A second `model` key is refused, not resolved: parsers disagree on
+    which one wins.
+  - The query parameter is checked at headers. A body with no model
+    field passes if the query named an admitted one.
+- **What is refused,** with a narrated 403 that names the rule and its
+  list, or with the rule's `message`:
+  - a model the list does not admit;
+  - a body that names none, names it twice, gives a non-string, or is not
+    one JSON object;
+  - a body compressed as anything but gzip or deflate (415).
+
+  Bodies are held and checked as content rules' are (5.1), with the same
+  limits that fail closed. A request with no body, or an empty one,
+  names no model and calls none, so it passes on the rule alone.
+- **Layers.** At request phase each layer's deciding rule contributes its
+  list, and the model must satisfy every enforced one. An audit layer's
+  list records a would-deny. At CONNECT a model rule defers to the
+  requests inside, as a path rule does; a tunnel Envoy does not terminate
+  is refused as needing termination.
+- **Records.** A `model` event for each request a model rule decided, with
+  the model as named (cut to 128 bytes), where it was read, the decision
+  and the rule. The timeline summary counts `models` by host, method, path
+  and model, at most 256 entries per run, the rest counted as dropped.
+  `agentctl events` lists them.
+- **Learn.** Models are recorded only where a model rule decides, so a run
+  is observed under `model: { allow: ["*"] }`, as paths are under
+  `http: { paths: ["*"] }`. Each drafted rule for the host gets a list of
+  the models its requests named and were let through with. A comment
+  flags requests on the same paths that named none, which the list would
+  refuse.
+- **Check** replays each recorded model against the profile's lists. A
+  POST, PUT or PATCH that a model rule would decide, from a run that did
+  not record its model, is listed as not replayable.
+
+Decisions:
+
+- **A body naming no model is refused.** Passing it would let anything
+  without a top-level `model` through a rule meant to bound models:
+  batches carry theirs per request, Gemini and Bedrock in the path. Uploads
+  and those APIs need a rule of their own above the model rule. The
+  receipt and the narration say so.
+- **The model field, not the path.** Path-shaped model APIs are left to
+  path rules. Reading them would mean a parser per provider, and an
+  allow-list that applies to one shape and not another is easy to
+  misread.
+- **The HTTP record stays a header decision.** A request refused for its
+  model, like one refused for content, is recorded as allowed at headers
+  and refused in its model event. Proxied path counts therefore do not
+  include those refusals; the model summary does.
+
+Verified:
+
+- Unit tests:
+  - compile errors, placement and posture;
+  - decisions across layers, audit layers, rule messages;
+  - the body and query readers: case, escapes, duplicates, non-JSON,
+    trailing values;
+  - `ext_proc` with chunked, gzip, Brotli, empty and query-named bodies, an
+    upload rule above the model rule, and content rules on the same body;
+  - the recorder, learn's round trip, and check, recorded or not.
+- `make integration`, profiles `it-models` and `it-observe`:
+  - an admitted model reached the origin unchanged;
+  - another, a body with none or two, and a gzip body naming a refused
+    model got the narrated 403;
+  - a GET passed, and a refused query parameter got 403;
+  - `agentctl events` listed the models;
+  - a run under `"*"` was drafted into a list of exactly the two models
+    it used, which replayed clean, while `check` found that `it-models`
+    would refuse one of them.
+- `make integration-transparent`, now twenty-one checks: `tp-models`, on a
+  host terminated for its model rule alone, passed an admitted model and
+  refused another, from a client ignoring the proxy.
 
 #### Proposed decisions
 

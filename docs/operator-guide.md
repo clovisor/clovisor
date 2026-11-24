@@ -226,7 +226,7 @@ spec:
 | Block | What it governs | Enforced by | Section |
 |---|---|---|---|
 | `mode` | `enforce` refuses; `audit` records what enforce would refuse | | |
-| `egress` | Destinations by name, address, port, method and path, first match wins | the proxy; in transparent mode every TCP connect goes there | §10, §11 |
+| `egress` | Destinations by name, address, port, method and path, first match wins; a rule's `model` list limits the models its requests may name | the proxy; in transparent mode every TCP connect goes there | §6 Models, §10, §11 |
 | `mcp` | MCP servers and their tools, sampling | the gateway and the proxy | §9 |
 | `exec` | Which binaries a run may execute | BPF LSM | §11 |
 | `unix` | Unix sockets outside the run | BPF LSM | §11 |
@@ -292,6 +292,50 @@ A profile's `udp` or `icmp` entry works only where its ceiling lists it too.
 - **Restarts.** Byte counts are saved in `<state-dir>/counters.json` every
   few seconds, and picked up again by runs that outlive a node agent
   restart. Rate allowances start full again.
+
+### Models
+
+An egress rule's `model` list limits which models its requests may name.
+
+```yaml
+  egress:
+    rules:
+      - name: uploads                 # first: no model list
+        to: { fqdn: ["api.anthropic.com"] }
+        http: { paths: ["/v1/files*"] }
+        action: allow
+      - name: claude
+        to: { fqdn: ["api.anthropic.com"] }
+        model: { allow: ["claude-sonnet-5-5*", "claude-haiku-5-5*"] }
+        action: allow
+        message: "Use claude-sonnet-5-5 or claude-haiku-5-5."  # optional
+```
+
+- **What is read.** The JSON body's top-level `model` field, as the
+  Anthropic and OpenAI APIs take it, and a `model` query parameter if the
+  request has one. Entries are globs (`*`) and match without regard to case.
+- **What is refused.** A request that names a model not on the list,
+  with a narrated 403 that names the list (or the rule's `message`).
+  Refused too, because nothing says which model they would reach:
+  - a body that names no model;
+  - a body that names it twice;
+  - a body that is not JSON, or is compressed as anything but gzip or
+    deflate.
+- **What passes.** A request with no body (`GET /v1/models`) names no model
+  and calls none, so it passes on the rule alone.
+- **Uploads and other APIs.** File uploads and batch submissions carry no
+  top-level `model`, so they would be refused. So would APIs that put the
+  model in the path (Gemini, Bedrock). Give their paths a rule of their own
+  above the model rule, as `uploads` does here.
+- **Termination.** A model rule's hosts are terminated, as for `http` rules.
+  Its body is held and checked like a content rule's (§10), and
+  `no_terminate` or a `cidr` destination on a model rule is a compile error.
+- **Records.** Each request a model rule decides is recorded with the model
+  it named. `agentctl events <run>` lists the models by host and path, with
+  refusals.
+- **Learning models.** To find out which models an agent uses, observe it
+  under an audit profile whose rule for the host has
+  `model: { allow: ["*"] }` (§8).
 
 ## 7. Running agents
 
@@ -379,7 +423,8 @@ The adoption path, per agent workload (design §7.10):
 1. **Observe.** Run the workload unprofiled, or under an `audit` profile, for
    a while. To see methods and paths on HTTPS hosts, terminate them. Use an
    audit profile whose rule for the host has `http: { paths: ["*"] }`, and an
-   MCP server rule with no tool limits for each MCP server.
+   MCP server rule with no tool limits for each MCP server. To see which
+   models a run uses, give the model API's rule `model: { allow: ["*"] }`.
 2. **Draft.**
    ```sh
    agentctl learn --name myagent -o myagent.yaml --all      # or run ids
@@ -389,13 +434,17 @@ The adoption path, per agent workload (design §7.10):
      appear as comments only.
    - Hosts used through opaque tunnels get host-level rules, with a note.
    - MCP servers get exact tool and resource lists, with pinning on.
+   - Rules for a host whose models were recorded get a `model` list naming
+     those models. A comment flags requests on the same paths that named
+     none, which the list would refuse.
    - Exec binaries are listed too, with interpreters flagged.
 3. **Check offline.**
    ```sh
    agentctl check --profile myagent.yaml --all
    ```
-   This replays the recorded runs against the draft: hosts, paths, MCP calls
-   and execs. It exits 1 if anything would be denied. Review each violation:
+   This replays the recorded runs against the draft: hosts, paths, models,
+   MCP calls and execs. A request a model rule would decide, from a run
+   that did not record its model, is listed as not replayable. It exits 1 if anything would be denied. Review each violation:
    widen the profile, or accept the denial.
 4. **Shadow live.** Install the profile with `mode: audit`, then `SIGHUP` the
    node agent. Decisions are recorded as `would-deny` and nothing is blocked.
@@ -442,7 +491,7 @@ root-only, because pins govern every run on the node.
 ## 10. TLS termination
 
 A host is terminated when some rule needs what is inside TLS: `http` method
-or path rules, MCP server rules, or content rules. Termination is node-wide; the receipt's
+or path rules, `model` lists, MCP server rules, or content rules. Termination is node-wide; the receipt's
 posture table lists each terminated host and the rules that caused it.
 Everything else is tunnelled untouched, with the origin's own certificate.
 
@@ -881,9 +930,11 @@ agentctl events --json <run-id>
 | Requests get `500` from the proxy | Envoy cannot reach `ext_proc`: socket path, `-envoy-uids`, or the volume mount. |
 | `unidentified client` (cgroup identity) | The client's socket is not in a run: started outside `agentctl run`, or through a proxy chain that hides the source port. |
 | `407` / `no run credential` (credential identity) | The request lacked the run's proxy URL credential: started outside `agentctl run`, or the tool dropped the credentials from the proxy URL. |
-| `needs termination` | A rule needs method or path, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
-| `413` on a large upload | The body is over `-inspect-max-body`, and a content rule or remote MCP covers the host. Raise the limit, or scope the content rule with `to:`. |
-| `415` from the proxy | A content rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| `needs termination` | A rule needs method, path or model, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
+| `413` on a large upload | The body is over `-inspect-max-body`, and a content rule, a model rule or remote MCP covers the host. Raise the limit, scope the content rule with `to:`, or give the upload's path a rule without a model list. |
+| `415` from the proxy | A content or model rule covers the host and the body's `Content-Encoding` is not gzip or deflate. |
+| `403` "not allowed by rule … Allowed: …" | The request named a model the rule's `model` list does not admit (§6 Models). |
+| `403` "names no model" or "is not a JSON object" on an upload | A model rule decided a request whose body carries no top-level `model`. Give its path a rule of its own above the model rule. |
 | `429` with `Retry-After` | A `rate-limit` rule or `connections_per_min` (§6 Limits). The narration names the rule or profile. |
 | `agentctl: run … was ended by the node agent` | The run reached its `duration`, or its parent run did. Exit status 137 (killed). |
 | A run's connections stall, then everything is refused | It reached `egress_bytes`: the kernel drops its packets, then its egress is revoked. `agentctl events <run>` shows the limit and the bytes sent. |
@@ -928,6 +979,10 @@ They check:
   concurrent uploads mixed with refusals;
 - limits: a rate-limit rule's 429 and `Retry-After`, and a duration that
   ends a credential-identity run;
+- model lists: an admitted model passed, others refused with the list,
+  bodies naming none or two refused, gzip decoded, a GET passed, a query
+  parameter checked; a run observed under `"*"` drafted into a model list,
+  replayed clean, and the stricter profile's refusal found by `check`;
 - timelines, `learn` and `check`;
 - tool pin drift and its approval.
 
@@ -968,6 +1023,8 @@ ignore the proxy, it checks:
 - limits: a rate-limit rule's 429 on a terminated host; an upload past
   `egress_bytes` cut off in the kernel, the run revoked, and no more than the
   limit counted as sent; a `duration` that kills the run;
+- a model list on a host terminated for it alone: an admitted model
+  passed, another refused;
 - `check --transparent` on the recorded runs;
 - fail closed: a run already going when the node agent stops gets `EPERM`
   on its next connect and no answer to its next lookup.

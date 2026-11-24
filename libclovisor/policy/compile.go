@@ -94,6 +94,7 @@ type compiledRule struct {
 	ports   map[uint16]bool
 	http    *HTTPMatch
 	rate    *compiledRate
+	models  *compiledModels
 	src     EgressRule
 }
 
@@ -175,7 +176,6 @@ var notYet = map[string]string{
 	"mode ask":        "the approval UI (Phase 5)",
 	"action ask":      "the approval UI (Phase 5)",
 	"action redirect": "transparent mode (Phase 3)",
-	"model":           "model allow-lists with budgets (Phase 5)",
 	"budget":          "budgets (Phase 5)",
 	"exec hash":       "IMA hash verification (Phase 4)",
 	"sampling ask":    "the approval UI (Phase 5)",
@@ -361,7 +361,7 @@ func (c *compiler) egress(p *AgentProfile, cp *CompiledProfile) {
 			c.errf(where, "ask: is only valid with action ask")
 		}
 		if r.Model != nil {
-			c.unsupported(where, "model")
+			cr.models = c.model(where, r)
 		}
 		if r.Budget != nil {
 			c.unsupported(where, "budget")
@@ -412,12 +412,22 @@ func onlyPort80(ports []uint16) bool {
 func (c *compiler) placeEgress(r EgressRule) Placement {
 	pl := Placement{Rule: r.Name, Tier: "2"}
 	switch {
-	case r.HTTP != nil:
-		pl.EnforcedBy = "ext_proc (method and path)"
+	case r.HTTP != nil || r.Model != nil:
+		switch {
+		case r.HTTP == nil:
+			pl.EnforcedBy = "ext_proc (body: model field)"
+		case r.Model == nil:
+			pl.EnforcedBy = "ext_proc (method and path)"
+		default:
+			pl.EnforcedBy = "ext_proc (method and path; body: model field)"
+		}
 		if onlyPort80(r.To.Ports) {
 			pl.Notes = append(pl.Notes, "plaintext HTTP")
 		} else {
 			pl.Notes = append(pl.Notes, "terminated: see posture")
+		}
+		if r.Model != nil {
+			pl.Notes = append(pl.Notes, modelNotes(r)...)
 		}
 	case len(r.To.FQDN) > 0:
 		pl.EnforcedBy = "ext_proc (CONNECT authority or Host)"
@@ -435,7 +445,7 @@ func (c *compiler) placeEgress(r EgressRule) Placement {
 			pl.Notes = append(pl.Notes, "matches every host")
 		}
 	}
-	if r.Action != ActionDeny && r.HTTP == nil && len(r.To.FQDN) > 0 && !onlyPort80(r.To.Ports) {
+	if r.Action != ActionDeny && r.HTTP == nil && r.Model == nil && len(r.To.FQDN) > 0 && !onlyPort80(r.To.Ports) {
 		pl.Notes = append(pl.Notes, "not terminated: domain-fronting exposed (design §7.5)")
 	}
 	if r.Action == ActionTagAndLog {
@@ -652,13 +662,20 @@ func (c *compiler) posture(profiles []*AgentProfile) []DestPosture {
 				if r.NoTerminate {
 					d.noTerm = append(d.noTerm, p.Metadata.Name+"/"+r.Name)
 				}
-				if r.HTTP != nil {
+				if r.HTTP != nil || r.Model != nil {
 					d.needs = true
 					d.needers[p.Metadata.Name] = true
 					if !onlyPort80(r.To.Ports) {
 						d.plain = false
 					}
-					d.why = append(d.why, fmt.Sprintf("%s (%s: http)", p.Metadata.Name, r.Name))
+					what := "http"
+					switch {
+					case r.HTTP == nil:
+						what = "model"
+					case r.Model != nil:
+						what = "http, model"
+					}
+					d.why = append(d.why, fmt.Sprintf("%s (%s: %s)", p.Metadata.Name, r.Name, what))
 				}
 			}
 		}

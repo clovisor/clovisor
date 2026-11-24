@@ -265,7 +265,6 @@ spec:
 `
 	errs := compileErrors(t, doc)
 	for _, want := range []string{
-		"model-endpoints): model cannot be enforced yet: it needs model allow-lists with budgets (Phase 5)",
 		"model-endpoints): budget cannot be enforced yet",
 		"package-registries): action ask cannot be enforced yet: it needs the approval UI (Phase 5)",
 		"billing.internal must be terminated for research-agent (billing-paths: http), but research-agent/payments-api asserts no_terminate",

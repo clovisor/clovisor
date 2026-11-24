@@ -22,7 +22,7 @@ import (
 // CheckFinding is one destination or binary seen in the runs, with what
 // the profile would do about it.
 type CheckFinding struct {
-	Kind     string // egress, http, mcp, exec, dns, udp, unverifiable, not-governed
+	Kind     string // egress, http, model, mcp, exec, dns, udp, unverifiable, not-governed
 	What     string // "TCP api.github.com:443 (140.82.112.6)", "/usr/bin/curl"
 	Decision string // allow, deny, tag-and-log, deferred, or a reason
 	Rule     string
@@ -204,6 +204,7 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				}
 			}
 		}
+		checkModels(cp, tl, add)
 		checkMCP(cp, tl, add)
 		if o.Transparent {
 			uid := -1
@@ -279,10 +280,10 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 		f := *found[k]
 		sort.Strings(f.Runs)
 		switch k.kind {
-		case "egress-deny", "http-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny", "unix-deny":
+		case "egress-deny", "http-deny", "model-deny", "mcp-deny", "exec-deny", "dns-deny", "udp-deny", "unix-deny":
 			f.Kind = strings.TrimSuffix(k.kind, "-deny")
 			rep.Violations = append(rep.Violations, f)
-		case "egress-allow", "http-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow", "unix-allow":
+		case "egress-allow", "http-allow", "model-allow", "mcp-allow", "exec-allow", "dns-allow", "udp-allow", "unix-allow":
 			f.Kind = strings.TrimSuffix(k.kind, "-allow")
 			rep.Allowed = append(rep.Allowed, f)
 		case "unverifiable":
@@ -345,7 +346,7 @@ func (rep *CheckReport) WriteText(w io.Writer) error {
 		return "rule " + f.Rule + runs(f)
 	})
 	if len(rep.Unverifiable) > 0 {
-		section("Depends on method or path, which audit data lacks", rep.Unverifiable, func(f CheckFinding) string {
+		section("Depends on what audit data lacks (method, path or model)", rep.Unverifiable, func(f CheckFinding) string {
 			return "first matching rule " + f.Rule + runs(f)
 		})
 	}
@@ -417,6 +418,66 @@ func checkL7(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) []Dest
 		}
 	}
 	return legacy
+}
+
+// checkModels replays the models the run's requests named (milestone
+// 5.3) against the profile's model lists. A request the profile decides
+// by a rule with no model list, or denies, is the path replay's to
+// report. A request with a body that a model rule would decide, but whose
+// model was not recorded (no model rule decided it in the run), cannot be
+// replayed.
+func checkModels(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) {
+	request := func(host string, port uint16, method, path string) policy.Request {
+		r := policy.Request{Port: port, Method: method, Path: path, Phase: policy.PhaseRequest}
+		if ip, err := netip.ParseAddr(host); err == nil {
+			r.IP = ip
+		} else {
+			r.Host = host
+		}
+		return r
+	}
+	recorded := map[hostPath]bool{}
+	for _, u := range tl.Summary.Models {
+		recorded[hostPath{policy.NormalizeHost(u.Host) + ":" + strconv.Itoa(int(u.Port)), u.Method, u.Path}] = true
+		dec := cp.Decide(request(u.Host, u.Port, u.Method, u.Path))
+		if !dec.Allowed() || !dec.ModelChecked() {
+			continue
+		}
+		hp := net.JoinHostPort(u.Host, strconv.Itoa(int(u.Port)))
+		what := fmt.Sprintf("%s %s%s model %q", u.Method, hp, u.Path, u.Model)
+		if u.Model == "" {
+			what = fmt.Sprintf("%s %s%s (no model: %s)", u.Method, hp, u.Path, u.Reason)
+		}
+		f := CheckFinding{Decision: policy.ActionAllow, Rule: dec.Rule}
+		if dec.PermitsModel(u.Model) {
+			add("model-allow", what, f, tl.RunID, u.Requests)
+			continue
+		}
+		f.Decision, f.Message = policy.ActionDeny, "not in the rule's model list"
+		if u.Model == "" {
+			f.Message = "names no model, and the rule has a model list"
+		}
+		add("model-deny", what, f, tl.RunID, u.Requests)
+	}
+	for _, p := range tl.Summary.Proxied {
+		for _, u := range p.Paths {
+			switch u.Method {
+			case "POST", "PUT", "PATCH":
+			default:
+				continue // no body, no model
+			}
+			if recorded[hostPath{policy.NormalizeHost(p.Host) + ":" + strconv.Itoa(int(p.Port)), u.Method, u.Path}] {
+				continue
+			}
+			dec := cp.Decide(request(p.Host, p.Port, u.Method, u.Path))
+			if !dec.Allowed() || !dec.ModelChecked() {
+				continue
+			}
+			hp := net.JoinHostPort(p.Host, strconv.Itoa(int(p.Port)))
+			add("unverifiable", fmt.Sprintf("%s %s%s (model not recorded)", u.Method, hp, u.Path),
+				CheckFinding{Decision: "model not recorded", Rule: dec.Rule}, tl.RunID, u.Requests)
+		}
+	}
 }
 
 // checkMCP replays the run's MCP operations. A profile with no mcp block,

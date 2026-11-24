@@ -802,6 +802,24 @@ func printTimeline(tl *clovisor.RunTimeline) {
 				detail += " [" + e.Reason + "]"
 			}
 			detail += " (" + e.Note + ")"
+		case "model":
+			detail = fmt.Sprintf("%s %s:%d%s -> %s", e.Method, e.DstName, e.DstPort, e.Path, e.Decision)
+			if e.Decision == "deny" && !e.Enforced {
+				detail += " (not enforced)"
+			}
+			if e.Rule != "" {
+				detail += " rule " + e.Rule
+			}
+			if e.Layer != "" {
+				detail += " by " + e.Layer
+			}
+			if len(e.WouldDeny) > 0 {
+				detail += " would-deny " + strings.Join(e.WouldDeny, ",")
+			}
+			if e.Reason != "" {
+				detail += " [" + e.Reason + "]"
+			}
+			detail += " (" + e.Note + ")"
 		case "mcp":
 			detail = fmt.Sprintf("%s %s %s -> %s", e.MCPServer, e.Method, e.MCPName, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -894,6 +912,29 @@ func printTimeline(tl *clovisor.RunTimeline) {
 				note += fmt.Sprintf(" audit-only %d", u.WouldHave)
 			}
 			fmt.Printf("  %-28s %-40s x%-4d%s\n", u.Host, what, u.Requests, note)
+		}
+	}
+	if len(tl.Summary.Models) > 0 {
+		fmt.Printf("Models (%d)\n", len(tl.Summary.Models))
+		for _, u := range tl.Summary.Models {
+			what := strconv.Quote(u.Model)
+			if u.Model == "" {
+				what = "none: " + u.Reason
+			}
+			note := ""
+			if u.Denied > 0 {
+				note += fmt.Sprintf(" denied %d", u.Denied)
+			}
+			if u.WouldDeny > 0 {
+				note += fmt.Sprintf(" would-deny %d", u.WouldDeny)
+			}
+			if u.Rule != "" {
+				note += " rule " + u.Layer + "/" + u.Rule
+			}
+			fmt.Printf("  %-40s %-32s x%-4d%s\n", u.Method+" "+u.Host+u.Path, what, u.Requests, note)
+		}
+		if tl.Summary.ModelsDropped > 0 {
+			fmt.Printf("  (%d more requests past the per-run cap, not listed)\n", tl.Summary.ModelsDropped)
 		}
 	}
 	if len(tl.Summary.Proxied) > 0 {

@@ -84,6 +84,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("run-udp-icmp", e.testRunNet)
 	t.Run("limits", e.testTransparentLimits)
 	t.Run("duration", e.testDuration)
+	t.Run("models", e.testTransparentModels)
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
 	if t.Failed() {
@@ -624,6 +625,25 @@ echo "after: $(curl -s -m 3 -o /dev/null -w %{http_code} https://origin.test/all
 	if b, _ := strconv.Atoi(n[1]); b < 128<<10 || b > 256<<10 {
 		t.Errorf("egress bytes %d: want most of 256Ki and no more", b)
 	}
+}
+
+func (e *env) testTransparentModels(t *testing.T) {
+	// The script goes in a file: agentRun quotes it in single quotes.
+	if _, errOut, err := e.sh(`cat > /tmp/tp-models.sh <<'EOS'
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+echo "gpt-5: $(curl -s -o /dev/null -w %{http_code} --data-binary '{"model":"gpt-5"}' https://other.test/echo)"
+echo "gpt-4o: $(curl -s -w ' %{http_code}' --data-binary '{"model":"gpt-4o"}' https://other.test/echo)"
+echo "get: $(curl -s -o /dev/null -w %{http_code} https://other.test/x)"
+EOS`); err != nil {
+		t.Fatal(errOut)
+	}
+	out, id := e.agentRun("tp-models", `sh /tmp/tp-models.sh`)
+	expect(t, out, "gpt-5: 200", `model \"gpt-4o\" is not allowed by rule llm of profile tp-models`, "} 403", "get: 200")
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Models (2)", `"gpt-4o"`, "denied 1")
 }
 
 func (e *env) testDuration(t *testing.T) {

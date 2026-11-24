@@ -1,0 +1,14 @@
+kind: AgentProfile
+metadata: { name: it-observe }
+spec:
+  # Observes which models a run uses, for learn: "*" admits any model and
+  # records it.
+  mode: audit
+  egress:
+    default: deny
+    rules:
+      - name: llm
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [POST], paths: ["/echo"] }
+        model: { allow: ["*"] }
+        action: allow

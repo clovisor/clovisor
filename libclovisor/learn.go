@@ -96,6 +96,10 @@ type Draft struct {
 	// Resolved exec paths (milestone 4.4), where the kernel reported them.
 	resolved  bool
 	untrusted []string // ran from a path failing the trusted-path test
+
+	// Models (milestone 5.3), by rule name.
+	ruleModels    map[string]*draftModel
+	modelsDropped int
 }
 
 // LearnProfile drafts an AgentProfile that would allow exactly the
@@ -317,6 +321,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		}
 		d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
 	}
+	d.learnModels(runs)
 	d.learnMCP(runs)
 	return d
 }
@@ -421,6 +426,10 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 	p("")
 	p("  egress:")
 	p("    default: %s", d.Profile.Spec.Egress.Default)
+	if d.modelsDropped > 0 {
+		p("    # %s named models past the per-run cap and were not recorded;", plural(d.modelsDropped, "request"))
+		p("    # the model lists below may miss what they named.")
+	}
 	if len(d.Profile.Spec.Egress.Rules) == 0 {
 		p("    rules: []")
 	} else {
@@ -465,8 +474,10 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 				p("      # for the addresses the host uses.")
 			}
 		}
+		d.writeModelComments(p, r)
 		p("      - name: %s", q(r.Name))
 		p("        to: { fqdn: [%s], ports: %s }", q(r.To.FQDN[0]), portList(r.To.Ports))
+		writeModelLine(p, r)
 		p("        action: %s", r.Action)
 	}
 

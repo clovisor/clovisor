@@ -384,7 +384,7 @@ func (s *ExtProcServer) resolvesTo(host string, a netip.Addr) bool {
 // if any, is for a request whose body or MCP traffic ext_proc inspects.
 func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, *streamState) {
 	resp, o := s.decideHeaders(ctx, req, h)
-	if resp.GetImmediateResponse() != nil || (o.mcp == nil && !o.content) {
+	if resp.GetImmediateResponse() != nil || (o.mcp == nil && !o.content && len(o.models) == 0) {
 		return resp, nil
 	}
 	hm := h.GetHeaders()
@@ -399,13 +399,17 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	}
 	hasBody := !h.GetEndOfStream()
 	enc := ""
-	if hasBody && o.content {
+	if hasBody && (o.content || len(o.models) > 0) {
 		ce := headerValue(hm, "content-encoding")
 		e, ok := bodyEncoding(ce)
 		if !ok {
+			what := "for content rules"
+			if !o.content {
+				what = "for the model it names"
+			}
 			return refuse(typev3.StatusCode_UnsupportedMediaType, "body encoding not checkable",
-				fmt.Sprintf("The request body is encoded as %q, which this proxy cannot decode to check for content rules, so it was not sent. "+
-					"Send it uncompressed, or as gzip or deflate.", ce))
+				fmt.Sprintf("The request body is encoded as %q, which this proxy cannot decode to check %s, so it was not sent. "+
+					"Send it uncompressed, or as gzip or deflate.", ce, what))
 		}
 		enc = e
 	}
@@ -418,7 +422,7 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	}
 	st := &streamState{mcp: o.mcp, release: release}
 	if hasBody {
-		st.body = &heldBody{d: d, runID: o.runID, runCg: o.runCg, leaf: o.leaf, eff: o.eff, content: o.content, encoding: enc, max: maxBody}
+		st.body = &heldBody{d: d, runID: o.runID, runCg: o.runCg, leaf: o.leaf, eff: o.eff, content: o.content, models: o.models, queryModel: o.queryModel, encoding: enc, max: maxBody}
 	}
 	switch {
 	case o.mcp != nil:
@@ -426,8 +430,8 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 	case hasBody:
 		resp.ModeOverride = bodyModes
 	default:
-		// A content-checked request with no body: its query string was
-		// checked at headers, and there is nothing more to hold.
+		// A content- or model-checked request with no body: its query
+		// string was checked at headers, and there is nothing more to hold.
 		st.done(s)
 		return resp, nil
 	}
@@ -438,11 +442,17 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 type headerOutcome struct {
 	mcp     *remoteMCP
 	content bool // content rules cover the request: hold its body
-	d       HTTPData
-	runID   string
-	runCg   uint64
-	leaf    uint64
-	eff     *policy.Effective
+	// models are the model lists the request must satisfy: hold its body
+	// to read the model it names (milestone 5.3).
+	models []policy.ModelCheck
+	// queryModel: the query string named an admitted model, so a body
+	// need not name one too.
+	queryModel bool
+	d          HTTPData
+	runID      string
+	runCg      uint64
+	leaf       uint64
+	eff        *policy.Effective
 }
 
 func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.ProcessingRequest, h *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, headerOutcome) {
@@ -492,6 +502,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		}
 	}
 	runID, eff, isRun, cg, runCg := "", (*policy.Effective)(nil), false, uint64(0), uint64(0)
+	var models []policy.ModelCheck
 	var src, dst netip.AddrPort
 	var err1, err2 error
 	if transparentHTTP {
@@ -613,6 +624,9 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			}
 		}
 		d.Decision, d.Rule, d.Layer, d.WouldDeny, d.Enforced, d.Message = ed.Action, ed.Rule, ed.Layer, ed.WouldDeny, ed.Enforced, ed.Message
+		if phase == policy.PhaseRequest && ed.Allowed() {
+			models = ed.Models
+		}
 		switch {
 		case ed.Deferred && phase == policy.PhaseConnect && ed.Allowed() && terminated:
 			// Envoy terminates this tunnel; each request inside it is
@@ -623,7 +637,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			// terminate this tunnel (its configuration predates the rule).
 			// Passing it would leave the rule unenforced, so refuse.
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "needs termination"
-			d.Message = fmt.Sprintf("Rule %s needs the request's method or path, which this proxy cannot see "+
+			d.Message = fmt.Sprintf("Rule %s needs the request's method, path or model, which this proxy cannot see "+
 				"inside this TLS tunnel. An operator must restart Envoy with the current configuration.", ed.Rule)
 		case phase == policy.PhaseConnect && ed.Allowed() && !terminated && !ip.IsValid() && eff.InspectsContent(host):
 			// Likewise for content rules, which read what is sent inside.
@@ -661,6 +675,17 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			return r, headerOutcome{}
 		}
 		out.content = true
+	}
+	if len(models) > 0 {
+		// A model rule decided (milestone 5.3): a model in the query string
+		// is checked now; one in the body once it is held.
+		if m, named, why := queryModel(rawQuery); named {
+			if r := s.checkModel(d, models, "query string", m, why, runID, cg, runCg); r != nil {
+				return r, headerOutcome{}
+			}
+			out.queryModel = true
+		}
+		out.models = models
 	}
 	if eff != nil && phase == policy.PhaseRequest && eff.GovernsRemoteMCP(host) {
 		// A remote MCP server for this run: inspect its JSON-RPC.

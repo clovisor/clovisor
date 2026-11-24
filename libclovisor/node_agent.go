@@ -837,6 +837,17 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		}
 		fmt.Printf("%s [CONTENT] run=%d %s %s%s %s decision=%s hits=[%s]%s\n", ts, event.RunCgroupID, d.Method,
 			net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))), d.Path, d.Where, d.Decision, strings.Join(hits, " "), extra)
+	case EventModel:
+		d := event.Data.(ModelData)
+		extra := ""
+		if len(d.WouldDeny) > 0 {
+			extra += " would-deny=" + strings.Join(d.WouldDeny, ",")
+		}
+		if d.Reason != "" {
+			extra += " reason=" + strconv.Quote(d.Reason)
+		}
+		fmt.Printf("%s [MODEL] run=%d %s %s%s %s model=%q decision=%s rule=%s/%s%s\n", ts, event.RunCgroupID, d.Method,
+			net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))), d.Path, d.Where, d.Model, d.Decision, d.Layer, d.Rule, extra)
 	case EventHTTP:
 		d := event.Data.(HTTPData)
 		what := d.Method + " " + net.JoinHostPort(d.Host, strconv.Itoa(int(d.Port))) + d.Path

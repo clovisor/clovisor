@@ -150,7 +150,7 @@ func TestExtProcDecisions(t *testing.T) {
 		{"CONNECT", "github.com:443", "", true, ""},
 		{"CONNECT", "evil.example:443", "", true, ""}, // tag-and-log via "*"
 		{"CONNECT", "203.0.113.5:22", "", true, ""},   // cidr on an IP literal
-		{"CONNECT", "api.github.com:443", "", false, "needs the request's method or path"},
+		{"CONNECT", "api.github.com:443", "", false, "needs the request's method, path or model"},
 		{"GET", "mirror.internal", "/pub/file?x=1", true, ""},
 		{"GET", "mirror.internal", "/private", true, ""}, // falls through to "*"
 		{"CONNECT", "127.0.0.1:19901", "", false, "node-local address"},

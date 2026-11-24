@@ -150,6 +150,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("timeline-and-learn", e.testTimeline)
 	t.Run("content", e.testContent)
 	t.Run("limits", e.testLimits)
+	t.Run("models", e.testModels)
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -467,6 +468,56 @@ echo "after: $(curl -s -o /dev/null -w "%{http_connect}" https://origin.test/all
 	}
 	expect(t, shown, "Ended by  the node agent: it reached its duration limit of 3s", "Limit     duration 3s (profile it-limits): ended",
 		"deny rule allowed by it-limits [rate limit]")
+}
+
+func (e *env) testModels(t *testing.T) {
+	if _, errOut, err := e.sh(`cat > /tmp/models.sh <<'EOS'
+u=https://origin.test/echo
+echo "sonnet: $(curl -s --data-binary '{"model":"claude-sonnet-5-5-20261001","max_tokens":1}' $u)"
+echo "opus: $(curl -s --data-binary '{"model":"claude-opus-5-5","max_tokens":1}' $u)"
+echo "none: $(curl -s -w ' %{http_code}' --data-binary '{"messages":[]}' $u)"
+echo "twice: $(curl -s -o /dev/null -w '%{http_code}' --data-binary '{"model":"gpt-5","model":"claude-opus-5-5"}' $u)"
+printf '{"model":"claude-opus-5-5"}' | gzip > /tmp/m.gz
+echo "gzip: $(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Encoding: gzip' --data-binary @/tmp/m.gz $u)"
+echo "get: $(curl -s -o /dev/null -w '%{http_code}' $u)"
+echo "query: $(curl -s -o /dev/null -w '%{http_code}' "$u?model=gpt-4o")"
+EOS
+cat > /tmp/observe.sh <<'EOS'
+u=https://origin.test/echo
+for m in claude-sonnet-5-5 claude-sonnet-5-5 claude-haiku-5-5; do
+  curl -s -o /dev/null -w "$m %{http_code}\n" --data-binary "{\"model\":\"$m\"}" $u
+done
+EOS`); err != nil {
+		t.Fatal(errOut)
+	}
+	out, id := e.agentRun("it-models", `sh /tmp/models.sh`)
+	expect(t, out,
+		`sonnet: {"body":"{\"model\":\"claude-sonnet-5-5-20261001\",\"max_tokens\":1}"`,
+		`opus: {"blocked":"POST origin.test/echo","error":"egress denied"`,
+		`model \"claude-opus-5-5\" is not allowed by rule llm of profile it-models. Allowed: claude-sonnet-5-5*, gpt-5.`,
+		`its body has no top-level \"model\" field, and rule llm of profile it-models allows only`, `} 403`,
+		"twice: 403", "gzip: 403", "get: 200", "query: 403")
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Models (", `"claude-sonnet-5-5-20261001"`, `"claude-opus-5-5"`, "denied 2", "rule it-models/llm",
+		`none: its body has more than one "model" field`, "-> deny rule llm by it-models")
+
+	// Learn: a run observed under "*" drafts the models it named, and the
+	// draft replays clean; the stricter profile would refuse haiku.
+	out, id = e.agentRun("it-observe", `sh /tmp/observe.sh`)
+	expect(t, out, "claude-sonnet-5-5 200", "claude-haiku-5-5 200")
+	out, errOut, err := e.sh("/it/bin/agentctl learn --name drafted -o /tmp/models.yaml " + id +
+		" && cat /tmp/models.yaml && /it/bin/agentctl check --profile /tmp/models.yaml " + id)
+	if err != nil {
+		t.Fatalf("learn/check: %v\n%s%s", err, out, errOut)
+	}
+	expect(t, out, `model: { allow: ["claude-haiku-5-5", "claude-sonnet-5-5"] }`,
+		"# Models named: claude-haiku-5-5 (1 request), claude-sonnet-5-5 (2 requests).", "Would be denied (0)",
+		`model  POST origin.test:443/echo model "claude-sonnet-5-5"`)
+	out, _, _ = e.sh("/it/bin/agentctl check --profile /etc/clovisor/policy/it-models.yaml " + id)
+	expect(t, out, "Would be denied (1)", `model  POST origin.test:443/echo model "claude-haiku-5-5"`, "not in the rule's model list")
 }
 
 func (e *env) testPinDrift(t *testing.T) {

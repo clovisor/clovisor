@@ -154,15 +154,18 @@ func (st *streamState) done(s *ExtProcServer) {
 
 // heldBody is a request body being collected for inspection.
 type heldBody struct {
-	d        HTTPData
-	runID    string
-	runCg    uint64
-	leaf     uint64
-	eff      *policy.Effective
-	content  bool   // content rules cover this host
-	encoding string // gzip or deflate, decoded to check; "" plain
-	buf      []byte
-	max      int
+	d       HTTPData
+	runID   string
+	runCg   uint64
+	leaf    uint64
+	eff     *policy.Effective
+	content bool // content rules cover this host
+	models  []policy.ModelCheck
+	// queryModel: the query string named an admitted model.
+	queryModel bool
+	encoding   string // gzip or deflate, decoded to check; "" plain
+	buf        []byte
+	max        int
 }
 
 // bodyModes is the processing mode for a request whose body is checked
@@ -313,15 +316,26 @@ func (s *ExtProcServer) refuseBody(b *heldBody, code typev3.StatusCode, reason, 
 func (s *ExtProcServer) finishBody(st *streamState) *extprocv3.ProcessingResponse {
 	b := st.body
 	body := b.buf
-	if b.content {
-		plain := body
-		if b.encoding != "" {
-			var err error
-			if plain, err = decodeBody(b.encoding, body, b.max); err != nil {
-				return s.refuseBody(b, typev3.StatusCode_BadRequest, "body not decodable",
-					fmt.Sprintf("The request body, sent as %s, could not be decoded to check it for content rules (%v), so it was not sent.", b.encoding, err))
+	plain := body
+	if b.encoding != "" && (b.content || len(b.models) > 0) {
+		var err error
+		if plain, err = decodeBody(b.encoding, body, b.max); err != nil {
+			return s.refuseBody(b, typev3.StatusCode_BadRequest, "body not decodable",
+				fmt.Sprintf("The request body, sent as %s, could not be decoded to check it (%v), so it was not sent.", b.encoding, err))
+		}
+	}
+	if len(b.models) > 0 && len(plain) > 0 {
+		// An empty body names no model and calls none, as a GET does.
+		// One with no model field is let through if the query string
+		// named an admitted model; anything unreadable is refused.
+		m, why := bodyModel(plain)
+		if !(m == policy.ModelMissing && why == "" && b.queryModel) {
+			if r := s.checkModel(b.d, b.models, "body", m, why, b.runID, b.leaf, b.runCg); r != nil {
+				return r
 			}
 		}
+	}
+	if b.content {
 		v := b.eff.ScanContent(b.d.Host, "body", plain, b.encoding == "")
 		if v.Matched() {
 			cd := ContentData{Host: b.d.Host, Port: b.d.Port, Method: b.d.Method, Path: b.d.Path, Where: "body", Bytes: len(plain),

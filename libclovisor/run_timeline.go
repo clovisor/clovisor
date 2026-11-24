@@ -128,7 +128,33 @@ type RunSummary struct {
 	// Content is what content rules found in the run's requests, by host
 	// and rule (milestone 5.1). The matched text is never recorded.
 	Content []ContentUse `json:"content,omitempty"`
+	// Models are the models the run's requests named where a model rule
+	// decided them (milestone 5.3), by host, method, path and model. At
+	// most MaxModelUses entries; requests beyond are counted in
+	// ModelsDropped.
+	Models        []ModelUse `json:"models,omitempty"`
+	ModelsDropped int        `json:"models_dropped,omitempty"`
 }
+
+// ModelUse aggregates requests that named one model on one path. Model is
+// empty for requests that named none, and Reason says why none was read.
+type ModelUse struct {
+	Host      string `json:"host"`
+	Port      uint16 `json:"port"`
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Model     string `json:"model,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Layer     string `json:"layer,omitempty"` // the layer that refused, or whose rule let it through
+	Rule      string `json:"rule,omitempty"`
+	Requests  int    `json:"requests"`
+	Denied    int    `json:"denied,omitempty"`
+	WouldDeny int    `json:"would_deny,omitempty"`
+}
+
+// MaxModelUses bounds the distinct model entries kept per run: the run
+// chooses the names and paths.
+const MaxModelUses = 256
 
 // ContentUse aggregates one content rule's matches on one host. Rule is
 // empty for requests refused for another reason (size, encoding, load),
@@ -253,7 +279,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, drop, socket, unix, gap
+	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, model, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -295,10 +321,18 @@ type TimelineEvent struct {
 	// mcp events:
 	MCPServer string `json:"mcp_server,omitempty"`
 	MCPName   string `json:"mcp_name,omitempty"` // tool or resource
-	Note      string `json:"note,omitempty"`
+	// model events (milestone 5.3): the model a request named.
+	Model string `json:"model,omitempty"`
+	Note  string `json:"note,omitempty"`
 }
 
 type contentKey struct{ host, layer, rule, reason string }
+
+type modelKey struct {
+	host                        string
+	port                        uint16
+	method, path, model, reason string
+}
 
 type destKey struct {
 	proto string
@@ -321,6 +355,7 @@ type runState struct {
 	proxied map[proxKey]*ProxiedDest
 	mcp     map[mcpKey]*MCPUse
 	content map[contentKey]*ContentUse
+	models  map[modelKey]*ModelUse
 	// callFor names the call a cgroup belongs to; calls counts events
 	// per call.
 	callFor func(cgroupID uint64) string
@@ -479,6 +514,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		proxied:  make(map[proxKey]*ProxiedDest),
 		mcp:      make(map[mcpKey]*MCPUse),
 		content:  make(map[contentKey]*ContentUse),
+		models:   make(map[modelKey]*ModelUse),
 		calls:    make(map[string]*CallSummary),
 		callFor: func(cg uint64) string {
 			if r.Meta == nil {
@@ -506,6 +542,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for i := range prev.Summary.Content {
 				u := prev.Summary.Content[i]
 				st.content[contentKey{u.Host, u.Layer, u.Rule, u.Reason}] = &u
+			}
+			for i := range prev.Summary.Models {
+				u := prev.Summary.Models[i]
+				st.models[modelKey{u.Host, u.Port, u.Method, u.Path, u.Model, u.Reason}] = &u
 			}
 			for i := range prev.Summary.Proxied {
 				p := prev.Summary.Proxied[i]
@@ -770,6 +810,51 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Note:     d.Where + ": " + strings.Join(notes, "; "),
 		}, r.MaxEvents)
 
+	case EventModel:
+		d := ev.Data.(ModelData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		k := modelKey{d.Host, d.Port, d.Method, d.Path, d.Model, d.Reason}
+		u := st.models[k]
+		if u == nil && len(st.models) < MaxModelUses {
+			u = &ModelUse{Host: d.Host, Port: d.Port, Method: d.Method, Path: d.Path, Model: d.Model, Reason: d.Reason}
+			st.models[k] = u
+		}
+		if u == nil {
+			st.tl.Summary.ModelsDropped++
+		} else {
+			u.Requests++
+			u.Layer, u.Rule = d.Layer, d.Rule
+			if d.Decision == policy.ActionDeny && d.Enforced {
+				u.Denied++
+			} else if len(d.WouldDeny) > 0 {
+				u.WouldDeny++
+			}
+		}
+		note := d.Where + ": model " + strconv.Quote(d.Model)
+		if d.Model == "" {
+			note = d.Where + ": no model"
+		}
+		st.add(TimelineEvent{
+			Time:      ev.Timestamp,
+			Type:      "model",
+			CgroupID:  ev.CgroupID,
+			Method:    d.Method,
+			DstName:   d.Host,
+			DstPort:   d.Port,
+			Path:      d.Path,
+			Model:     d.Model,
+			Decision:  d.Decision,
+			Enforced:  d.Enforced,
+			Rule:      d.Rule,
+			Layer:     d.Layer,
+			WouldDeny: d.WouldDeny,
+			Reason:    d.Reason,
+			Note:      note,
+		}, r.MaxEvents)
+
 	case EventHTTP:
 		d := ev.Data.(HTTPData)
 		st := r.state(ev, "")
@@ -1006,6 +1091,30 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 		}
 		if a.Layer+"/"+a.Rule != b.Layer+"/"+b.Rule {
 			return a.Layer+"/"+a.Rule < b.Layer+"/"+b.Rule
+		}
+		return a.Reason < b.Reason
+	})
+
+	tl.Summary.Models = nil
+	for _, u := range st.models {
+		tl.Summary.Models = append(tl.Summary.Models, *u)
+	}
+	sort.Slice(tl.Summary.Models, func(i, j int) bool {
+		a, b := tl.Summary.Models[i], tl.Summary.Models[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if a.Model != b.Model {
+			return a.Model < b.Model
 		}
 		return a.Reason < b.Reason
 	})

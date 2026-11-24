@@ -1,0 +1,13 @@
+# Model allow-lists (milestone 5.3): other.test is terminated for its
+# model rule alone; the run ignores the proxy and is redirected.
+kind: AgentProfile
+metadata: { name: tp-models }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: llm
+        to: { fqdn: ["other.test"], ports: [443] }
+        model: { allow: ["gpt-5"] }
+        action: allow
