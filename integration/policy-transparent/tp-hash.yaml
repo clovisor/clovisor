@@ -1,0 +1,16 @@
+# Exec hashes (milestone 5.7): pinned.sh may run only with its own
+# content, here and in the test's bin directory (where /it/bin/* would
+# otherwise allow any content). Everything else runs, by the default.
+kind: AgentProfile
+metadata: { name: tp-hash }
+spec:
+  mode: enforce
+  egress: { default: deny }
+  exec:
+    default: allow
+    allow:
+      - { path: "/it/bin/*" }
+      - path: "/it/bin/pinned.sh"
+        hash: "sha256:d4ed4315da74e2cdbbefa11fec9fbcf04cc2e781b1f51cc2f3ad2230c29e24b1"
+      - path: "/tmp/h/pinned.sh"
+        hash: "sha256:d4ed4315da74e2cdbbefa11fec9fbcf04cc2e781b1f51cc2f3ad2230c29e24b1"

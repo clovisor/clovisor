@@ -46,7 +46,12 @@
  *                            require_trusted_path, a file failing the
  *                            trusted-path test is refused; else the
  *                            layer's default decides. Scripts are checked
- *                            again for their interpreter.
+ *                            again for their interpreter. An exact entry
+ *                            with hashes (milestone 5.7) passes only if
+ *                            the file's SHA-256, from bpf_ima_file_hash,
+ *                            is one of them; that makes the hook
+ *                            sleepable. Hashes are cached per inode where
+ *                            the kernel's validators can be trusted.
  *            unix_stream_connect, unix_may_send (milestone 4.2)
  *                            a Unix socket bound outside the run, unless
  *                            its address matches the node's patterns (the
@@ -146,9 +151,40 @@ typedef struct {
     unsigned int val;
 } kuid_t___c;
 
+struct super_block {
+    __u32 s_dev;
+    unsigned long s_flags;
+    unsigned long s_magic;
+} __attribute__((preserve_access_index));
+
+typedef struct {
+    int counter;
+} atomic_t___c;
+
+typedef struct {
+    __s64 counter;
+} atomic64_t___c;
+
 struct inode {
     unsigned short i_mode;
     kuid_t___c i_uid;
+    struct super_block *i_sb;
+    unsigned long i_ino;
+    __u32 i_generation;
+    atomic64_t___c i_version;
+    atomic_t___c i_writecount;
+    __s64 i_ctime_sec;  /* 6.11 and later */
+    __u32 i_ctime_nsec;
+} __attribute__((preserve_access_index));
+
+struct timespec64___c {
+    __s64 tv_sec;
+    long tv_nsec;
+};
+
+/* Before 6.11 the change time was one timespec64. */
+struct inode___ctime {
+    struct timespec64___c __i_ctime;
 } __attribute__((preserve_access_index));
 
 struct dentry {
@@ -1888,19 +1924,31 @@ struct exec_key {
     __u64 hash;
 };
 
-/* Exact exec.allow paths, per run and layer, by hash; the value is the
+struct exec_path {
+    __u64 b[EXEC_WORDS];
+};
+
+#define MAX_EXEC_HASHES 4
+#define SHA256_LEN      32
+
+/* An exact exec.allow entry: the path, and the SHA-256s its content may
+ * have (milestone 5.7). */
+struct exec_allowed {
+    __u64 b[EXEC_WORDS];
+    __u32 n_hash;         /* 0: the path alone passes */
+    __u32 _pad;
+    __u64 sha[MAX_EXEC_HASHES][SHA256_LEN / 8]; /* the digest's bytes, as words */
+};
+
+/* Exact exec.allow paths, per run and layer, by hash; the value holds the
  * path, compared in full so a crafted collision gains nothing. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 65536);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, struct exec_key);
-    __type(value, struct exec_path);
+    __type(value, struct exec_allowed);
 } exec_allow SEC(".maps");
-
-struct exec_path {
-    __u64 b[EXEC_WORDS];
-};
 
 /* Per run, the resolved paths already reported (with their verdict). */
 struct {
@@ -1910,22 +1958,78 @@ struct {
     __type(value, __u8);
 } exec_seen SEC(".maps");
 
+/* exec_path_event flags (milestone 5.7) */
+#define EXEC_HASHED   1 /* sha is the file's SHA-256 */
+#define EXEC_CACHED   2 /* from exec_sums, not computed for this exec */
+#define EXEC_MISMATCH 4 /* an entry with hashes named the path; the content is none of them */
+#define EXEC_HASH_ERR 8 /* the file could not be hashed */
+
 struct exec_path_event {
     struct event_hdr hdr;
     __u8  path[EXEC_PATH];
     __u32 len;
     __u32 verdict;        /* V_EXEC_* */
     __u32 trusted;
+    __u32 flags;
+    __u8  sha[SHA256_LEN];
+};
+
+/* The exec hash cache (milestone 5.7; 5.0 spike): a file's SHA-256 by
+ * (device, inode), with the kernel's validators as they were when it was
+ * hashed. Shared by every run: it holds content hashes, not decisions. */
+struct exec_ino {
+    __u64 dev;
+    __u64 ino;
+};
+
+struct exec_sum {
+    __s64 version;        /* i_version, less its queried flag */
+    __s64 ctime_sec;
+    __u32 ctime_nsec;     /* less the multigrain queried flag */
+    __u32 gen;
+    __u8  sha[SHA256_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct exec_ino);
+    __type(value, struct exec_sum);
+} exec_sums SEC(".maps");
+
+/* Scratch for one exec: the resolved path, too large for the stack beside
+ * the rest, and the file's hash. Per task, not per CPU: the hook sleeps
+ * while it hashes, and another exec on the same CPU could overwrite
+ * per-CPU scratch meanwhile. Keeping the hash's outcome here rather than
+ * in registers also keeps the verifier from walking the layers once per
+ * outcome. */
+struct exec_task {
+    struct exec_path p;
+    struct exec_sum sum;
+    __u64 h;              /* exec_hash of p */
+    __u32 len;            /* of p */
+    __u32 trusted;        /* trusted_path */
+    __u32 flags;          /* EXEC_* */
     __u32 _pad;
 };
 
-/* Scratch for the resolved path: too large for the stack beside the rest. */
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct exec_path);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, struct exec_task);
 } exec_scratch SEC(".maps");
+
+#define HASH_ALGO_SHA256_ 4          /* enum hash_algo */
+#define SB_I_VERSION_     (1UL << 23)
+#define EXT4_MAGIC_       0xEF53
+#define XFS_MAGIC_        0x58465342
+#define BTRFS_MAGIC_      0x9123683E
+#define TMPFS_MAGIC_      0x01021994
+/* A file is cached only once its change time is this many seconds old by
+ * the TAI clock (ahead of real time by at most 37 s), so a later write in
+ * the same clock tick cannot leave the change time as it was. */
+#define EXEC_SUM_SETTLED  60
 
 static __always_inline int trusted_inode(struct inode *ino)
 {
@@ -1961,6 +2065,23 @@ static __always_inline int trusted_path(struct file *f)
     return 0; /* deeper than TRUST_DEPTH: not shown trusted */
 }
 
+/* Zero p past len bytes. bpf_d_path builds the path at the end of the
+ * buffer and moves it to the front, so what follows the NUL is the end of
+ * the path again; exact entries are hashed and compared over all of it.
+ * Arithmetic, not branches, as len is not known to the verifier. */
+static __always_inline void exec_clear_tail(struct exec_path *p, __u32 len)
+{
+#pragma unroll
+    for (int j = 0; j < EXEC_WORDS; j++) {
+        __s64 s = (__s64)len - 8 * j;    /* bytes of this word to keep */
+        __u64 full = (__u64)(7 - s) >> 63; /* s >= 8 */
+        __u64 some = (__u64)(0 - s) >> 63; /* s > 0 */
+        asm volatile("" : "+r"(full), "+r"(some));
+        __u64 part = (1ULL << (8 * (s & 7))) - 1;
+        p->b[j] &= (0 - full) | ((0 - (some & (full ^ 1))) & part);
+    }
+}
+
 static __always_inline __u64 exec_hash(struct exec_path *p)
 {
     __u64 h = 14695981039346656037ULL;
@@ -1970,17 +2091,19 @@ static __always_inline __u64 exec_hash(struct exec_path *p)
     return h;
 }
 
+/* 1: listed; 2: an exact entry with hashes names it, so its content
+ * decides; 0: not listed. */
 static __always_inline int exec_listed(__u64 run, __u32 layer, struct exec_layer *l, struct exec_path *p, __u64 h, __u32 len)
 {
     struct exec_key k = {.run = run, .layer = layer, .hash = h};
-    struct exec_path *v = bpf_map_lookup_elem(&exec_allow, &k);
+    struct exec_allowed *v = bpf_map_lookup_elem(&exec_allow, &k);
     if (v) {
         __u64 diff = 0;
 #pragma unroll
         for (int j = 0; j < EXEC_WORDS; j++)
             diff |= v->b[j] ^ p->b[j];
         if (diff == 0)
-            return 1;
+            return v->n_hash ? 2 : 1;
     }
     __u32 n = l->n_prefix;
 #pragma unroll
@@ -1996,8 +2119,132 @@ static __always_inline int exec_listed(__u64 run, __u32 layer, struct exec_layer
     return 0;
 }
 
-SEC("lsm/bprm_check_security")
-int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
+/* 1 if x is 0, else 0; and 1 if a < b, else 0. Arithmetic, not branches:
+ * the verifier would follow every combination of branched results. The
+ * barrier keeps the compiler from turning them back into compares. */
+static __always_inline __u64 bf_zero(__u64 x)
+{
+    __u64 neg = -x;
+    asm volatile("" : "+r"(neg));
+    return ((x | neg) >> 63) ^ 1;
+}
+
+static __always_inline __u64 bf_lt(__u32 a, __u32 b)
+{
+    __u64 d = (__u64)a - (__u64)b;
+    asm volatile("" : "+r"(d));
+    return d >> 63;
+}
+
+/* Whether some layer below n has an exact entry with hashes under this
+ * path's hash. The path itself is compared when layers decide: a
+ * colliding path costs a needless hash, nothing more. */
+static __always_inline int exec_pinned(__u64 run, __u32 n, __u64 h)
+{
+    struct exec_key k = {.run = run, .hash = h};
+    __u64 pinned = 0;
+#pragma unroll
+    for (int i = 0; i < MAX_EXEC_LAYERS; i++) {
+        k.layer = i;
+        struct exec_allowed *v = bpf_map_lookup_elem(&exec_allow, &k);
+        if (v)
+            pinned |= bf_lt(i, n) & (bf_zero(v->n_hash) ^ 1);
+    }
+    return pinned;
+}
+
+/* Whether layer's exact entry for this path (already compared) lists sha. */
+static __always_inline int exec_sha_listed(__u64 run, __u32 layer, __u64 h, __u8 *sha)
+{
+    struct exec_key k = {.run = run, .layer = layer, .hash = h};
+    struct exec_allowed *v = bpf_map_lookup_elem(&exec_allow, &k);
+    if (!v)
+        return 0;
+    __u64 w[SHA256_LEN / 8];
+    __builtin_memcpy(w, sha, SHA256_LEN);
+    __u32 n = v->n_hash;
+    __u64 found = 0;
+#pragma unroll
+    for (int i = 0; i < MAX_EXEC_HASHES; i++) {
+        __u64 diff = (v->sha[i][0] ^ w[0]) | (v->sha[i][1] ^ w[1]) | (v->sha[i][2] ^ w[2]) | (v->sha[i][3] ^ w[3]);
+        found |= bf_lt(i, n) & bf_zero(diff);
+    }
+    return found;
+}
+
+/* The inode's cache key and validators. Nonzero if a cached hash can be
+ * trusted for it: a local filesystem that keeps i_version (FUSE and
+ * network filesystems can change content behind an unchanged inode), and
+ * no one has the file open for writing. */
+static __always_inline int exec_validators(struct inode *in, struct exec_ino *k, struct exec_sum *s)
+{
+    struct super_block *sb = BPF_CORE_READ(in, i_sb);
+    unsigned long magic = BPF_CORE_READ(sb, s_magic);
+    unsigned long flags = BPF_CORE_READ(sb, s_flags);
+    k->dev = BPF_CORE_READ(sb, s_dev);
+    k->ino = BPF_CORE_READ(in, i_ino);
+    s->version = BPF_CORE_READ(in, i_version.counter) >> 1;
+    s->gen = BPF_CORE_READ(in, i_generation);
+    if (bpf_core_field_exists(in->i_ctime_sec)) {
+        s->ctime_sec = BPF_CORE_READ(in, i_ctime_sec);
+        s->ctime_nsec = BPF_CORE_READ(in, i_ctime_nsec) & 0x7fffffff;
+    } else {
+        struct inode___ctime *o = (void *)in;
+        s->ctime_sec = BPF_CORE_READ(o, __i_ctime.tv_sec);
+        s->ctime_nsec = BPF_CORE_READ(o, __i_ctime.tv_nsec) & 0x7fffffff;
+    }
+    int local = magic == EXT4_MAGIC_ || magic == XFS_MAGIC_ || magic == BTRFS_MAGIC_ || magic == TMPFS_MAGIC_;
+    return local && (flags & SB_I_VERSION_) && BPF_CORE_READ(in, i_writecount.counter) <= 0;
+}
+
+/* The file's SHA-256 into s->sha, from the cache or bpf_ima_file_hash,
+ * which sleeps. Exec holds off writers until it completes, so the content
+ * cannot change while it is hashed. Returns EXEC_* flags. */
+static __always_inline __u32 exec_file_sha(struct file *f, struct exec_sum *s)
+{
+    struct inode *in = BPF_CORE_READ(f, f_inode);
+    struct exec_ino k = {};
+    int cacheable = exec_validators(in, &k, s);
+    if (cacheable) {
+        struct exec_sum *v = bpf_map_lookup_elem(&exec_sums, &k);
+        if (v && v->version == s->version && v->ctime_sec == s->ctime_sec &&
+            v->ctime_nsec == s->ctime_nsec && v->gen == s->gen) {
+            __builtin_memcpy(s->sha, v->sha, SHA256_LEN);
+            return EXEC_HASHED | EXEC_CACHED;
+        }
+    }
+    if (bpf_ima_file_hash(f, s->sha, SHA256_LEN) != HASH_ALGO_SHA256_)
+        return EXEC_HASH_ERR;
+    __s64 now = bpf_ktime_get_tai_ns() / 1000000000ULL;
+    if (cacheable && s->ctime_sec + EXEC_SUM_SETTLED < now)
+        bpf_map_update_elem(&exec_sums, &k, s, BPF_ANY);
+    return EXEC_HASHED;
+}
+
+/* Whether layer i passes the exec in t. A global function, so the
+ * verifier checks the matching once, not once per layer for each way the
+ * caller reached it (which is more states than it allows). */
+__attribute__((noinline)) int exec_layer_ok(struct exec_policy *pol, struct exec_task *t, __u64 run, __u32 i, int hashing)
+{
+    if (!pol || !t || i >= MAX_EXEC_LAYERS)
+        return 0;
+    struct exec_layer *l = &pol->l[i];
+    int r = exec_listed(run, i, l, &t->p, t->h, t->len);
+    if (r == 2) {
+        int ok = hashing && (t->flags & EXEC_HASHED) && exec_sha_listed(run, i, t->h, t->sum.sha);
+        if (!ok && (t->flags & EXEC_HASHED))
+            t->flags |= EXEC_MISMATCH;
+        return ok;
+    }
+    if (r == 1)
+        return 1;
+    if (l->require_trusted && !t->trusted)
+        return 0;
+    return l->default_allow != 0;
+}
+
+/* The exec decision for both programs below; hashing is a constant. */
+static __always_inline int exec_check(struct linux_binprm *bprm, int ret, const int hashing)
 {
     if (ret)
         return lsm_prev(ret);
@@ -2010,20 +2257,34 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
     run = policy_run(cfg, run);
     struct exec_policy *pol = bpf_map_lookup_elem(&exec_policy, &run);
 
-    __u32 zero = 0;
-    struct exec_path *p = bpf_map_lookup_elem(&exec_scratch, &zero);
-    if (!p)
-        return 0;
+    struct exec_task *t = bpf_task_storage_get(&exec_scratch, bpf_get_current_task_btf(), 0,
+                                               BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (!t)
+        return pol && cfg->mode == MODE_ENFORCE ? -EPERM_ : 0; /* out of memory: fail closed */
+    struct exec_path *p = &t->p;
     __builtin_memset(p, 0, sizeof(*p));
-    /* Direct access keeps the pointer trusted, as bpf_d_path requires. */
+    t->flags = 0;
+    /* Direct access keeps the pointer trusted, as bpf_d_path and
+     * bpf_ima_file_hash require. */
     struct file *f = bprm->file;
     long n = bpf_d_path(&f->f_path, (char *)p->b, EXEC_PATH);
     if (n <= 0)
         return 0;
     __u32 len = n - 1; /* n counts the NUL */
+    exec_clear_tail(p, len);
     int trusted = trusted_path(f);
     __u64 h = exec_hash(p);
 
+    /* The file is hashed only if some layer's exact entry for the path
+     * lists hashes. Without hashing, such an entry passes nothing. */
+    if (hashing && pol && exec_pinned(run, pol->n, h)) {
+        t->flags = exec_file_sha(f, &t->sum);
+        pol = bpf_map_lookup_elem(&exec_policy, &run); /* again, after a sleep */
+    }
+
+    t->h = h;
+    t->len = len;
+    t->trusted = trusted;
     int deny = 0, refuse = 0;
     if (pol) {
         __u32 nl = pol->n;
@@ -2031,17 +2292,9 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
         for (int i = 0; i < MAX_EXEC_LAYERS; i++) {
             if ((__u32)i >= nl)
                 break;
-            struct exec_layer *l = &pol->l[i];
-            int ok;
-            if (exec_listed(run, i, l, p, h, len))
-                ok = 1;
-            else if (l->require_trusted && !trusted)
-                ok = 0;
-            else
-                ok = l->default_allow;
-            if (!ok) {
+            if (!exec_layer_ok(pol, t, run, i, hashing)) {
                 deny = 1;
-                if (l->enforce)
+                if (pol->l[i].enforce)
                     refuse = 1;
             }
         }
@@ -2049,9 +2302,16 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
     refuse = refuse && cfg->mode == MODE_ENFORCE;
     __u32 verdict = refuse ? V_EXEC_DENY : (deny ? V_AUDIT_EXEC : V_EXEC_OK);
 
-    /* Each resolved path once per run and verdict: what learn and check
-     * need, without an event per exec of a hot binary. */
-    struct exec_key sk = {.run = run, .layer = verdict, .hash = h};
+    /* Each resolved path once per run, verdict and content (where it was
+     * hashed), and once more when the cache first answers for it: what
+     * learn and check need, without an event per exec of a hot binary. */
+    __u64 seen = h;
+    if (t->flags & EXEC_HASHED) {
+        __u64 x;
+        __builtin_memcpy(&x, t->sum.sha, sizeof(x));
+        seen ^= x ^ (t->flags & EXEC_CACHED);
+    }
+    struct exec_key sk = {.run = run, .layer = verdict, .hash = seen};
     __u8 one = 1;
     if (bpf_map_update_elem(&exec_seen, &sk, &one, BPF_NOEXIST) == 0) {
         struct event_hdr hdr = {};
@@ -2063,7 +2323,8 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
                 e->len = len;
                 e->verdict = verdict;
                 e->trusted = trusted;
-                e->_pad = 0;
+                e->flags = t->flags;
+                __builtin_memcpy(e->sha, t->sum.sha, SHA256_LEN);
                 bpf_ringbuf_submit(e, 0);
             } else {
                 note_lost(hdr.run_cgroup_id);
@@ -2071,6 +2332,23 @@ int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
         }
     }
     return refuse ? -EPERM_ : 0;
+}
+
+/* Exec policy with hashes (milestone 5.7): sleepable for
+ * bpf_ima_file_hash (Linux 5.18) and the TAI clock (5.19). It sleeps only
+ * for an exact entry with hashes whose file is not cached. */
+SEC("lsm.s/bprm_check_security")
+int BPF_PROG(on_lsm_exec_hash, struct linux_binprm *bprm, int ret)
+{
+    return exec_check(bprm, ret, 1);
+}
+
+/* Exec policy by path alone, for kernels the program above does not load
+ * on; the node agent then refuses profiles with hashes. */
+SEC("lsm/bprm_check_security")
+int BPF_PROG(on_lsm_exec, struct linux_binprm *bprm, int ret)
+{
+    return exec_check(bprm, ret, 0);
 }
 
 /* ---- Unix sockets (milestone 4.2) ---- */

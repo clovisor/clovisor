@@ -1001,11 +1001,18 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 		if st == nil {
 			return nil, nil
 		}
-		st.tl.Summary.Exec = append(st.tl.Summary.Exec, ExecUse{Path: d.Path, Trusted: d.Trusted, Verdict: d.Verdict})
+		st.tl.Summary.Exec = append(st.tl.Summary.Exec, ExecUse{Path: d.Path, Trusted: d.Trusted, Verdict: d.Verdict,
+			Hash: d.Hash, HashCached: d.HashCached, HashMismatch: d.HashMismatch, HashError: d.HashError})
 		if d.Verdict != "allowed" {
 			note := "untrusted path"
 			if d.Trusted {
 				note = "trusted path"
+			}
+			switch {
+			case d.HashMismatch:
+				note = "content " + d.Hash + " is not a hash exec.allow lists for this path"
+			case d.HashError:
+				note = "exec.allow lists hashes for this path, and the file could not be hashed"
 			}
 			st.add(TimelineEvent{Time: ev.Timestamp, Type: "exec_path", PID: ev.PID, CgroupID: ev.CgroupID,
 				Binary: d.Path, Verdict: d.Verdict, Note: note}, r.MaxEvents)
@@ -1347,4 +1354,11 @@ type ExecUse struct {
 	Path    string `json:"path"`
 	Trusted bool   `json:"trusted"`
 	Verdict string `json:"verdict"`
+	// Hash is the content's sha256:<hex>, where an exec.allow entry with
+	// hashes named the path (milestone 5.7). HashMismatch: it was none of
+	// them; HashError: the file could not be hashed.
+	Hash         string `json:"hash,omitempty"`
+	HashCached   bool   `json:"hash_cached,omitempty"` // the kernel's cache answered, not a fresh hash
+	HashMismatch bool   `json:"hash_mismatch,omitempty"`
+	HashError    bool   `json:"hash_error,omitempty"`
 }

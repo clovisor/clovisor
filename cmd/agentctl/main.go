@@ -1125,7 +1125,9 @@ func explainProfiles(argv []string) error {
 	// Offline, assume this machine's kernel: whether BPF LSM is active
 	// decides what transparent mode does with sockets.
 	lsm := mode != policy.ExplicitProxy && *platform == "linux" && clovisor.BPFLSMActive()
-	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux", KernelLSM: lsm})
+	// Exec hashes are assumed verifiable where BPF LSM is: probing needs
+	// the node agent's privilege. The node agent's own compile decides.
+	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux", KernelLSM: lsm, ExecHash: lsm})
 	if err != nil {
 		return err
 	}
@@ -1168,6 +1170,7 @@ func checkProfile(argv []string) error {
 		// As the transparent node would compile it; BPF LSM as on this
 		// machine.
 		copts.Mode, copts.KernelLSM = policy.Transparent, copts.Linux && clovisor.BPFLSMActive()
+		copts.ExecHash = copts.KernelLSM
 	}
 	c, err := compileFilesFor([]string{*profile}, copts)
 	if err != nil {

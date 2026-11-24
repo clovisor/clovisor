@@ -8,6 +8,7 @@
 package policy
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
@@ -272,7 +273,7 @@ spec:
 		`bad-host): fqdn "Bad_Host.example" must be a lowercase hostname`,
 		"exec: exec rules cannot be enforced by this deployment",
 		`exec.allow[0]: path "git" must be absolute`,
-		"exec.allow[1]: exec hash cannot be enforced yet: it needs IMA hash verification (Phase 4)",
+		`exec.allow[1]: hash "sha256:ab12" must be sha256: followed by 64 hex digits`,
 	} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("missing diagnostic %q", want)
@@ -591,6 +592,112 @@ spec:
 		bp, _ := Parse([]byte(strings.Replace(doc, "/home/u/bin/tool", bad, 1)))
 		if _, diags := Compile(Options{Mode: Transparent, Linux: true, KernelLSM: true}, bp); len(diags) == 0 {
 			t.Errorf("exec.allow %q accepted", bad)
+		}
+	}
+}
+
+func TestExecHash(t *testing.T) {
+	const git = "sha256:" + "aa00000000000000000000000000000000000000000000000000000000000001"
+	const git2 = "sha256:" + "bb00000000000000000000000000000000000000000000000000000000000002"
+	doc := `kind: AgentProfile
+metadata: { name: x }
+spec:
+  mode: enforce
+  egress: { default: deny }
+  exec:
+    default: allow
+    allow:
+      - { path: /usr/bin/git, hash: "` + git + `" }
+      - { path: /usr/bin/git, hash: "sha256:` + strings.ToUpper(git2[7:]) + `" }
+      - { path: /usr/bin/curl }
+`
+	opts := Options{Mode: Transparent, Linux: true, KernelLSM: true, ExecHash: true}
+	c := mustCompile(t, opts, doc)
+	cp := c.Profiles[0]
+	for _, tc := range []struct {
+		path, sum                  string
+		allowed, mismatch, unknown bool
+	}{
+		{"/usr/bin/git", git, true, false, false},
+		{"/usr/bin/git", git2, true, false, false}, // upper case parsed, lower case compared
+		{"/usr/bin/git", "sha256:" + strings.Repeat("0", 64), false, true, false},
+		{"/usr/bin/git", "", false, false, true},
+		{"/usr/bin/curl", "", true, false, false},
+		{"/usr/bin/env", "", true, false, false}, // the default
+	} {
+		d := cp.DecideExecHash(tc.path, true, tc.sum)
+		if d.Allowed != tc.allowed || d.Mismatch != tc.mismatch || d.NoHash != tc.unknown {
+			t.Errorf("%s %s: %+v", tc.path, tc.sum, d)
+		}
+	}
+	l, ok := cp.ExecLayer()
+	if !ok || len(l.Exact) != 2 || len(l.Hashes) != 1 || len(l.Hashes["/usr/bin/git"]) != 2 || FormatExecHash(l.Hashes["/usr/bin/git"][0]) != git {
+		t.Errorf("layer: %+v", l)
+	}
+	var pl *Placement
+	for i := range cp.Placements {
+		if cp.Placements[i].Rule == "exec/git" {
+			pl = &cp.Placements[i]
+		}
+	}
+	if pl == nil || !strings.Contains(pl.EnforcedBy, "SHA-256") || pl.Notes[0] != "content-verified: one of 2 SHA-256s" {
+		t.Errorf("placement: %+v", pl)
+	}
+
+	// Errors: a directory, a malformed hash, the path also listed bare, too many.
+	bad := func(entries string) string {
+		p, err := Parse([]byte(strings.Replace(doc, doc[strings.Index(doc, "      - { path: /usr/bin/git"):], entries, 1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, diags := Compile(opts, p)
+		var s []string
+		for _, d := range diags {
+			s = append(s, d.Error())
+		}
+		return strings.Join(s, "\n")
+	}
+	for entries, want := range map[string]string{
+		"      - { path: /opt/*, hash: \"" + git + "\" }\n":                                       "must be an exact path",
+		"      - { path: /usr/bin/git, hash: \"md5:00\" }\n":                                      "must be sha256: followed by 64 hex digits",
+		"      - { path: /usr/bin/git }\n      - { path: /usr/bin/git, hash: \"" + git + "\" }\n": "also listed without a hash",
+		"      - { path: /usr/bin/git, hash: \"" + git + "\" }\n      - { path: /usr/bin/git }\n": "also listed with a hash",
+		strings.Repeat("      - { path: /usr/bin/git, hash: \"X\" }\n", 5):                        "at most 4 hashes",
+	} {
+		if strings.Contains(entries, `"X"`) {
+			var b strings.Builder
+			for i := 0; i < 5; i++ {
+				fmt.Fprintf(&b, "      - { path: /usr/bin/git, hash: \"sha256:%064x\" }\n", i)
+			}
+			entries = b.String()
+		}
+		if e := bad(entries); !strings.Contains(e, want) {
+			t.Errorf("%q: got %q, want %q", entries, e, want)
+		}
+	}
+
+	// Where the kernel cannot hash, the receipt says the hash is not
+	// verified, and an enforcing profile with one does not compile.
+	audit := mustCompile(t, Options{Linux: true}, strings.Replace(doc, "mode: enforce", "mode: audit", 1))
+	for _, p := range audit.Profiles[0].Placements {
+		if p.Rule == "exec/git" && !strings.Contains(strings.Join(p.Notes, ";"), "needs transparent mode") {
+			t.Errorf("explicit-mode placement: %+v", p)
+		}
+	}
+	old := opts
+	old.ExecHash = false
+	ep, _ := Parse([]byte(doc))
+	if _, diags := Compile(old, ep); len(diags) != 2 || !strings.Contains(diags[0].Msg, "cannot hash files at exec") {
+		t.Errorf("enforced hash on a kernel that cannot hash: %v", diags)
+	}
+	ap, _ := Parse([]byte(strings.Replace(doc, "mode: enforce", "mode: audit", 1)))
+	ac, diags := Compile(old, ap)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	for _, p := range ac.Profiles[0].Placements {
+		if p.Rule == "exec/git" && !strings.Contains(strings.Join(p.Notes, ";"), "this kernel cannot hash") {
+			t.Errorf("audit placement on a kernel that cannot hash: %+v", p)
 		}
 	}
 }

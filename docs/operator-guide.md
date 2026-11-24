@@ -751,6 +751,7 @@ relying on it.
 | atomic exchange in BPF | backstop report counts | 5.12 |
 | BPF LSM (`CONFIG_BPF_LSM`), active at boot | socket families, foreign sockets, Unix sockets, exec | 5.7 |
 | `bpf_d_path` | exec by resolved path | 5.10 |
+| `bpf_ima_file_hash`, the TAI clock | exec by content (`exec.allow[].hash`) | 5.18, 5.19 |
 
 **Enabling BPF LSM.** Transparent mode works without it, but socket
 families, foreign sockets, Unix sockets and exec are then not governed. The
@@ -1025,6 +1026,41 @@ exec fails with `EPERM`. Each resolved path is recorded once per run with
 its trust and verdict (`exec` in the summary), and learn drafts from those
 paths. Audit layers and audit mode record `would refuse: exec` instead.
 
+**Pinning a binary's content.** An exact `exec.allow` entry may carry a
+`hash`, as `sha256sum` prints it. The path then runs only with that
+content; anything else at that path is refused, whatever `default` and
+`require_trusted_path` say. A path may be listed with up to four hashes (an
+upgrade, or one per architecture), and not also without one:
+
+```yaml
+    allow:
+      - path: /usr/local/bin/terraform
+        hash: sha256:0f3c…               # sha256sum /usr/local/bin/terraform
+      - path: /usr/local/bin/terraform
+        hash: sha256:9a41…               # the next version, during the upgrade
+```
+
+- The kernel hashes the file at exec with `bpf_ima_file_hash`, which needs
+  no IMA policy, and keeps the hash per inode. It reuses a hash only on
+  ext4, xfs, btrfs and tmpfs, only while the inode's change time and
+  version are as they were, and only for files last changed more than a
+  minute before they were hashed. Elsewhere (overlay, FUSE, NFS) every exec
+  of a pinned path is hashed: about 1.6 ms, 4 ms for a 10 MB binary.
+  Nothing is hashed for paths without a hash.
+- The timeline records each pinned path's hash (`hash` in `exec`), and
+  whether the cache answered (`hash_cached`). A refusal's note names the
+  content that ran. `learn` drafts the hashes recorded for paths a profile
+  already pinned; for others, add the hash yourself.
+- `check` decides a pinned path by its recorded hash. A run recorded before
+  the path was pinned has no hash, so check lists it as unverifiable.
+- A pin is updated by editing the profile: an upgraded binary is refused
+  until its hash is listed.
+- On a kernel without `bpf_ima_file_hash` or the TAI clock, the node agent
+  loads an exec hook that decides by path alone and logs `exec hashes
+  unavailable`. Enforcing profiles with hashes then fail to load, and in
+  audit the receipt says the hashes are not verified. `agentctl status`
+  shows which hook is in use.
+
 **Choosing `require_trusted_path`.** Turn it on for agents that run only
 installed tools: anything they download or write and then run is refused.
 Leave it off for coding agents that run what they build (`go test` runs
@@ -1036,7 +1072,6 @@ unknown behaviour: an allowed interpreter runs any code it is given (design
 **Not covered yet:**
 - a host daemon connecting on a run's behalf through a socket the profile
   allows: what the daemon does is outside the run;
-- hash matching (`exec.allow[].hash`);
 - per-cgroup attachment of the LSM programs (`lsm_cgroup`). The hooks are
   global and stand down outside runs.
 
@@ -1140,6 +1175,8 @@ agentctl events --json <run-id>
 | `holds N network sockets created outside the run` | Transparent enforce refuses runs whose first process inherited network sockets. Start `agentctl run` from a process without them. |
 | A transparent TLS connection is reset | The proxy refused it: check the timeline. A TCP destination the run did not look up through the node (a hard-coded address) needs a `cidr` rule. |
 | A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
+| A pinned binary fails with `Permission denied` after an upgrade (transparent) | Its content no longer matches the `hash` in `exec.allow`; the timeline's `exec_path` note names the content that ran. Add its `sha256sum` to the entry (up to four), then remove the old one. |
+| `exec hashes unavailable` in the node agent's log | The kernel lacks `bpf_ima_file_hash` (5.18) or the TAI clock (5.19), so exec is decided by path alone and enforcing profiles with hashes do not load. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS, `-udp-allow`, and what both the ceiling's and the profile's `udp.allow` name. Check `udp_refused` and the connect events in the timeline. |
 | `Name or service not known` in a run (transparent) | The resolver refused the name: no rule allows a connection to it. Check `dns_blocked` in the timeline, or `dig` for the EDE reason. |
 | DNS in runs fails entirely (transparent) | The node agent is down (DNS is refused with it), or the resolver cannot reach `-dns-upstream`: see `server` and `reason` on the timeline's dns events. |
@@ -1213,7 +1250,9 @@ ignore the proxy, it checks:
   a Unix socket in `unix.allow` reached, another one bound outside the run
   refused, the run's own and the run API reached; a root-owned binary in
   `/tmp` refused by the trusted-path test and one under an allowed
-  directory run;
+  directory run; a pinned script run with its content and refused with
+  other content, at a path hashed every exec (overlay) and at one the
+  kernel caches (tmpfs), including a change made after it was cached;
 - also where BPF LSM is active: a Docker socket, a live ssh-agent and
   systemd-resolved's varlink socket, all bound outside the run, refused;
 - tool calls attributed to their `call-<n>` cgroups;

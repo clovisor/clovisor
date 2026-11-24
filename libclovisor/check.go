@@ -266,20 +266,45 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 		type execSeen struct {
 			path    string
 			trusted bool
+			hash    string
 		}
 		var execs []execSeen
 		if len(tl.Summary.Exec) > 0 {
+			// A path recorded with and without a hash (before and after
+			// a profile pinned it) is decided by the hashed records.
+			hashed := map[string]bool{}
 			for _, e := range tl.Summary.Exec {
-				execs = append(execs, execSeen{e.Path, e.Trusted})
+				hashed[e.Path] = hashed[e.Path] || e.Hash != ""
+			}
+			seen := map[execSeen]bool{}
+			for _, e := range tl.Summary.Exec {
+				x := execSeen{e.Path, e.Trusted, e.Hash}
+				if (hashed[e.Path] && e.Hash == "") || seen[x] {
+					continue
+				}
+				seen[x] = true
+				execs = append(execs, x)
 			}
 		} else {
 			for _, b := range tl.Summary.Binaries {
-				execs = append(execs, execSeen{b, true})
+				execs = append(execs, execSeen{b, true, ""})
 			}
 		}
 		for _, x := range execs {
 			b := x.path
-			ed := cp.DecideExecTrusted(b, x.trusted)
+			ed := cp.DecideExecHash(b, x.trusted, x.hash)
+			if ed.NoHash {
+				// The pin decides by content, which this run did not
+				// record: it ran under a profile without the hash.
+				add("unverifiable", b+" (content not recorded)", CheckFinding{Decision: "hash",
+					Rule: "exec.allow", Message: "exec.allow lists hashes for this path; runs record a hash only where a profile already pinned it"},
+					tl.RunID, 1)
+				continue
+			}
+			what := b
+			if x.hash != "" {
+				what = b + " (" + x.hash + ")"
+			}
 			f := CheckFinding{Decision: policy.ActionAllow}
 			if !ed.Default {
 				f.Rule = "exec.allow"
@@ -289,6 +314,9 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 				f.Message = "not in exec.allow"
 				if ed.Untrusted {
 					f.Message = "not in exec.allow, and not on a trusted path (require_trusted_path)"
+				}
+				if ed.Mismatch {
+					f.Message = "content is not a hash exec.allow lists for this path"
 				}
 			}
 			kind := "exec-allow"
@@ -305,7 +333,7 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 			if n == 0 {
 				n = 1
 			}
-			add(kind, b, f, tl.RunID, n)
+			add(kind, what, f, tl.RunID, n)
 		}
 	}
 

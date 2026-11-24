@@ -64,6 +64,10 @@ type Options struct {
 	// QUIC: transparent enforce relays QUIC by server name (milestone
 	// 5.6, node -quic); otherwise UDP 443 is refused like other UDP.
 	QUIC bool
+	// ExecHash: the kernel's exec hook hashes files (milestone 5.7:
+	// bpf_ima_file_hash, Linux 5.18, and the TAI clock, 5.19), so
+	// exec.allow hashes are verified where exec is enforceable.
+	ExecHash bool
 }
 
 // Diagnostic is one compile error.
@@ -106,7 +110,8 @@ type compiledRule struct {
 type compiledExec struct {
 	Exec
 	allow    map[string]bool
-	prefixes []string // allow entries ending in /*, without the *
+	hashes   map[string][][32]byte // exact paths whose content must have one of these (milestone 5.7)
+	prefixes []string              // allow entries ending in /*, without the *
 }
 
 // MaxExecPrefixes matches MAX_EXEC_PREFIXES in agent_audit.c.
@@ -184,7 +189,6 @@ var methodRE = regexp.MustCompile(`^[A-Z]+$`)
 // rule that looks enforced but is not is worse than no rule (§7.1).
 var notYet = map[string]string{
 	"action redirect": "transparent mode (Phase 3)",
-	"exec hash":       "IMA hash verification (Phase 4)",
 }
 
 type compiler struct {
@@ -529,7 +533,7 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 		c.errf("exec", "exec rules cannot be enforced by this deployment: gating exec needs transparent mode with BPF LSM. "+
 			"Set exec.audit_only: true to keep them as audit-only, or remove the exec block")
 	}
-	ce := &compiledExec{Exec: *e, allow: map[string]bool{}}
+	ce := &compiledExec{Exec: *e, allow: map[string]bool{}, hashes: map[string][][32]byte{}}
 	tier, by := "1", "BPF LSM (bprm_check_security), by resolved path"
 	var notes []string
 	switch {
@@ -542,6 +546,11 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 		tier = "audit"
 		notes = append(notes, "audit_only: refusals recorded, not made")
 	}
+	hashable := c.opts.Linux && enforceable && c.opts.ExecHash
+	byHash := "BPF LSM (bprm_check_security), by resolved path and SHA-256 (bpf_ima_file_hash)"
+	if !hashable {
+		byHash = by
+	}
 	cp.Placements = append(cp.Placements, Placement{
 		Rule: "exec (default " + e.Default + ")", Tier: tier, EnforcedBy: by, Notes: notes,
 	})
@@ -551,6 +560,8 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 			Notes: append(append([]string{}, notes...), "execs not in exec.allow must come from root-owned paths no one else can write"),
 		})
 	}
+	plain := map[string]bool{} // exact paths listed without a hash
+	pinned := map[string]int{} // exact paths listed with one: their placement
 	for i, a := range e.Allow {
 		where := fmt.Sprintf("exec.allow[%d]", i)
 		dir, prefix := strings.CutSuffix(a.Path, "/*")
@@ -566,7 +577,63 @@ func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {
 			continue
 		}
 		if a.Hash != "" {
-			c.unsupported(where, "exec hash")
+			if prefix {
+				c.errf(where, "a hash pins one file: %q must be an exact path, not a directory", a.Path)
+				continue
+			}
+			sum, err := ParseExecHash(a.Hash)
+			if err != nil {
+				c.errf(where, "%v", err)
+				continue
+			}
+			if enforceable && !c.opts.ExecHash && !e.AuditOnly && (p.Spec.Mode == ModeEnforce || p.Spec.Mode == ModeAsk) {
+				c.errf(where, "this node's kernel cannot hash files at exec (bpf_ima_file_hash, Linux 5.18; the TAI clock, 5.19), "+
+					"so a hash cannot be verified. Set exec.audit_only: true, or remove the hash")
+				continue
+			}
+			if plain[a.Path] {
+				c.errf(where, "%s is also listed without a hash, which allows any content", a.Path)
+				continue
+			}
+			if len(ce.hashes[a.Path]) == MaxExecHashes {
+				c.errf(where, "at most %d hashes for %s", MaxExecHashes, a.Path)
+				continue
+			}
+			dup := false
+			for _, h := range ce.hashes[a.Path] {
+				dup = dup || h == sum
+			}
+			if !dup {
+				ce.hashes[a.Path] = append(ce.hashes[a.Path], sum)
+			}
+			if j, ok := pinned[a.Path]; ok {
+				cp.Placements[j].Notes[0] = fmt.Sprintf("content-verified: one of %d SHA-256s", len(ce.hashes[a.Path]))
+				continue
+			}
+			ce.allow[a.Path] = true
+			pl := Placement{Rule: "exec/" + path.Base(a.Path), Tier: tier, EnforcedBy: byHash,
+				Notes: append([]string{"content-verified: SHA-256"}, notes...)}
+			if hashable {
+				pl.Notes = append(pl.Notes, "other content at this path is refused, whatever the default; "+
+					"hashed at exec, and cached per inode on ext4, xfs, btrfs and tmpfs")
+			} else if enforceable {
+				pl.Notes = append(pl.Notes, "hash not verified: this kernel cannot hash files at exec")
+			} else {
+				pl.Notes = append(pl.Notes, "hash not verified: needs transparent mode with BPF LSM")
+			}
+			if a.Note != "" {
+				pl.Notes = append(pl.Notes, a.Note)
+			}
+			pinned[a.Path] = len(cp.Placements)
+			cp.Placements = append(cp.Placements, pl)
+			continue
+		}
+		if !prefix {
+			if _, ok := pinned[a.Path]; ok {
+				c.errf(where, "%s is also listed with a hash: without one, any content would pass", a.Path)
+				continue
+			}
+			plain[a.Path] = true
 		}
 		pl := Placement{Rule: "exec/" + path.Base(a.Path), Tier: tier, EnforcedBy: by, Notes: append([]string{"path only"}, notes...)}
 		if prefix {

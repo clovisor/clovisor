@@ -181,6 +181,11 @@ func (e *env) build() {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build quictest: %v\n%s", err, out)
 	}
+	// The script tp-hash pins (milestone 5.7), written early: the kernel
+	// caches a hash only once the file is a minute old.
+	if err := os.WriteFile(filepath.Join(bin, "pinned.sh"), []byte(pinnedScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, f := range []string{"mcp_client.py"} {
 		data, err := os.ReadFile(f)
 		if err != nil {

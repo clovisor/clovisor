@@ -55,6 +55,10 @@ type TransparentOptions struct {
 	// enforce, UDP 443 from a run goes there and is decided by the
 	// server name in its Initial. 0: QUIC is refused like other UDP.
 	QUICPort uint16
+	// ExecHash loads the exec program that hashes files (milestone 5.7),
+	// where ExecHashSupported says the kernel can; otherwise exec is
+	// decided by path alone.
+	ExecHash bool
 	// Exceptions are reached directly: the explicit proxy and the MCP
 	// gateway. An unspecified address matches any loopback address.
 	Exceptions []netip.AddrPort

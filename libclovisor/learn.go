@@ -96,6 +96,10 @@ type Draft struct {
 	// Resolved exec paths (milestone 4.4), where the kernel reported them.
 	resolved  bool
 	untrusted []string // ran from a path failing the trusted-path test
+	// Content hashes the kernel recorded, by path (milestone 5.7): only
+	// where a profile already pinned the path.
+	execHashes   map[string][]string
+	execUnpinned []string // pinned paths with more contents than exec.allow holds
 
 	// Models (milestone 5.3), by rule name.
 	ruleModels    map[string]*draftModel
@@ -135,6 +139,7 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 	looked := map[string]bool{}
 
 	untrusted := map[string]bool{}
+	hashes := map[string]map[string]bool{}
 	for _, tl := range runs {
 		// The kernel's resolved paths, where it reported them: what the
 		// exec hook compares (/bin/true runs /usr/bin/gnutrue on some
@@ -147,6 +152,12 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 				bins = append(bins, e.Path)
 				if !e.Trusted {
 					untrusted[e.Path] = true
+				}
+				if e.Hash != "" {
+					if hashes[e.Path] == nil {
+						hashes[e.Path] = map[string]bool{}
+					}
+					hashes[e.Path][e.Hash] = true
 				}
 			}
 		}
@@ -314,12 +325,27 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 		bins = append(bins, b)
 	}
 	sort.Strings(bins)
+	d.execHashes = map[string][]string{}
 	for _, b := range bins {
 		a := policy.ExecAllow{Path: b}
 		if isInterpreter(b) {
 			a.Note = "interpreter: allows arbitrary code; confinement comes from egress policy"
 		}
-		d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
+		sums := sortedSet(hashes[b])
+		if len(sums) > policy.MaxExecHashes {
+			d.execUnpinned = append(d.execUnpinned, b)
+			sums = nil
+		}
+		if len(sums) == 0 {
+			d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
+			continue
+		}
+		// Each content seen, one entry each: the draft pins what ran.
+		d.execHashes[b] = sums
+		for _, h := range sums {
+			a.Hash = h
+			d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
+		}
 	}
 	d.learnModels(runs)
 	d.learnMCP(runs)
@@ -614,6 +640,15 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			p("    #   %s", commentSafe(u))
 		}
 	}
+	if len(d.execUnpinned) > 0 {
+		p("    # These were pinned by hash, and ran with more contents than one path may")
+		p("    # list (%d), so the draft allows them by path alone:", policy.MaxExecHashes)
+		for _, u := range d.execUnpinned {
+			p("    #   %s", commentSafe(u))
+		}
+	}
+	p("    # To pin a binary's content, add hash: sha256:<sha256sum of the file> to its")
+	p("    # entry; other content at that path is then refused (where BPF LSM is active).")
 	if len(d.Profile.Spec.Exec.Allow) == 0 {
 		p("    allow: []")
 	} else {
@@ -625,6 +660,9 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 			line += "  # " + strings.TrimPrefix(rn, ", ")
 		}
 		p("%s", line)
+		if a.Hash != "" {
+			p("        hash: %s", q(a.Hash))
+		}
 		if a.Note != "" {
 			p("        note: %s", q(a.Note))
 		}

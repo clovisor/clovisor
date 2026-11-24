@@ -128,7 +128,6 @@ type bpfLSMObjects struct {
 	SocketSendmsg *ebpf.Program `ebpf:"on_lsm_socket_sendmsg"`
 	UnixStream    *ebpf.Program `ebpf:"on_lsm_unix_stream_connect"`
 	UnixSend      *ebpf.Program `ebpf:"on_lsm_unix_may_send"`
-	Exec          *ebpf.Program `ebpf:"on_lsm_exec"`
 	ExecPolicy    *ebpf.Map     `ebpf:"exec_policy"`
 	ExecAllow     *ebpf.Map     `ebpf:"exec_allow"`
 	ExecSeen      *ebpf.Map     `ebpf:"exec_seen"`
@@ -139,7 +138,7 @@ type bpfLSMObjects struct {
 
 func (o *bpfLSMObjects) Close() {
 	for _, c := range []interface{ Close() error }{o.SocketCreate, o.SocketConnect, o.SocketSendmsg,
-		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.Exec, o.ExecPolicy, o.ExecAllow, o.ExecSeen} {
+		o.UnixStream, o.UnixSend, o.UnixPolicy, o.UnixNode, o.UnixSeen, o.ExecPolicy, o.ExecAllow, o.ExecSeen} {
 		if c != nil && !reflect.ValueOf(c).IsNil() {
 			c.Close()
 		}
@@ -151,6 +150,24 @@ const (
 	maxExecLayers   = maxKernelExecLayers
 	maxExecPrefixes = 4
 	execPathBytes   = 256
+	maxExecHashes   = policy.MaxExecHashes
+)
+
+// bpfExecAllowed is exec_allow's value: an exact path, and the SHA-256s
+// its content may have (milestone 5.7).
+type bpfExecAllowed struct {
+	B     [execPathBytes]byte
+	NHash uint32
+	_     uint32
+	Sha   [maxExecHashes][32]byte
+}
+
+// exec_path_event flags (agent_audit.c).
+const (
+	execHashed   = 1
+	execCached   = 2
+	execMismatch = 4
+	execHashErr  = 8
 )
 
 type bpfExecPrefix struct {
@@ -187,7 +204,8 @@ type bpfExecPathEvent struct {
 	Len     uint32
 	Verdict uint32
 	Trusted uint32
-	_       uint32
+	Flags   uint32
+	Sha     [32]byte
 }
 
 // execHash is exec_hash in agent_audit.c: FNV-1a over the zero-padded
@@ -244,7 +262,22 @@ func (r *EBPFReader) SetExecPolicy(runCg uint64, layers []policy.ExecLayer) erro
 		for _, path := range l.Exact {
 			h, b := execHash(path)
 			k := bpfExecKey{Run: runCg, Layer: uint32(i), Hash: h}
-			if err := r.lsm.ExecAllow.Put(k, b); err != nil {
+			v := bpfExecAllowed{B: b}
+			sums := l.Hashes[path]
+			if !r.transparent.ExecHash {
+				// The path-only program cannot check them; only audit
+				// profiles with hashes compile here, and their receipts
+				// say the hashes are not verified.
+				sums = nil
+			}
+			if len(sums) > maxExecHashes {
+				return fmt.Errorf("exec allow %s: at most %d hashes", path, maxExecHashes)
+			}
+			for j, sum := range sums {
+				v.Sha[j] = sum
+			}
+			v.NHash = uint32(len(sums))
+			if err := r.lsm.ExecAllow.Put(k, v); err != nil {
 				return fmt.Errorf("exec allow %s: %w", path, err)
 			}
 			keys = append(keys, k)
@@ -581,7 +614,10 @@ type EBPFReader struct {
 	gateCg    string
 	gateLinks []link.Link
 
-	lsm      bpfLSMObjects
+	lsm bpfLSMObjects
+	// execProg is on_lsm_exec_hash or on_lsm_exec (see loadExec), apart
+	// from lsm because LoadAndAssign would try to fill it.
+	execProg *ebpf.Program
 	lsmState string // what the socket hooks do, for status
 	execMu   sync.Mutex
 	execKeys map[uint64][]bpfExecKey // exec_allow entries written, per run
@@ -839,8 +875,13 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			return AuditEvent{}, err
 		}
 		ev.Type = EventExecPath
-		ev.Data = ExecPathData{Path: string(e.Path[:min(int(e.Len), len(e.Path))]), Trusted: e.Trusted != 0,
-			Verdict: connectVerdicts[e.Verdict]}
+		d := ExecPathData{Path: string(e.Path[:min(int(e.Len), len(e.Path))]), Trusted: e.Trusted != 0,
+			Verdict: connectVerdicts[e.Verdict], HashCached: e.Flags&execCached != 0,
+			HashMismatch: e.Flags&execMismatch != 0, HashError: e.Flags&execHashErr != 0}
+		if e.Flags&execHashed != 0 {
+			d.Hash = policy.FormatExecHash(e.Sha)
+		}
+		ev.Data = d
 
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent
@@ -950,8 +991,26 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 		}
 		return fmt.Errorf("load BPF LSM programs: %w", err)
 	}
+	execMaps := map[string]*ebpf.Map{"exec_policy": r.lsm.ExecPolicy, "exec_allow": r.lsm.ExecAllow, "exec_seen": r.lsm.ExecSeen}
+	for k, v := range replace {
+		execMaps[k] = v
+	}
+	name := execPlainProg
+	if t.ExecHash {
+		name = execHashProg
+	}
+	exec, err := loadExec(spec, name, execMaps)
+	if err != nil {
+		return err
+	}
+	r.execProg = exec
+	if t.ExecHash {
+		log.Printf("bpf: exec hook hashes files for exec.allow entries with hashes")
+	} else {
+		log.Printf("bpf: exec hook decides by path alone: this kernel cannot hash files at exec")
+	}
 	pin := t.Mode == TransparentEnforce
-	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg, r.lsm.UnixStream, r.lsm.UnixSend, r.lsm.Exec} {
+	for i, p := range []*ebpf.Program{r.lsm.SocketCreate, r.lsm.SocketConnect, r.lsm.SocketSendmsg, r.lsm.UnixStream, r.lsm.UnixSend, r.execProg} {
 		name := lsmNames[i]
 		// A tracing link cannot take a new program in place, so attach
 		// the new one first, then let go of a pinned predecessor: for a
@@ -979,7 +1038,67 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 	}
 	r.lsmState = map[string]string{TransparentAudit: "audit: refusals recorded, not made",
 		TransparentEnforce: "enforce: unusual families, raw sockets, foreign sockets, Unix sockets outside unix.allow, and execs the profile refuses"}[t.Mode]
+	if t.ExecHash {
+		r.lsmState += "; exec hashes verified"
+	} else {
+		r.lsmState += "; exec hashes unavailable on this kernel"
+	}
 	return nil
+}
+
+// Exec programs (milestone 5.7): the sleepable one hashes files for
+// exec.allow entries with hashes; the other decides by path alone, for
+// kernels without bpf_ima_file_hash (5.18) or the TAI clock (5.19).
+const (
+	execHashProg  = "on_lsm_exec_hash"
+	execPlainProg = "on_lsm_exec"
+)
+
+// loadExec loads one exec program, sharing the maps in replace, and
+// only the maps it uses.
+func loadExec(spec *ebpf.CollectionSpec, name string, replace map[string]*ebpf.Map) (*ebpf.Program, error) {
+	var p *ebpf.Program
+	var err error
+	opts := &ebpf.CollectionOptions{MapReplacements: replace}
+	if name == execHashProg {
+		var o struct {
+			P *ebpf.Program `ebpf:"on_lsm_exec_hash"`
+		}
+		err = spec.LoadAndAssign(&o, opts)
+		p = o.P
+	} else {
+		var o struct {
+			P *ebpf.Program `ebpf:"on_lsm_exec"`
+		}
+		err = spec.LoadAndAssign(&o, opts)
+		p = o.P
+	}
+	if err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			return nil, fmt.Errorf("load %s: %+v", name, ve)
+		}
+		return nil, fmt.Errorf("load %s: %w", name, err)
+	}
+	return p, nil
+}
+
+// ExecHashSupported says whether this kernel loads the exec program that
+// hashes files (milestone 5.7), by loading it from the object at objPath.
+// It needs BPF LSM and privilege, as the node agent has.
+func ExecHashSupported(objPath string) bool {
+	spec, err := ebpf.LoadCollectionSpec(objPath)
+	if err != nil {
+		log.Printf("bpf: exec hashes unavailable: %v", err)
+		return false
+	}
+	p, err := loadExec(spec, execHashProg, nil)
+	if err != nil {
+		log.Printf("bpf: exec hashes unavailable: %v", err)
+		return false
+	}
+	p.Close()
+	return true
 }
 
 // LSMState says what the BPF LSM socket hooks do on this node.
@@ -1197,5 +1316,8 @@ func (r *EBPFReader) Close() {
 		}
 		r.objs.Close()
 		r.lsm.Close()
+		if r.execProg != nil {
+			r.execProg.Close()
+		}
 	})
 }

@@ -50,3 +50,6 @@ func (r *EBPFReader) ForgetRunBytes(uint64)                          {}
 
 // BPFLSMActive is false off Linux.
 func BPFLSMActive() bool { return false }
+
+// ExecHashSupported needs Linux.
+func ExecHashSupported(string) bool { return false }

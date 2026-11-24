@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -79,6 +80,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("unix-sockets", e.testUnixSockets)
 	t.Run("host-daemons", e.testHostDaemons)
 	t.Run("exec", e.testExec)
+	t.Run("exec-hash", e.testExecHash)
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
@@ -455,6 +457,59 @@ func (e *env) testExec(t *testing.T) {
 	expect(t, out, "system: ran", "tmp: refused", "allowed dir: ran")
 	tl := e.timeline(id)
 	expect(t, tl, `"path": "/tmp/t"`, `"verdict": "refused: exec"`, `"trusted": false`)
+}
+
+// pinnedScript is the content tp-hash pins by its SHA-256.
+const pinnedScript = "#!/bin/sh\necho pinned ran\n"
+
+func (e *env) testExecHash(t *testing.T) {
+	// tp-hash pins pinned.sh's content at two paths (milestone 5.7): in the
+	// container's /tmp (overlay, so hashed at every exec) and in the bin
+	// directory, a bind mount of the host's tmpfs, where the kernel caches
+	// the hash once the file has been unchanged for a minute.
+	e.needLSM(t)
+	host := filepath.Join(e.dir, "bin", "pinned.sh")
+	var st syscall.Stat_t
+	if err := syscall.Stat(host, &st); err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(time.Unix(st.Ctim.Unix()).Add(62 * time.Second)); wait > 0 {
+		t.Logf("waiting %v for pinned.sh to be cacheable", wait.Round(time.Second))
+		time.Sleep(wait)
+	}
+	s := e.script("hash", `mkdir -p /tmp/h
+cp /it/bin/pinned.sh /tmp/h/pinned.sh
+/tmp/h/pinned.sh && echo "tmp pinned: ran"
+printf "#!/bin/sh\necho changed ran\n" > /tmp/h/pinned.sh
+/tmp/h/pinned.sh || echo "tmp changed: refused"
+cp /tmp/h/pinned.sh /tmp/h/copy.sh && /tmp/h/copy.sh && echo "copy: ran"
+cp /it/bin/pinned.sh /tmp/h/pinned.sh && /tmp/h/pinned.sh && echo "tmp restored: ran"
+/it/bin/pinned.sh && /it/bin/pinned.sh && echo "bin pinned: ran twice"
+`)
+	out, id := e.agentRun("tp-hash", s)
+	expect(t, out, "tmp pinned: ran", "tmp changed: refused", "changed ran", "copy: ran", "tmp restored: ran", "bin pinned: ran twice")
+	if strings.Contains(out, "changed ran\ntmp changed") {
+		t.Errorf("changed content ran at the pinned path:\n%s", out)
+	}
+	tl := e.timeline(id)
+	sum := `"hash": "sha256:d4ed4315da74e2cdbbefa11fec9fbcf04cc2e781b1f51cc2f3ad2230c29e24b1"`
+	expect(t, tl, sum, `"hash_cached": true`, `"hash_mismatch": true`, "is not a hash exec.allow lists for this path")
+
+	// Changed on the host after the kernel cached it: refused at once,
+	// since the write changes the inode's change time.
+	if err := os.WriteFile(host, []byte("#!/bin/sh\necho evil ran\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = e.agentRun("tp-hash", `/it/bin/pinned.sh || echo "bin changed: refused"`)
+	expect(t, out, "bin changed: refused")
+	if strings.Contains(out, "evil ran") {
+		t.Errorf("a stale cached hash let changed content run:\n%s", out)
+	}
+	if err := os.WriteFile(host, []byte(pinnedScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = e.agentRun("tp-hash", `/it/bin/pinned.sh && echo "bin restored: ran"`)
+	expect(t, out, "bin restored: ran")
 }
 
 func (e *env) testToolCalls(t *testing.T) {

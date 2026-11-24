@@ -103,6 +103,7 @@ place:
 | Budgets: a rule's `budget` of tokens and dollars, charged from the usage in each response, streamed or not, at prices from a node `ModelPrices` document; `include_usage` set on OpenAI streams and its chunk removed again; refused once spent, and for unpriced models under a cost budget; nested runs charge their parents; spend persisted and reported. | [5.4 status](#54-status-2026-11-24) |
 | Ask: `action: ask`, `mode: ask` and `sampling: ask` hold a request in the node agent's queue until a person decides over the run API, or its timeout; decisions refused from inside a run, and needing root with credential identity; remembered decisions; held requests capped; open question 3 answered for host deployments. | [5.5 status](#55-status-2026-11-24) |
 | QUIC by name (opt-in, `-quic`): UDP 443 from runs sent by the connect hooks to a relay in the node agent, which reads the server name from the Initial packets and decides it as a CONNECT; refused, with a narrated `CONNECTION_REFUSED`, for hosts needing termination or a person, ECH and unnamed connections. | [5.6 status](#56-status-2026-11-24) |
+| Exec hashes: `exec.allow[].hash` pins a path's content, checked by `bpf_ima_file_hash` in a sleepable exec hook and cached per inode while its validators hold; other content refused whatever the default; a path-only hook loaded where the kernel cannot hash, and enforcing profiles with hashes refused there. Found: exact `exec.allow` paths had never matched in the kernel (fixed). | [5.7 status](#57-status-2026-11-24) |
 
 ---
 
@@ -1255,7 +1256,9 @@ latter applies in full to whatever the interpreter then decides to do.
 
 Path matching plus a read-only-origin requirement as the default, with hash
 verification as an opt-in high-assurance mode — the `exec` block in
-[§7.3](#73-surface-syntax). Per [§7.1](#71-organizing-principle) the receipt
+[§7.3](#73-surface-syntax). Path matching and the trusted-path test shipped
+in 4.4; hashes in 5.7, through `bpf_ima_file_hash` with a kernel-side cache
+([5.7 status](#57-status-2026-11-24)). Per [§7.1](#71-organizing-principle) the receipt
 must distinguish the three cases so the weaker rules are visible rather than
 implied; see the `exec/*` lines in
 [§7.4](#74-compilation-and-the-enforcement-receipt).
@@ -3936,6 +3939,129 @@ Verified:
 
   The UDP checks now use port 4443 for refused UDP, since 443 goes to the
   relay.
+
+#### 5.7 status (2026-11-24)
+
+Implemented, where BPF LSM is active, under transparent audit and enforce:
+
+- **`exec.allow[].hash`**: `sha256:` and 64 hex digits, as `sha256sum`
+  prints them, on an exact path (not a `dir/*`). Up to four per path,
+  each its own entry; a path may not be listed both with and without one.
+  The hash is the opt-in: profiles without one behave as in 4.4.
+- **The decision.** For a path some layer pins, the kernel hashes the file
+  with `bpf_ima_file_hash` (SHA-256, no IMA policy needed), and that
+  layer passes the exec only if the content is one it lists. Other
+  content is refused whatever the layer's default and trusted-path test
+  say, since passing it would make the pin meaningless. Paths that no
+  layer pins are not hashed.
+- **The cache** (5.0 finding): a hash per (device, inode), reused while the
+  inode's generation, `i_version` and change time are unchanged. These are
+  read with the kernel's "queried" flags masked off, so a `stat` does not
+  count as a change. A hash is reused only:
+  - on ext4, xfs, btrfs and tmpfs with `SB_I_VERSION`;
+  - with no writer open on the file (exec already holds writers off while
+    it hashes);
+  - for a file whose change time was at least 60 seconds old, by the TAI
+    clock, when it was hashed. Otherwise a write in the same clock tick
+    could leave the change time as cached.
+
+  Overlay, FUSE and network filesystems are hashed at every exec.
+- **Two exec programs from one source.** Hashing needs a sleepable hook,
+  `bpf_ima_file_hash` (Linux 5.18) and the TAI clock (5.19).
+  - The node agent loads the sleepable `on_lsm_exec_hash` once at start, as
+    a probe. If it loads, the node agent uses it; otherwise it uses
+    `on_lsm_exec`, which decides by path alone.
+  - Compile learns the result (`Options.ExecHash`). Without it, an
+    enforcing profile with a hash is an error, and an audit profile's
+    receipt says the hash is not verified.
+  - `agentctl status` says which program is in use.
+- **Scratch per task.** The hook's scratch (path, hash, flags) is in task
+  storage, not per-CPU, because another exec on the same CPU could
+  overwrite per-CPU scratch while the hook sleeps.
+- **Records.**
+  - The exec event carries the hash, and whether it came from the cache,
+    did not match, or could not be computed.
+  - A path is reported once per run, verdict and content, and once more
+    the first time the cache answers.
+  - The summary's `exec` entries gain `hash`, `hash_cached`,
+    `hash_mismatch` and `hash_error`. A refusal's note names the content.
+  - `check` decides pinned paths by the recorded hash. A record without one
+    (from before the pin) is unverifiable.
+  - `learn` drafts the hashes recorded for paths a profile already pinned,
+    one entry each, falling back to the path alone past four.
+  - The receipt marks pinned entries "content-verified".
+
+Found on the way:
+
+- **Exact `exec.allow` paths never matched in the kernel (a 4.4 bug).**
+  `bpf_d_path` builds the path at the end of its buffer and moves it to
+  the front, so the bytes after the NUL repeat the end of the path. Exact
+  entries were hashed and compared over all 256 bytes, so they never
+  matched what the node agent wrote. A listed path then fell through to
+  the trusted-path test and the default. Prefixes compare under a mask,
+  which is why the 4.4 tests, which used only prefixes, passed. The hook
+  now zeroes the buffer past the path. The pinned paths in the new test
+  are exact entries, so it covers this.
+- **The verifier's limit, not the hashing, set the shape.** Inline, the
+  hashing hook exceeded a million instructions: each outcome of the hash
+  (cached, computed, failed) and each byte compare left a different
+  state, and the verifier walked the six layers once for each. Three
+  changes brought both programs to about 26,000 instructions, against
+  88,000 for the 4.4 hook:
+  - keeping the hash's outcome in task storage;
+  - deciding one layer in a global function, which the kernel verifies
+    once;
+  - comparing hashes as words with arithmetic, and a compiler barrier so
+    clang does not turn them back into branches.
+- **cilium/ebpf fills untagged struct pointers.** An exec program kept in
+  the LSM objects struct without a tag made `LoadAndAssign` fail, so it
+  lives beside it.
+
+Decisions:
+
+- **A pin refuses other content outright** rather than falling through to
+  the default. Under `default: allow`, falling through would let any
+  content at the pinned path run.
+- **Hashes are cached only for files settled for a minute.** A freshly
+  built binary is hashed at every exec for its first minute (1.6 ms on
+  average, 4 ms at 10 MB, per 5.0). In exchange, no write can hide behind
+  an unchanged change time.
+- **Fall back rather than fail.** A kernel too old to hash still gets
+  exec gating by path. Profiles that depend on hashes are refused there,
+  not weakened.
+
+Limits:
+
+- A pin follows content, so an upgrade is refused until its hash is
+  listed: the operational cost §7.6 names. Signature verification is not
+  implemented.
+- Writes that bypass the inode (to the block device under a mounted
+  filesystem) are not seen by the cache. They need root outside the run.
+- Exec gating still sees binaries, not behaviour: a pinned interpreter
+  runs whatever code it is given (§7.6).
+
+Verified:
+
+- Unit tests:
+  - compiling hashes: case, several per path, duplicates, and the errors
+    for a directory, a bad hash, a path also listed bare, more than four,
+    and an enforcing profile on a kernel that cannot hash;
+  - the decision with matching, other and unknown content;
+  - timeline notes, check's unverifiable records, and learn's drafts
+    checking clean against their runs.
+- Both exec programs loaded on kernel 7.0: about 26,000 instructions each.
+- A privileged harness on the host, not kept: exact entries matched after
+  the fix and not before; a pinned script hashed to `sha256sum`'s value;
+  a second exec of an unchanged system binary was answered by the cache.
+- `make integration-transparent`, now twenty-five checks. Under `tp-hash`,
+  which pins a script at two paths:
+  - in the container's `/tmp` (overlay, hashed at every exec), it ran with
+    its content, was refused after a rewrite and ran again once restored,
+    while a copy elsewhere ran by the default;
+  - in the test's bin directory (the host's tmpfs), it ran twice, the
+    second time from the cache;
+  - rewritten on the host after it was cached, it was refused at once;
+    restored, it ran.
 
 #### Proposed decisions
 

@@ -252,6 +252,12 @@ type ExecDecision struct {
 	Allowed   bool
 	Default   bool // no allow entry matched
 	Untrusted bool // refused by require_trusted_path
+	// Pinned: an exec.allow entry with hashes names the path, so its
+	// content decides (milestone 5.7). Mismatch: the content is none of
+	// them; NoHash: the content is not known, so nothing is decided.
+	Pinned   bool
+	Mismatch bool
+	NoHash   bool
 }
 
 // DecideExec evaluates an exec of an absolute path. Without an exec
@@ -265,8 +271,27 @@ func (cp *CompiledProfile) DecideExec(path string) ExecDecision {
 // passes; else an untrusted file fails under require_trusted_path; else
 // the default.
 func (cp *CompiledProfile) DecideExecTrusted(path string, trusted bool) ExecDecision {
+	return cp.DecideExecHash(path, trusted, "")
+}
+
+// DecideExecHash is DecideExecTrusted for a file whose content hashed to
+// sum (sha256:<hex>, or "" if not known), as the kernel decides with
+// hashes (milestone 5.7): an entry with hashes passes only the content it
+// lists, and refuses any other, whatever the default.
+func (cp *CompiledProfile) DecideExecHash(path string, trusted bool, sum string) ExecDecision {
 	if cp.exec == nil {
 		return ExecDecision{Allowed: true, Default: true}
+	}
+	if sums, ok := cp.exec.hashes[path]; ok {
+		if sum == "" {
+			return ExecDecision{Pinned: true, NoHash: true}
+		}
+		for _, h := range sums {
+			if FormatExecHash(h) == sum {
+				return ExecDecision{Allowed: true, Pinned: true}
+			}
+		}
+		return ExecDecision{Pinned: true, Mismatch: true}
 	}
 	if cp.exec.allow[path] {
 		return ExecDecision{Allowed: true}
@@ -289,6 +314,9 @@ type ExecLayer struct {
 	Enforce        bool // an enforcing layer refuses; others record
 	Exact          []string
 	Prefixes       []string // each ends in /
+	// Hashes are the SHA-256s an exact path's content may have, for the
+	// paths in Exact that list any (milestone 5.7).
+	Hashes map[string][][32]byte
 }
 
 // ExecLayer returns the profile's exec policy for the kernel, or false
@@ -301,6 +329,9 @@ func (cp *CompiledProfile) ExecLayer() (ExecLayer, bool) {
 		Enforce: cp.Enforcing() && !cp.exec.AuditOnly, Prefixes: cp.exec.prefixes}
 	for p := range cp.exec.allow {
 		l.Exact = append(l.Exact, p)
+	}
+	if len(cp.exec.hashes) > 0 {
+		l.Hashes = cp.exec.hashes
 	}
 	sort.Strings(l.Exact)
 	return l, true

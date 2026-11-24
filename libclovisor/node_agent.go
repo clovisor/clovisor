@@ -47,6 +47,7 @@ type NodeAgent struct {
 	deployment policy.DeploymentMode
 	lsm        bool
 	quic       bool
+	execHash   bool // the kernel's exec hook hashes files (milestone 5.7)
 	relay      *QUICRelay
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
@@ -197,7 +198,11 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	// Load policy before touching the kernel or the socket: a policy that
 	// does not load is fatal, and failing here leaves nothing behind.
 	quic := t.QUICPort != 0
-	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsmFor(*t, credential), quic)
+	lsm := lsmFor(*t, credential)
+	// Whether exec.allow hashes can be verified decides how profiles
+	// compile, so it is probed before they load.
+	t.ExecHash = lsm && ExecHashSupported(opts.BPFObjPath)
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsm, quic, t.ExecHash)
 	if err != nil {
 		return nil, err
 	}
@@ -400,8 +405,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		httpEvents: httpEvents,
 		policyDir:  opts.PolicyDir,
 		deployment: t.DeploymentMode(),
-		lsm:        lsmFor(*t, credential),
+		lsm:        lsm,
 		quic:       quic,
+		execHash:   t.ExecHash,
 		relay:      relay,
 		stopChan:   make(chan bool),
 		running:    false,
@@ -509,7 +515,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic, na.execHash)
 	if err != nil {
 		return err
 	}
@@ -639,12 +645,12 @@ func lsmFor(t TransparentOptions, credential bool) bool {
 	return !credential && t.Mode != TransparentOff && BPFLSMActive()
 }
 
-func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic bool) (*policy.Set, error) {
+func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic, execHash bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic}, os.Geteuid() == 0)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic, ExecHash: execHash}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -860,7 +866,20 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			ts, event.RunCgroupID, event.CgroupID, d.Server, d.Query, d.QType, d.RCode, d.Addrs(), extra)
 	case EventExecPath:
 		d := event.Data.(ExecPathData)
-		fmt.Printf("%s [EXEC PATH] run=%d pid=%d %s trusted=%v verdict=%q\n", ts, event.RunCgroupID, event.PID, d.Path, d.Trusted, d.Verdict)
+		extra := ""
+		if d.Hash != "" {
+			extra = " " + d.Hash
+			if d.HashCached {
+				extra += " (cached)"
+			}
+		}
+		if d.HashMismatch {
+			extra += " hash-mismatch"
+		}
+		if d.HashError {
+			extra += " hash-error"
+		}
+		fmt.Printf("%s [EXEC PATH] run=%d pid=%d %s trusted=%v verdict=%q%s\n", ts, event.RunCgroupID, event.PID, d.Path, d.Trusted, d.Verdict, extra)
 	case EventUnix:
 		d := event.Data.(UnixData)
 		kind := "stream"

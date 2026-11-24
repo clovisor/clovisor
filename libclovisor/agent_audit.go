@@ -33,11 +33,18 @@ const (
 
 // ExecPathData is what the exec hook saw: the resolved path the kernel ran,
 // whether it passed the trusted-path test, and the verdict. Reported once
-// per run, path and verdict.
+// per run, path, verdict and content.
 type ExecPathData struct {
 	Path    string
 	Trusted bool
 	Verdict string
+	// Hash is the file's sha256:<hex>, where an exec.allow entry with
+	// hashes named the path (milestone 5.7); HashCached if the kernel's
+	// cache answered.
+	Hash         string
+	HashCached   bool
+	HashMismatch bool // the content was none of the entry's hashes
+	HashError    bool // the file could not be hashed
 }
 
 // UnixData reports a run's first connect or send to a Unix socket bound
