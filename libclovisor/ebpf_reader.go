@@ -1174,6 +1174,15 @@ func (r *EBPFReader) SetTLSCapture(runCg uint64, on bool) error {
 	return r.tls.setRun(runCg, on)
 }
 
+// TLSAttachRunning probes the processes already in a capturing run's
+// cgroups (a restored run, milestone 6.6), and returns how many.
+func (r *EBPFReader) TLSAttachRunning(cgroupPath string, runCg uint64) int {
+	if r.tls == nil {
+		return 0
+	}
+	return r.tls.attachRunning(cgroupPath, runCg)
+}
+
 // TLSLibraries lists the TLS libraries probed, or nil without -uprobes.
 func (r *EBPFReader) TLSLibraries() []string {
 	if r.tls == nil {

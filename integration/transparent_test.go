@@ -82,6 +82,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("exec", e.testExec)
 	t.Run("exec-hash", e.testExecHash)
 	t.Run("tls-plaintext", e.testTLSPlaintext)
+	t.Run("tunnel-identity", e.testTunnelIdentity)
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
@@ -523,8 +524,9 @@ cp /it/bin/pinned.sh /tmp/h/pinned.sh && /tmp/h/pinned.sh && echo "tmp restored:
 
 func (e *env) testTLSPlaintext(t *testing.T) {
 	// Milestone 6.2: under tp-observe, requests from curl (OpenSSL), Python
-	// (OpenSSL, loaded at import) and git (GnuTLS, through libcurl-gnutls)
-	// are read from their TLS plaintext. Each process is held at exec
+	// (OpenSSL, loaded at import), git (GnuTLS, through libcurl-gnutls) and
+	// Debian's Node (the system OpenSSL; 6.6) are read from their TLS
+	// plaintext. Each process is held at exec
 	// until its probes are attached, so even curl, which is done in
 	// milliseconds, is seen. A run under tp, which does not ask, is not.
 	status, _, _ := e.sh("/it/bin/agentctl status")
@@ -532,19 +534,21 @@ func (e *env) testTLSPlaintext(t *testing.T) {
 	s := e.script("tlscap", `for i in 1 2 3; do curl -s -o /dev/null -w "curl$i %{http_code}\n" "https://origin.test/allowed?try=$i"; done
 python3 -c 'import urllib.request; print("python", urllib.request.urlopen("https://origin.test/headers").status)'
 git ls-remote https://origin.test/repo.git >/dev/null 2>&1; echo "git done"
+node -e 'require("https").get("https://origin.test/node?try=1", r => { console.log("node", r.statusCode); r.resume() })'
 `)
 	out, id := e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
-	expect(t, out, "curl1 200", "curl2 200", "curl3 200", "python 200", "git done")
+	expect(t, out, "curl1 200", "curl2 200", "curl3 200", "python 200", "git done", "node 200")
 	tl := e.timeline(id) // once the run's end is recorded
 	shown, _, err := e.sh("/it/bin/agentctl events " + id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expect(t, shown, "Seen in TLS plaintext (3)")
+	expect(t, shown, "Seen in TLS plaintext (4)")
 	sec := shown[strings.Index(shown, "Seen in TLS plaintext"):]
 	sec = sec[:strings.Index(sec, "Via proxy")]
 	if !regexp.MustCompile(`GET origin.test/allowed +x3 +200 x3 \(libssl, HTTP/2\)`).MatchString(sec) ||
-		!strings.Contains(sec, "GET origin.test/headers") || !regexp.MustCompile(`repo.git/info/refs .*\(gnutls, `).MatchString(sec) {
+		!strings.Contains(sec, "GET origin.test/headers") || !regexp.MustCompile(`repo.git/info/refs .*\(gnutls, `).MatchString(sec) ||
+		!regexp.MustCompile(`GET origin.test/node +x1 +200 x1 \(libssl, HTTP/1.1\)`).MatchString(sec) {
 		t.Errorf("TLS plaintext section:\n%s", sec)
 	}
 	if strings.Contains(sec, "try=") {
@@ -651,6 +655,60 @@ fetch("https://origin.test/allowed?try=node").then(r => console.log("node", r.st
 	if !regexp.MustCompile(`/it/bin/node-official +x1 +OpenSSL \d+\.\d+\.\d+\w*, bundled probed`).MatchString(shown) ||
 		!regexp.MustCompile(`GET origin.test/allowed +x1 +200 x1 \(OpenSSL \d+\.\d+\.\d+\w*, HTTP/1.1\)`).MatchString(shown) {
 		t.Errorf("official Node:\n%s", shown)
+	}
+}
+
+func (e *env) testTunnelIdentity(t *testing.T) {
+	// Milestone 6.6: a client's identity crosses the hop to the
+	// terminating listener on its tunnel's connection. Envoy pools those
+	// connections by what is hashed of their options, which the identity
+	// was not: while run A held a tunnel to a terminated host open, run
+	// B's tunnels came from A's pool and its requests were taken as A's,
+	// decided under A's policy. (The 6.1 restart check failed so,
+	// intermittently: "not a run", run A having ended.)
+	if _, errOut, err := e.sh("rm -f /tmp/ti-*"); err != nil {
+		t.Fatal(errOut)
+	}
+	hold := e.py("tihold", `import http.client, os, time
+c = http.client.HTTPSConnection("origin.test")
+c.request("GET", "/allowed")
+print("A", c.getresponse().read().decode().strip(), flush=True)
+open("/tmp/ti-ready", "w").close()
+while not os.path.exists("/tmp/ti-done"):
+    time.sleep(0.05)
+c.close()
+`)
+	noProxy := "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp -- sh -c '"+noProxy+hold+"' > /tmp/ti-a.out 2>&1")
+	if _, _, err := e.sh("for i in $(seq 100); do [ -f /tmp/ti-ready ] && exit 0; sleep 0.1; done; exit 1"); err != nil {
+		a, _, _ := e.sh("cat /tmp/ti-a.out")
+		t.Fatalf("run A did not hold its tunnel open:\n%s", a)
+	}
+	// B's profile allows any path on origin.test; A's, tp, does not allow
+	// /from-b: decided as A's, B's requests would be refused.
+	out, idB := e.agentRun("tp-observe", noProxy+`for i in 1 2 3 4 5 6 7 8; do echo "B$i $(curl -s -m 5 -o /dev/null -w "%{http_code}" https://origin.test/from-b)"; done`)
+	e.sh("touch /tmp/ti-done")
+	a := ""
+	for i := 0; i < 50 && !strings.Contains(a, "agentctl: run "); i++ {
+		a, _, _ = e.sh("cat /tmp/ti-a.out")
+		time.Sleep(100 * time.Millisecond)
+	}
+	m := runIDRE.FindStringSubmatch(a)
+	if m == nil {
+		t.Fatalf("run A: %s", a)
+	}
+	for i := 1; i <= 8; i++ {
+		if !strings.Contains(out, fmt.Sprintf("B%d 200", i)) {
+			t.Errorf("run B's requests:\n%s", out)
+			break
+		}
+	}
+	if tlB := e.timeline(idB); strings.Count(tlB, `"/from-b"`) == 0 {
+		t.Errorf("run B's timeline lacks its requests")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if tlA, _, _ := e.sh("cat /var/lib/clovisor/runs/run-" + m[1] + ".json"); strings.Contains(tlA, "/from-b") {
+		t.Errorf("run B's requests were recorded, and decided, as run A's")
 	}
 }
 
@@ -793,11 +851,23 @@ done
 	revoked := e.script("revoked", `while [ ! -f /tmp/go1 ]; do sleep 0.1; done
 echo "B after $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/allowed)"
 `)
+	// Run C (milestone 6.6) captures TLS plaintext: one Python process
+	// makes a request before the restart and another after. Its probes go
+	// with the old node agent; the new one attaches them again.
+	capture := e.py("restartcap", `import os, time, urllib.request
+def get(p):
+    print("C", p, urllib.request.urlopen("https://origin.test/" + p).status, flush=True)
+get("c0")
+while not os.path.exists("/tmp/go1"):
+    time.sleep(0.1)
+get("c1")
+`)
 	noProxy := "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "
 	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp -- sh -c '"+noProxy+probe+"' > /tmp/ra.out 2>&1; echo exit=$? >> /tmp/ra.out")
 	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp -- sh -c '"+noProxy+revoked+"' > /tmp/rb.out 2>&1")
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile tp-observe -- sh -c '"+noProxy+capture+"' > /tmp/rc.out 2>&1")
 	ids := map[string]string{}
-	for _, f := range []string{"ra", "rb"} {
+	for _, f := range []string{"ra", "rb", "rc"} {
 		for i := 0; i < 50 && ids[f] == ""; i++ {
 			out, _, _ := e.sh("cat /tmp/" + f + ".out")
 			if m := runIDRE.FindStringSubmatch(out); m != nil {
@@ -806,13 +876,14 @@ echo "B after $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	if ids["ra"] == "" || ids["rb"] == "" {
+	if ids["ra"] == "" || ids["rb"] == "" || ids["rc"] == "" {
 		t.Fatalf("runs did not start: %v", ids)
 	}
 	if out, errOut, err := e.sh("/it/bin/agentctl revoke " + ids["rb"]); err != nil {
 		t.Fatalf("revoke: %v %s%s", err, out, errOut)
 	}
 	e.sh("touch /tmp/go0; while [ ! -f /tmp/done0 ]; do sleep 0.1; done")
+	e.sh("for i in $(seq 100); do grep -q 'C c0' /tmp/rc.out && break; sleep 0.1; done")
 
 	if err := e.stopNodeAgent(); err != nil {
 		t.Fatal(err)
@@ -826,7 +897,7 @@ echo "B after $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/
 		t.Fatalf("not healthy after restart: %v\n%s%s", err, out, errOut)
 	}
 	status, _, _ := e.sh("/it/bin/agentctl status")
-	expect(t, status, "Restored      2 runs restored at start")
+	expect(t, status, "Restored      3 runs restored at start")
 
 	e.sh("touch /tmp/go1; while [ ! -f /tmp/done1 ]; do sleep 0.1; done")
 	var a string
@@ -852,6 +923,23 @@ echo "B after $(curl -s -m 5 -o /dev/null -w '%{http_code}' https://origin.test/
 	expect(t, tl, `"restored": [`, `"exit_code": 0`)
 	shown, _, _ := e.sh("/it/bin/agentctl events " + ids["ra"])
 	expect(t, shown, "Restored  ", "the node agent restarted, and gave the run its grants back")
+
+	var c string
+	for i := 0; i < 100 && !strings.Contains(c, "C c1"); i++ {
+		c, _, _ = e.sh("cat /tmp/rc.out")
+		time.Sleep(100 * time.Millisecond)
+	}
+	expect(t, c, "C c0 200", "C c1 200")
+	e.timeline(ids["rc"])
+	shown, _, _ = e.sh("/it/bin/agentctl events " + ids["rc"])
+	if !regexp.MustCompile(`GET origin.test/c0 +x1 +200 x1 \(libssl`).MatchString(shown) ||
+		!regexp.MustCompile(`GET origin.test/c1 +x1 +200 x1 \(libssl`).MatchString(shown) {
+		t.Errorf("TLS plaintext across the restart:\n%s", shown)
+	}
+	log, _, _ := e.sh("cat /var/log/node-agent.log")
+	if !regexp.MustCompile(`restored run ` + ids["rc"] + `: TLS probes attached to [1-9]\d* running processes`).MatchString(log) {
+		t.Errorf("no probes attached to the capturing run's processes at restore")
+	}
 }
 
 func (e *env) testFailClosed(t *testing.T) {

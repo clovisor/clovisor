@@ -527,7 +527,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	if err != nil || host == "" {
 		d.Host, d.Decision, d.Reason = authority, policy.ActionDeny, "bad authority"
 		d.Message = "The proxy could not parse the destination " + strconv.Quote(authority) + "."
-		return s.deny(d, ""), headerOutcome{}
+		return s.denyUnrecorded(d, ""), headerOutcome{}
 	}
 	d.Host, d.Port = host, port
 	ip, _ := netip.ParseAddr(host)
@@ -569,7 +569,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "host mismatch"
 			d.Message = fmt.Sprintf("The request's Host %s does not match the tunnel's destination %s.",
 				net.JoinHostPort(host, strconv.Itoa(int(port))), headerValue(hm, hdrConnect))
-			return s.deny(d, ""), headerOutcome{}
+			return s.denyUnrecorded(d, "tunnel "+headerValue(hm, hdrConnect)), headerOutcome{}
 		}
 	} else {
 		src, err1 = attrAddrPort(req, "source.address", "source.port")
@@ -605,7 +605,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	case err != nil:
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "unidentified client"
 		d.Message = "The proxy could not identify which run this connection belongs to."
-		return s.deny(d, ""), headerOutcome{}
+		return s.denyUnrecorded(d, fmt.Sprintf("client %v, proxy %v, inner %v: %v", src, dst, inner, err)), headerOutcome{}
 	case !isRun && !s.NonRunAllowed:
 		d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "not a run"
 		d.Message = "This proxy serves governed agent runs only; start the command with agentctl run."
@@ -619,7 +619,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 				return proxyAuthRequired(s.deny(d, "")), headerOutcome{}
 			}
 		}
-		return s.deny(d, ""), headerOutcome{}
+		return s.denyUnrecorded(d, fmt.Sprintf("client %v, cgroup %d", src, cg)), headerOutcome{}
 	}
 
 	reason := s.guard(ctx, host, ip)
@@ -823,6 +823,17 @@ func proxyAuthRequired(r *extprocv3.ProcessingResponse) *extprocv3.ProcessingRes
 	ir.Headers.SetHeaders = append(ir.Headers.SetHeaders, &corev3.HeaderValueOption{
 		Header: &corev3.HeaderValue{Key: "proxy-authenticate", RawValue: []byte(`Basic realm="clovisor run"`)}})
 	return r
+}
+
+// denyUnrecorded refuses a request no run's timeline will record (it
+// could not be tied to a run, or not parsed), logging why: otherwise the
+// client's 403 would be the only trace.
+func (s *ExtProcServer) denyUnrecorded(d HTTPData, detail string) *extprocv3.ProcessingResponse {
+	if detail != "" {
+		detail = " (" + detail + ")"
+	}
+	log.Printf("ext_proc: refused %s %s:%d%s, recorded in no run: %s%s", d.Method, d.Host, d.Port, d.Path, d.Reason, detail)
+	return s.deny(d, "")
 }
 
 func (s *ExtProcServer) deny(d HTTPData, runID string) *extprocv3.ProcessingResponse {

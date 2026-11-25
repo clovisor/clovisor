@@ -1159,7 +1159,9 @@ run's processes:
   would decide them.
 - **Safety.** A process is held only while the node agent's heartbeat is
   fresh. One held for more than a second is continued without its probes. A
-  restarted node agent continues processes left stopped in runs that capture.
+  restarted node agent continues processes left stopped in runs that
+  capture, and attaches probes again to the processes already running in
+  them. What they sent while no node agent was up is not seen.
 
 `agentctl status` lists the libraries probed and the Go versions
 (`TLS capture`).
@@ -1263,6 +1265,25 @@ agentctl events --json <run-id>
 - **Approvals come from outside the run.** The run API refuses decisions
   from inside a run or its descendants, so an agent cannot approve itself.
   With credential identity only root may decide.
+- **Upgrading to Phase 6.6: restart Envoy.** Before it, while one run had a
+  tunnel open to a terminated host, another run's requests inside its own
+  tunnels to that host could be taken as the first run's: decided under
+  its profile, and recorded in its timeline. The fix is in the Envoy
+  bootstrap the node agent writes, so it takes effect only once Envoy is
+  restarted on the new one.
+- **TLS plaintext is the most sensitive data the node touches.** With
+  `-uprobes`, the kernel copies up to 2 KB of each write and 512 bytes of
+  each read made by the TLS libraries of runs that ask. The copies reach
+  only the node agent, through the kernel ring buffer, and are parsed in
+  its memory. Timelines keep method, host, path without the query, status,
+  and an MCP call's method and tool: the same as for a terminated host. As
+  timelines are, they are readable by the run's owner and root. Bodies,
+  headers and tool arguments are dropped.
+- **Uprobes inform; they never decide.** Nothing read from plaintext
+  changes a verdict. A run can avoid the probes by carrying a TLS stack
+  they do not reach (§11 TLS plaintext); `Visibility` in `agentctl events`
+  shows where that happened. The proxy, which a run cannot bypass in
+  transparent enforce mode, remains the only place egress is decided.
 
 ## 15. Troubleshooting
 
@@ -1271,6 +1292,7 @@ agentctl events --json <run-id>
 | `cannot reach the node agent at …/agent.sock` | No node agent, or a different one: check `CLOVISOR_SOCKET`, and whether a user-level agent is running. |
 | Requests get `500` from the proxy | Envoy cannot reach `ext_proc`: socket path, `-envoy-uids`, or the volume mount. |
 | `unidentified client` (cgroup identity) | The client's socket is not in a run: started outside `agentctl run`, or through a proxy chain that hides the source port. |
+| The node agent logs `ext_proc: refused … recorded in no run` | A request the proxy could not tie to a run, or parse: the reason and the addresses follow. No timeline has it. A client address that belongs to another, or an ended, run inside a terminated tunnel points at an Envoy started from a bootstrap from before Phase 6.6: restart Envoy. |
 | `407` / `no run credential` (credential identity) | The request lacked the run's proxy URL credential: started outside `agentctl run`, or the tool dropped the credentials from the proxy URL. |
 | `needs termination` | A rule needs method, path or model, or a content rule covers the host, and Envoy does not terminate it yet. Restart Envoy after the reload message. |
 | `413` on a large upload | The body is over `-inspect-max-body`, and a content rule, a model rule or remote MCP covers the host. Raise the limit, scope the content rule with `to:`, or give the upload's path a rule without a model list. |
@@ -1411,8 +1433,8 @@ ignore the proxy, it checks:
 - `check --transparent` on the recorded runs;
 - TLS plaintext with `-uprobes`: under a profile with
   `observe.tls_plaintext`, requests from curl (three, each held at exec
-  until probed), Python and git (GnuTLS) recorded with their statuses and
-  without query strings; a Go client and its stripped build, the second
+  until probed), Python, git (GnuTLS) and Debian's Node recorded with their
+  statuses and without query strings; a Go client and its stripped build, the second
   started through `env`, probed and their HTTP/2 requests recorded; a run
   under a profile that does not ask, not probed. With `CLOVISOR_IT_NODE`
   set to an official Node binary, its `fetch` recorded from the OpenSSL
@@ -1422,6 +1444,11 @@ ignore the proxy, it checks:
   its request got through and it listed as not visible.
   `CLOVISOR_IT_LOG=1` prints the node agent's log even when the checks
   pass;
+- tunnel identity: while one run holds a tunnel to a terminated host
+  open, another run's requests to it are its own, decided by its profile;
+- restart, capturing: a Python process in a run that captures TLS
+  plaintext made a request before the restart and one after; both were
+  recorded, the new node agent having probed the running process again;
 - restart: a run going across a node agent restart refused the same things
   after it as before (a path rule, an unlisted host and its name, an
   untrusted exec), a run revoked before it stayed revoked, `agentctl status`

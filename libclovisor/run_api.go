@@ -273,6 +273,9 @@ type RunAPIServer struct {
 	// nested run it also marks the cgroup, so the kernel looks its policy
 	// up by it (milestone 4.6); a nested run is refused if that fails.
 	OnPolicy func(runCg uint64, uid int, eff *policy.Effective, nested bool) error
+	// OnRestoreCapture attaches TLS probes to the processes already in a
+	// restored run that captures (milestone 6.6), returning how many.
+	OnRestoreCapture func(runCg uint64, cgroupPath string) int
 	// OnNestedEnd, if set, hears that a nested run's cgroup is gone.
 	OnNestedEnd func(runCg uint64)
 	// OnRunStart, if set, hears of every run once its cgroup exists and

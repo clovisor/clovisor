@@ -39,6 +39,9 @@ func (r *EBPFReader) ReleaseHeldLSM()                  {}
 func (r *EBPFReader) SetTLSCapture(uint64, bool) error { return nil }
 func (r *EBPFReader) TLSLibraries() []string           { return nil }
 
+// TLSAttachRunning needs Linux.
+func (r *EBPFReader) TLSAttachRunning(string, uint64) int { return 0 }
+
 // ContinueStopped needs Linux.
 func ContinueStopped(string) int                                     { return 0 }
 func (r *EBPFReader) SetUnixPolicy(uint64, []string, bool) error     { return nil }

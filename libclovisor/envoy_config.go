@@ -143,10 +143,25 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		return obj{"object_key": key, "factory_key": "envoy.string", "shared_with_upstream": "TRANSITIVE",
 			"format_string": obj{"text_format_source": obj{"inline_string": format}}}
 	}
+	// The identity crosses to the terminating listener as filter state
+	// on the upstream connection, set when the connection is made. Envoy
+	// pools connections by the hash of their options, and these string
+	// objects have none: while one run's tunnel to a terminated host was
+	// open, another run's tunnels came from its pool, and their requests
+	// were taken as the first run's, decided under its policy (milestone
+	// 6.6). The upstream server name is hashed into the pool key, so it
+	// carries the client too, keeping each tunnel to a pool of its own.
+	// It is not shared further: on the next hop it would be the origin's
+	// SNI.
+	poolKey := func(client string) obj {
+		return obj{"object_key": "envoy.network.upstream_server_name",
+			"format_string": obj{"text_format_source": obj{"inline_string": "clovisor-" + client}}}
+	}
 	setState := func(client string) obj {
 		return obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(
 			"type.googleapis.com/envoy.extensions.filters.http.set_filter_state.v3.Config",
 			obj{"on_request_headers": arr{
+				poolKey(client),
 				fsEntry("clovisor.client", client),
 				fsEntry("clovisor.connect", "%REQ(:AUTHORITY)%"),
 				// With credential identity the run's secret is on the CONNECT

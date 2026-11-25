@@ -384,6 +384,38 @@ func TestEnvoyBootstrapTermination(t *testing.T) {
 			t.Errorf("bootstrap lacks %s", want)
 		}
 	}
+	// Each client's tunnels get a connection pool of their own (6.6): the
+	// identity is in the hashed upstream server name, which is not shared
+	// on, where it would be the origin's SNI.
+	var boot map[string]interface{}
+	json.Unmarshal(b, &boot)
+	var found bool
+	var walk func(v interface{})
+	walk = func(v interface{}) {
+		switch x := v.(type) {
+		case map[string]interface{}:
+			if x["object_key"] == "envoy.network.upstream_server_name" {
+				found = true
+				if _, shared := x["shared_with_upstream"]; shared {
+					t.Error("the pool key is shared with upstream")
+				}
+				if f, _ := json.Marshal(x["format_string"]); !strings.Contains(string(f), "%DOWNSTREAM_REMOTE_ADDRESS%") {
+					t.Errorf("pool key without the client: %s", f)
+				}
+			}
+			for _, e := range x {
+				walk(e)
+			}
+		case []interface{}:
+			for _, e := range x {
+				walk(e)
+			}
+		}
+	}
+	walk(boot)
+	if !found {
+		t.Error("no per-client pool key")
+	}
 	if _, err := EnvoyBootstrap(EnvoyConfig{ProxyListen: netip.MustParseAddrPort("127.0.0.1:1"), ExtProcSocket: "/x", AdminSocket: "/a",
 		Terminate: []TerminatedHost{{Pattern: "a.com"}}}); err == nil {
 		t.Error("termination without an upstream CA accepted")

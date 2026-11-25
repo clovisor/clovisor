@@ -123,6 +123,7 @@ place:
 | Go `crypto/tls` probed in each Go binary a capturing run executes, go1.21 to go1.26, arm64 and amd64: functions found by symbol or by Go's function table, so stripped builds too; return probes on decoded return instructions; offsets checked against Go's prologue. Every exec in a capturing run is now reported, so a process that execs another binary gets it probed. Go binaries listed per run, probed or not visible and why. Found: stripped Go is visible after all; the function table's text address is not `.text`'s in an external link. | [6.3 status](#63-status-2026-11-25) |
 | Bundled stacks: OpenSSL linked into a binary and exported (official Node builds) probed in the binary itself, labelled by its banner; Bun's BoringSSL and rustls listed as not visible, with the reason. The Bun-built `claude` binary was not examined, but an app compiled with Bun was. Found: detaching one link per probe held the next exec up to 1.6 s, so all TLS probes are now uprobe-multi links (Linux 6.6 for `-uprobes`). | [6.4 status](#64-status-2026-11-25) |
 | Visibility report: per run and destination, the best level anything saw it at (requests, plaintext, name, address) and why not better, in the timeline and `agentctl events`; the receipt's TLS posture gains what audit will see. | [6.5 status](#65-status-2026-11-25) |
+| Runs' requests inside terminated tunnels could be taken as another run's while that run had a tunnel to the same host open: Envoy pooled the connections to the terminating listener without the client's identity in the key. Fixed by carrying it in the hashed upstream server name; restart Envoy after upgrading. Restored capturing runs get their running processes probed again; Debian's Node in the tests. Phase 6 complete. | [6.6 status](#66-status-2026-11-25) |
 
 ---
 
@@ -4684,8 +4685,7 @@ Verified:
   watchdog. In one of five runs, the 6.1 restart check failed, under
   `tp`, which does not capture. A run's first request, made before the
   restart, got a 403 from the proxy with no decision logged by ext_proc.
-  It happened right after another run was revoked. The cause is not yet
-  found; it is open for 6.6.
+  6.6 found the cause: requests taken as another run's (see 6.6 status).
 
 #### 6.5 status (2026-11-25)
 
@@ -4760,6 +4760,104 @@ Verified:
   `origin.test:443 requests` and `mcp.test:443 plaintext`. With
   `CLOVISOR_IT_BUN`, the Bun app's request to `mcp.test` was `name`, the
   reason naming the app and its BoringSSL.
+
+#### 6.6 status (2026-11-25)
+
+Tests and docs, and what they found.
+
+**Runs' requests taken as another run's (found and fixed).** The proxy
+knows a request inside a terminated tunnel by the client address that
+crosses to the terminating listener as filter state. That state is set on
+the upstream connection to the listener when the connection is made. Envoy
+pools those connections by a hash of their options, and plain string
+filter state has no hash. So every tunnel to a terminated host shared one
+pool, and its connections carried the identity of the tunnel that created
+the pool. Tunnels one after another were right only because an emptied
+pool is deleted. While one run's tunnel was open, another run's tunnels
+to a terminated host came from its pool. Their requests were then taken as
+the first run's: decided under its policy, and recorded in its timeline.
+
+- **How it showed.** The intermittent 6.1 restart failure: a run's first
+  request was refused as "not a run". The run whose identity it carried,
+  the limits test's, had ended. Its upload had passed its `egress_bytes`,
+  so its packets, FIN included, were dropped, and Envoy kept its tunnel
+  open.
+- **How it was found.** Refusals that no run records are now logged with
+  their reason and addresses. A temporary access log on each hop then
+  showed a fresh connection to the terminating listener carrying an
+  earlier run's address.
+- **The fix.** Envoy 1.34 has no hashable string object. The client's
+  identity is therefore also written into `envoy.network.upstream_server_name`,
+  which is hashed into the pool key, so each tunnel's connections come
+  from a pool of their own. It is not shared further; on the next hop it
+  would be the origin's SNI. Explicit mode's proxy listener sets the same
+  state, so it is covered too, but was not separately tested live.
+- **Since when.** Since termination (2.7), in both modes. With two runs
+  reaching one terminated host at the same time, one run's requests could
+  be decided by the other run's profile, and recorded as the other's.
+  Nodes must restart Envoy after upgrading, to load the new bootstrap.
+- **The test.** `tunnel-identity`: run A (`tp`) holds a tunnel open, and
+  run B (`tp-observe`, which allows any path) makes 8 requests to a path
+  `tp` refuses. Before the fix, 3 of 4 runs had some of B's requests
+  refused under `tp` and recorded in A's timeline. After it, 6 of 6
+  passed.
+
+A first fix, making connections to internal listeners single-use, did
+not help: the connections were not being reused, the pool's options were.
+It was dropped.
+
+**Capture across a restart.** A restarted node agent held new execs again,
+but processes already running in a capturing run had lost their probes
+with the old node agent, which owned the links. Restoring a run that
+captures now attaches probes to the processes already in its cgroups,
+after continuing any left stopped. They are not held, so what they send
+before the probes are in place is not seen. Multi probes need no exec to
+take effect: the process's libraries are already mapped.
+
+**Tests added:**
+- `tunnel-identity`, above.
+- `restart`: a third run, under `tp-observe`, keeps one Python process
+  across the restart. It makes a request before and one after, and both
+  are recorded from its TLS plaintext. The node agent's log says probes
+  were attached at restore.
+- `tls-plaintext`: Debian's Node, which uses the system OpenSSL, is in the
+  test image. Its `https.get` is recorded with the curl, Python and git
+  requests, so Node is covered without `CLOVISOR_IT_NODE`. The official
+  build, with OpenSSL linked in, still needs it.
+
+**Docs.** The operator guide gains:
+- security notes on uprobes: what is copied, where it goes, what is
+  kept, and that uprobes inform and never decide;
+- the restart behaviour for capture;
+- the new tests.
+
+**Verified:**
+- `make check`.
+- `make integration`.
+- `make integration-transparent`, now thirty checks, twice, with the
+  optional Node, uv and Bun binaries. No refusal went unrecorded, and no
+  process was held past the watchdog.
+
+#### Phase 6 complete
+
+- **Restart.** A node agent restart keeps every run's grants, revocations
+  included, and fails closed until they are back.
+- **TLS plaintext** is read, for runs that ask, from:
+  - OpenSSL, BoringSSL and GnuTLS as shared libraries;
+  - Go's `crypto/tls` (go1.21 to go1.26);
+  - OpenSSL linked into official Node builds.
+  It is visibility only.
+- **What cannot be read is reported,** per binary and per destination:
+  Bun, rustls, untested Go versions, stripped stacks.
+- **Found on the way and fixed:**
+  - the restart ordering;
+  - detach costs that held execs;
+  - runs' requests taken as another run's.
+
+Open:
+- Explicit mode's identity fix was not separately tested live.
+- The x86 BPF object compiles but has not run.
+- The Bun-built `claude` binary was not examined.
 
 ---
 

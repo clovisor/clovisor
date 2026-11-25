@@ -556,6 +556,43 @@ func (c *tlsCapture) Close() {
 	c.objs.Close()
 }
 
+// attachRunning probes the processes already in a run's cgroups: a
+// restarted node agent restores a capturing run (milestone 6.6), whose
+// processes lost their probes with the previous node agent. They are not
+// held; what they send before their probes are in place is not seen.
+func (c *tlsCapture) attachRunning(cgroupPath string, runCg uint64) int {
+	n := 0
+	filepath.WalkDir(cgroupPath, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		var st syscall.Stat_t
+		if syscall.Stat(p, &st) != nil {
+			return nil
+		}
+		b, err := os.ReadFile(filepath.Join(p, "cgroup.procs"))
+		if err != nil {
+			return nil
+		}
+		for _, f := range strings.Fields(string(b)) {
+			var pid uint32
+			if _, err := fmt.Sscan(f, &pid); err != nil {
+				continue
+			}
+			c.mu.Lock()
+			_, have := c.procs[pid]
+			c.mu.Unlock()
+			if have {
+				continue
+			}
+			n++
+			c.onExec(AuditEvent{Type: EventTLSProgram, Timestamp: time.Now(), PID: pid, CgroupID: st.Ino, RunCgroupID: runCg}, false)
+		}
+		return nil
+	})
+	return n
+}
+
 // ContinueStopped continues processes in cgroupPath and below that are
 // stopped: a previous node agent may have held them at exec and died
 // before continuing them (milestone 6.2). Only for runs that capture.

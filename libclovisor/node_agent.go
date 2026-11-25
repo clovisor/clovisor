@@ -448,6 +448,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	// 4.7), and with BPF LSM, Unix sockets and exec. The LSM writers do
 	// nothing where it is not loaded.
 	if r := audit.reader; r != nil && !credential && (t.Mode != TransparentOff || t.TLSCapture) {
+		api.OnRestoreCapture = func(runCg uint64, path string) int { return r.TLSAttachRunning(path, runCg) }
 		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective, nested bool) error {
 			var errs []error
 			if err := r.SetTLSCapture(runCg, eff.CapturesTLS()); err != nil {

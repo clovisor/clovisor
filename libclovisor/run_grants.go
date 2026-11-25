@@ -354,6 +354,12 @@ func (s *RunAPIServer) adopt(g runGrant, path string, eff *policy.Effective) {
 		if n := ContinueStopped(path); n > 0 {
 			log.Printf("run api: restored run %s: continued %d stopped processes", g.RunID, n)
 		}
+		// Its processes lost their probes with the previous node agent.
+		if s.OnRestoreCapture != nil {
+			if n := s.OnRestoreCapture(g.CgroupID, path); n > 0 {
+				log.Printf("run api: restored run %s: TLS probes attached to %d running processes", g.RunID, n)
+			}
+		}
 	}
 	what := "unprofiled"
 	if eff != nil {
