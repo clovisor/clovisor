@@ -46,7 +46,7 @@ func printUsage(code int) {
 	fmt.Println("  agentctl events [--json] [run-id] List recorded runs, or show one run's timeline")
 	fmt.Println("  agentctl learn [-o file] [--name n] (--all | run-id...)")
 	fmt.Println("                                    Draft a profile from recorded runs")
-	fmt.Println("  agentctl explain [--transparent off|audit|enforce] profile.yaml...")
+	fmt.Println("  agentctl explain [--transparent off|audit|enforce] [--uprobes] profile.yaml...")
 	fmt.Println("                                    Compile profiles and print the enforcement receipt")
 	fmt.Println("  agentctl check --profile p.yaml [--transparent [--udp-allow ip:port,...] [--quic]] (--all | run-id...)")
 	fmt.Println("                                    Replay recorded runs against a profile; exit 1 on violations")
@@ -1010,6 +1010,7 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			fmt.Printf("  %-48s x%-4d %s %s\n", p.Path, p.Execs, p.Stack, state)
 		}
 	}
+	printVisibility(tl)
 	if len(tl.Summary.Models) > 0 {
 		fmt.Printf("Models (%d)\n", len(tl.Summary.Models))
 		for _, u := range tl.Summary.Models {
@@ -1158,6 +1159,7 @@ func explainProfiles(argv []string) error {
 	fs := flag.NewFlagSet("explain", flag.ContinueOnError)
 	platform := platformFlag(fs)
 	transparent := fs.String("transparent", "off", "the node's transparent mode: off, audit or enforce (Linux)")
+	uprobes := fs.Bool("uprobes", false, "the node agent runs with -uprobes (TLS plaintext for profiles that ask)")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -1174,7 +1176,8 @@ func explainProfiles(argv []string) error {
 	lsm := mode != policy.ExplicitProxy && *platform == "linux" && clovisor.BPFLSMActive()
 	// Exec hashes are assumed verifiable where BPF LSM is: probing needs
 	// the node agent's privilege. The node agent's own compile decides.
-	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux", KernelLSM: lsm, ExecHash: lsm})
+	c, err := compileFilesFor(fs.Args(), policy.Options{Mode: mode, Linux: *platform == "linux", KernelLSM: lsm, ExecHash: lsm,
+		Uprobes: *uprobes && *platform == "linux"})
 	if err != nil {
 		return err
 	}
@@ -1416,4 +1419,39 @@ func callCommand(argv []string) (int, error) {
 		fmt.Fprintf(os.Stderr, "agentctl: ending call %s: %v\n", c.CallID, err)
 	}
 	return code, nil
+}
+
+// printVisibility shows, per destination, how much of what the run did
+// there was seen (milestone 6.5), the least seen first. A timeline from
+// before it is reported from its summary.
+func printVisibility(tl *clovisor.RunTimeline) {
+	vis := tl.Summary.Visibility
+	if vis == nil {
+		vis = clovisor.RunVisibility(tl)
+	}
+	if len(vis) == 0 {
+		return
+	}
+	counts := map[string]int{}
+	for _, v := range vis {
+		counts[v.Seen]++
+	}
+	var parts []string
+	for _, l := range []string{clovisor.SeenRequests, clovisor.SeenPlaintext, clovisor.SeenName, clovisor.SeenAddress} {
+		if counts[l] > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", counts[l], l))
+		}
+	}
+	fmt.Printf("Visibility (%d destinations: %s)\n", len(vis), strings.Join(parts, ", "))
+	for _, v := range vis {
+		dest := net.JoinHostPort(v.Host, strconv.Itoa(int(v.Port)))
+		if v.Proto == "udp" {
+			dest += "/udp"
+		}
+		line := fmt.Sprintf("  %-40s %-10s by %s", dest, v.Seen, strings.Join(v.By, ", "))
+		if v.Why != "" {
+			line += ": " + v.Why
+		}
+		fmt.Println(line)
+	}
 }

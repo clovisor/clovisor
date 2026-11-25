@@ -82,14 +82,17 @@ func (c *Compiled) WriteReceipt(w io.Writer) error {
 		p("TLS posture (node-wide: applies to every run on the node, under every profile)")
 		p("")
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "DESTINATION\tPOSTURE\tWHY")
+		fmt.Fprintln(tw, "DESTINATION\tPOSTURE\tWHY\tAUDIT SEES")
 		for _, d := range c.Posture {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", d.Dest, d.Posture, strings.Join(d.Why, ", "))
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.Dest, d.Posture, strings.Join(d.Why, ", "), d.Visibility)
 			if len(d.Others) > 0 {
-				fmt.Fprintf(tw, "\t\talso terminated for %s, which need only the hostname\n", strings.Join(d.Others, ", "))
+				fmt.Fprintf(tw, "\t\talso terminated for %s, which need only the hostname\t\n", strings.Join(d.Others, ", "))
 			}
 		}
 		tw.Flush()
+		p("")
+		p("Destinations no rule names (by IP or CIDR, or under a default allow) are seen")
+		p("by name when the client sends TLS, and otherwise by address only.")
 	}
 	_, err := io.WriteString(w, b.String())
 	return err

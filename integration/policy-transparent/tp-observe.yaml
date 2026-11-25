@@ -8,4 +8,7 @@ spec:
     default: deny
     rules:
       - { name: origin, to: { fqdn: ["origin.test"], ports: [443] }, action: allow }
+      # No profile needs mcp.test's paths, so it is tunnelled, not
+      # terminated: only TLS plaintext shows its requests (milestone 6.5).
+      - { name: tunnelled, to: { fqdn: ["mcp.test"], ports: [443] }, action: allow }
   observe: { tls_plaintext: true }

@@ -562,7 +562,10 @@ git ls-remote https://origin.test/repo.git >/dev/null 2>&1; echo "git done"
 	// from its symbols, or from Go's function table once stripped. env
 	// execs the client in its own process, which already had probes from
 	// its first exec: the new binary is probed all the same.
-	s = e.script("gotls", `/it/bin/gotls "https://origin.test/allowed?try=go" https://origin.test/headers
+	// mcp.test is tunnelled (milestone 6.5): the client sees the origin's
+	// own certificate, so it trusts the test CA too.
+	s = e.script("gotls", `cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/trust.pem
+SSL_CERT_FILE=/tmp/trust.pem /it/bin/gotls "https://origin.test/allowed?try=go" https://origin.test/headers https://mcp.test/tunnelled
 env /it/bin/gotls-stripped https://origin.test/allowed
 `)
 	out, id = e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
@@ -580,9 +583,18 @@ env /it/bin/gotls-stripped https://origin.test/allowed
 	sec = shown[strings.Index(shown, "Seen in TLS plaintext"):]
 	sec = sec[:strings.Index(sec, "Programs with their own TLS")]
 	if !regexp.MustCompile(`GET origin.test/allowed +x2 +200 x2 \(go1\.\d+\S*, HTTP/2\)`).MatchString(sec) ||
-		!regexp.MustCompile(`GET origin.test/headers +x1 +200 x1 \(go1`).MatchString(sec) || strings.Contains(sec, "try=") {
+		!regexp.MustCompile(`GET origin.test/headers +x1 +200 x1 \(go1`).MatchString(sec) ||
+		!regexp.MustCompile(`GET mcp.test/tunnelled +x1 +200 x1 \(go1`).MatchString(sec) || strings.Contains(sec, "try=") {
 		t.Errorf("Go TLS plaintext section:\n%s", sec)
 	}
+	// Milestone 6.5: origin.test was terminated, so the proxy saw its
+	// requests; mcp.test was tunnelled, and only TLS plaintext showed them.
+	expect(t, shown, "Visibility (2 destinations: 1 requests, 1 plaintext)")
+	if !regexp.MustCompile(`mcp.test:443 +plaintext +by proxy, tls-plaintext: tunnelled without termination`).MatchString(shown) ||
+		!regexp.MustCompile(`origin.test:443 +requests +by proxy\n`).MatchString(shown) {
+		t.Errorf("visibility:\n%s", shown)
+	}
+	expect(t, e.timeline(id), `"visibility"`, `"seen": "plaintext"`)
 
 	// Milestone 6.4: a rustls binary cannot be probed, and is listed as
 	// not visible. Only with CLOVISOR_IT_RUSTLS (see build).
@@ -602,14 +614,18 @@ env /it/bin/gotls-stripped https://origin.test/allowed
 	// without symbols: it gets through, and is listed as not visible.
 	// Only with CLOVISOR_IT_BUN (see build).
 	if os.Getenv("CLOVISOR_IT_BUN") != "" {
-		s = e.script("buntls", `NODE_EXTRA_CA_CERTS=${SSL_CERT_FILE:-/it/test-ca.crt} /it/bin/bun-app "https://origin.test/allowed?try=bun"
+		s = e.script("buntls", `cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/trust.pem
+NODE_EXTRA_CA_CERTS=/tmp/trust.pem /it/bin/bun-app "https://mcp.test/bun"
 `)
 		out, id = e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
 		expect(t, out, "bun 200")
 		e.timeline(id)
 		shown, _, _ = e.sh("/it/bin/agentctl events " + id)
+		// Tunnelled, and Bun's TLS not probed: the name is all there is,
+		// and the report says why (milestone 6.5).
 		if !regexp.MustCompile(`/it/bin/bun-app +x1 +Bun's BoringSSL not visible: Bun links BoringSSL in without its symbols`).MatchString(shown) ||
-			strings.Contains(shown, "Seen in TLS plaintext") {
+			strings.Contains(shown, "Seen in TLS plaintext") ||
+			!regexp.MustCompile(`mcp.test:443 +name +by proxy: tunnelled without termination; TLS plaintext was asked for, but not visible in /it/bin/bun-app \(Bun's BoringSSL\)`).MatchString(shown) {
 			t.Errorf("Bun app:\n%s", shown)
 		}
 	} else {

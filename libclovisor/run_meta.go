@@ -108,6 +108,9 @@ type PolicyLayer struct {
 	Mode    string    `json:"mode"`
 	Source  string    `json:"source"` // granted, ceiling clamp, clamped by ..., revoked by ...
 	At      time.Time `json:"at"`
+	// Observe: the profile asks for TLS plaintext (milestone 6.5's
+	// visibility report reads it).
+	Observe bool `json:"observe,omitempty"`
 }
 
 // writeFileAtomic writes data to a temp file next to path and renames it

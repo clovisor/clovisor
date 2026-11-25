@@ -169,6 +169,10 @@ type DestPosture struct {
 	// Others lists profiles that reach the destination without needing
 	// termination, but get it anyway because posture is node-wide.
 	Others []string
+	// Visibility is what audit records of runs reaching it (milestone
+	// 6.5): each request, or the name only, with TLS plaintext for the
+	// profiles that ask.
+	Visibility string
 }
 
 // Compiled is the result of compiling the profiles active on a node.
@@ -778,23 +782,28 @@ func (c *compiler) posture(profiles []*AgentProfile) []DestPosture {
 		noTerm  []string // "profile/rule"
 		users   map[string]bool
 		needers map[string]bool
-		plain   bool // every rule needing L7 is on port 80 only
+		obs     map[string]bool // users that ask for TLS plaintext
+		plain   bool            // every rule needing L7 is on port 80 only
 		needs   bool
 	}
 	dests := map[string]*dest{}
 	get := func(h string) *dest {
 		d := dests[h]
 		if d == nil {
-			d = &dest{users: map[string]bool{}, needers: map[string]bool{}, plain: true}
+			d = &dest{users: map[string]bool{}, needers: map[string]bool{}, obs: map[string]bool{}, plain: true}
 			dests[h] = d
 		}
 		return d
 	}
 	for _, p := range profiles {
+		observes := p.Spec.Observe != nil && p.Spec.Observe.TLSPlaintext
 		for _, r := range p.Spec.Egress.Rules {
 			for _, h := range r.To.FQDN {
 				d := get(h)
 				d.users[p.Metadata.Name] = true
+				if observes {
+					d.obs[p.Metadata.Name] = true
+				}
 				if r.NoTerminate {
 					d.noTerm = append(d.noTerm, p.Metadata.Name+"/"+r.Name)
 				}
@@ -897,9 +906,33 @@ func (c *compiler) posture(profiles []*AgentProfile) []DestPosture {
 		default:
 			dp.Why = []string{"no rule needs more than the hostname"}
 		}
+		dp.Visibility = c.visibility(dp.Posture, d.obs)
 		out = append(out, dp)
 	}
 	return out
+}
+
+// visibility says what audit records of a destination with this
+// posture (milestone 6.5).
+func (c *compiler) visibility(posture string, observers map[string]bool) string {
+	if posture != PosturePassthrough {
+		return "requests"
+	}
+	if len(observers) == 0 {
+		return "name only"
+	}
+	names := make([]string, 0, len(observers))
+	for n := range observers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	switch {
+	case !c.opts.Linux:
+		return "name only (TLS plaintext needs the Linux node agent)"
+	case !c.opts.Uprobes:
+		return "name only (TLS plaintext needs the node agent's -uprobes)"
+	}
+	return "name; for " + strings.Join(names, ", ") + " also requests from TLS plaintext, where the client's TLS is probed"
 }
 
 // overlaps reports whether two fqdn entries can name the same host.

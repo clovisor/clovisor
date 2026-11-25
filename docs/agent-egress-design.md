@@ -122,6 +122,7 @@ place:
 |---|---|
 | Go `crypto/tls` probed in each Go binary a capturing run executes, go1.21 to go1.26, arm64 and amd64: functions found by symbol or by Go's function table, so stripped builds too; return probes on decoded return instructions; offsets checked against Go's prologue. Every exec in a capturing run is now reported, so a process that execs another binary gets it probed. Go binaries listed per run, probed or not visible and why. Found: stripped Go is visible after all; the function table's text address is not `.text`'s in an external link. | [6.3 status](#63-status-2026-11-25) |
 | Bundled stacks: OpenSSL linked into a binary and exported (official Node builds) probed in the binary itself, labelled by its banner; Bun's BoringSSL and rustls listed as not visible, with the reason. The Bun-built `claude` binary was not examined, but an app compiled with Bun was. Found: detaching one link per probe held the next exec up to 1.6 s, so all TLS probes are now uprobe-multi links (Linux 6.6 for `-uprobes`). | [6.4 status](#64-status-2026-11-25) |
+| Visibility report: per run and destination, the best level anything saw it at (requests, plaintext, name, address) and why not better, in the timeline and `agentctl events`; the receipt's TLS posture gains what audit will see. | [6.5 status](#65-status-2026-11-25) |
 
 ---
 
@@ -4685,6 +4686,80 @@ Verified:
   restart, got a 403 from the proxy with no decision logged by ext_proc.
   It happened right after another run was revoked. The cause is not yet
   found; it is open for 6.6.
+
+#### 6.5 status (2026-11-25)
+
+Implemented:
+
+- **Per run, per destination.** When a timeline is written, each
+  destination the run reached is placed at the best level anything saw it.
+  The list, least seen first, is stored as `visibility` in the summary.
+  - **requests:** the proxy saw each request (plain HTTP, or TLS it
+    terminated).
+  - **plaintext:** tunnelled, with requests read from TLS plaintext. This
+    also covers plaintext from connections that did not go through the
+    proxy.
+  - **name:** a CONNECT authority or SNI only.
+  - **address:** a kernel connect only. This means a connect not through
+    the proxy (explicit mode), or UDP other than DNS. It is labelled with
+    the name the run's lookups gave the address, where there is one.
+
+  Each entry says what saw it (proxy, TLS plaintext, kernel) and, below
+  `requests`, why not better:
+  - a CONNECT refused by name;
+  - a profile that does not ask for TLS plaintext;
+  - binaries whose own TLS was not visible, named (`/it/bin/bun-app (Bun's
+    BoringSSL)`);
+  - or plaintext asked for and none seen.
+
+  Policy layers now record whether their profile asks for TLS plaintext
+  (`observe`), so a run's timeline can tell an unasked gap from a missed
+  one.
+- **`agentctl events`** shows it under `Visibility`, counted by level. It
+  computes the report for timelines written before 6.5.
+- **The receipt.** The TLS posture table gains `AUDIT SEES`:
+  - `requests` where terminated;
+  - `name only` where not;
+  - `name; for <profiles> also requests from TLS plaintext` where some
+    profiles reaching it ask, and the node probes.
+
+  Without `-uprobes` (`agentctl explain --uprobes` models it), the column
+  says why there will be no plaintext. A note covers destinations no rule
+  names: name when the client sends TLS, else address.
+
+Decisions:
+
+- **A level per destination, not per request.** A destination whose
+  requests the proxy saw at all is `requests`, even if some CONNECTs to it
+  were tunnelled. Posture is node-wide, so a host is either terminated or
+  not. The exceptions are a destination reached both through the proxy and
+  around it, and an IP rule beside a name.
+- **Derived, not recorded.** The report is computed from the summary at
+  each write. It needs nothing new from the kernel or the proxy, and old
+  timelines get it too.
+
+Limits:
+
+- Plaintext is matched to a destination by host. A TLS record whose port
+  is not in its host is taken as 443's.
+- In transparent mode, a connect refused before the proxy is a refusal,
+  counted in the summary, not a destination, so it is not listed.
+
+Verified:
+
+- Unit tests:
+  - every level from one summary: terminated and plain HTTP, tunnelled with
+    and without plaintext, a refused CONNECT, plaintext from outside the
+    proxy, an address with a DNS name, a bare address and UDP;
+  - DNS left out; the least seen first; the reason when the profile does
+    not ask;
+  - the receipt's column with and without `-uprobes`, and for a
+    destination only some profiles observe.
+- `make integration-transparent`, twenty-nine checks. `tp-observe` gains
+  `mcp.test`, which no profile terminates. A Go client's run reported
+  `origin.test:443 requests` and `mcp.test:443 plaintext`. With
+  `CLOVISOR_IT_BUN`, the Bun app's request to `mcp.test` was `name`, the
+  reason naming the app and its BoringSSL.
 
 ---
 

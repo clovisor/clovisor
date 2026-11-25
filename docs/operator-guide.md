@@ -281,7 +281,10 @@ A profile's `udp` or `icmp` entry works only where its ceiling lists it too.
 - **Explain before you load.** `agentctl explain profile.yaml…` compiles
   profiles exactly as the node agent will. It prints the *enforcement
   receipt*: for each rule, what enforces it, and the TLS posture for each
-  destination. Features nothing can enforce yet are compile errors, not
+  destination. `AUDIT SEES` says what audit will record there: each request
+  where it is terminated, the name only where it is not, and requests from
+  TLS plaintext for profiles that ask, given `--uprobes` (the node's
+  `-uprobes`). Features nothing can enforce yet are compile errors, not
   silent no-ops.
 - **A `deny` needs a `message`.** The message is the narration the agent sees,
   and is how it learns to stay inside the policy.
@@ -1205,6 +1208,19 @@ agentctl events --json <run-id>
 
   The summary aggregates destinations, paths, tools, and denied and
   would-deny counts.
+- **What audit did not see.** `Visibility` in `agentctl events` lists each
+  destination of the run at the best level anything saw it, the least seen
+  first, with the reason it was not seen better:
+
+  | Level | Meaning |
+  |---|---|
+  | `requests` | The proxy saw each request: plain HTTP, or TLS it terminated. |
+  | `plaintext` | Tunnelled, but its requests were read from the run's TLS plaintext (§11 TLS plaintext). |
+  | `name` | Only the name, from the CONNECT or the SNI: tunnelled, and no plaintext seen. The reason says whether the profile asked for plaintext, and names the binaries whose TLS was not visible. |
+  | `address` | Only the address the kernel saw connected to: not through the proxy (explicit mode), or UDP. A name from the run's DNS lookups is shown when there is one. |
+
+  It is in the timeline's summary as `visibility`. Timelines from before it
+  are reported from their summary.
 - **Event cap.** Events past the per-run cap are counted but not listed;
   summaries stay complete.
 - **Lost and suppressed events.** Events the kernel could not queue (its

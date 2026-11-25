@@ -152,6 +152,9 @@ type RunSummary struct {
 	// Spend is the run's own budgeted model calls (milestone 5.4), by host
 	// and model: tokens, and cost at the node's prices.
 	Spend []SpendUse `json:"spend,omitempty"`
+	// Visibility is, per destination, how much of what the run did there
+	// was seen (milestone 6.5), the least seen first. See RunVisibility.
+	Visibility []DestVisibility `json:"visibility,omitempty"`
 }
 
 // SpendUse aggregates one run's budgeted calls to one model on one host.
@@ -1413,6 +1416,7 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 	if len(st.udpDeny) > 0 {
 		tl.Summary.UDPRefusedTo = destinationList(st.udpDeny)
 	}
+	tl.Summary.Visibility = RunVisibility(tl)
 
 	data, err := json.MarshalIndent(tl, "", "  ")
 	if err != nil {

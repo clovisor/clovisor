@@ -1013,6 +1013,7 @@ func layerRecord(l policy.Layer, at time.Time) PolicyLayer {
 		Mode:    l.Profile.Mode,
 		Source:  l.Source,
 		At:      at,
+		Observe: l.Profile.CapturesTLS(),
 	}
 }
 
