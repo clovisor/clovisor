@@ -95,7 +95,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("check-transparent", e.testCheckTransparent)
 	t.Run("restart", e.testRestart)
 	t.Run("fail-closed", e.testFailClosed) // last: stops the node agent
-	if t.Failed() {
+	if t.Failed() || os.Getenv("CLOVISOR_IT_LOG") != "" {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
 		t.Logf("node agent log:\n%s", out)
 	}
@@ -582,6 +582,59 @@ env /it/bin/gotls-stripped https://origin.test/allowed
 	if !regexp.MustCompile(`GET origin.test/allowed +x2 +200 x2 \(go1\.\d+\S*, HTTP/2\)`).MatchString(sec) ||
 		!regexp.MustCompile(`GET origin.test/headers +x1 +200 x1 \(go1`).MatchString(sec) || strings.Contains(sec, "try=") {
 		t.Errorf("Go TLS plaintext section:\n%s", sec)
+	}
+
+	// Milestone 6.4: a rustls binary cannot be probed, and is listed as
+	// not visible. Only with CLOVISOR_IT_RUSTLS (see build).
+	if os.Getenv("CLOVISOR_IT_RUSTLS") != "" {
+		out, id = e.agentRun("tp-observe", "/it/bin/rustls-bin --version >/dev/null && echo rustls ran")
+		expect(t, out, "rustls ran")
+		e.timeline(id)
+		shown, _, _ = e.sh("/it/bin/agentctl events " + id)
+		if !regexp.MustCompile(`/it/bin/rustls-bin +x1 +rustls \d+\.\d+\.\d+ not visible: rustls has no stable symbols`).MatchString(shown) {
+			t.Errorf("rustls:\n%s", shown)
+		}
+	} else {
+		t.Log("CLOVISOR_IT_RUSTLS unset: a rustls binary not checked")
+	}
+
+	// A Bun-compiled app makes its request with BoringSSL linked in
+	// without symbols: it gets through, and is listed as not visible.
+	// Only with CLOVISOR_IT_BUN (see build).
+	if os.Getenv("CLOVISOR_IT_BUN") != "" {
+		s = e.script("buntls", `NODE_EXTRA_CA_CERTS=${SSL_CERT_FILE:-/it/test-ca.crt} /it/bin/bun-app "https://origin.test/allowed?try=bun"
+`)
+		out, id = e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
+		expect(t, out, "bun 200")
+		e.timeline(id)
+		shown, _, _ = e.sh("/it/bin/agentctl events " + id)
+		if !regexp.MustCompile(`/it/bin/bun-app +x1 +Bun's BoringSSL not visible: Bun links BoringSSL in without its symbols`).MatchString(shown) ||
+			strings.Contains(shown, "Seen in TLS plaintext") {
+			t.Errorf("Bun app:\n%s", shown)
+		}
+	} else {
+		t.Log("CLOVISOR_IT_BUN unset: a Bun-compiled app not checked")
+	}
+
+	// An official Node build links OpenSSL in and exports it, so the same
+	// probes go on the node binary itself. Only with CLOVISOR_IT_NODE.
+	if os.Getenv("CLOVISOR_IT_NODE") == "" {
+		t.Log("CLOVISOR_IT_NODE unset: official Node not checked")
+		return
+	}
+	s = e.script("nodetls", `NODE_EXTRA_CA_CERTS=${SSL_CERT_FILE:-/it/test-ca.crt} /it/bin/node-official -e '
+fetch("https://origin.test/allowed?try=node").then(r => console.log("node", r.status)).catch(e => console.log("node error", e.cause || e))'
+`)
+	out, id = e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
+	expect(t, out, "node 200")
+	e.timeline(id)
+	shown, _, err = e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`/it/bin/node-official +x1 +OpenSSL \d+\.\d+\.\d+\w*, bundled probed`).MatchString(shown) ||
+		!regexp.MustCompile(`GET origin.test/allowed +x1 +200 x1 \(OpenSSL \d+\.\d+\.\d+\w*, HTTP/1.1\)`).MatchString(shown) {
+		t.Errorf("official Node:\n%s", shown)
 	}
 }
 

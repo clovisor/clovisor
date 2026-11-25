@@ -32,14 +32,16 @@ const (
 	EventTLSData    // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
 	EventTLSExit    // a process with TLS probes exited
 	EventTLS        // a request parsed from TLS plaintext
-	EventTLSProgram // a Go binary exec'd in a capturing run, and whether its crypto/tls is probed (milestone 6.3)
+	EventTLSProgram // a binary with its own TLS stack exec'd in a capturing run, and whether it is probed (milestones 6.3, 6.4)
 )
 
 // TLSProgramData is a binary exec'd in a capturing run whose TLS stack is
-// linked into it (milestone 6.3: Go), and whether it could be probed.
+// linked into it (milestones 6.3 and 6.4: Go, bundled OpenSSL, Bun,
+// rustls), and whether it could be probed.
 type TLSProgramData struct {
 	Path   string
-	Stack  string // the Go version, e.g. go1.26.8
+	Stack  string // e.g. "go1.26.8 crypto/tls", "OpenSSL 3.5.9, bundled"
+	Lib    string `json:",omitempty"` // what its records are labelled
 	Probed bool
 	Reason string `json:",omitempty"` // why not
 }
@@ -54,7 +56,7 @@ type TLSEventData struct {
 // kilobytes, of Len.
 type TLSData struct {
 	Write bool
-	Lib   string // libssl (OpenSSL or BoringSSL), gnutls, go
+	Lib   string // libssl (OpenSSL or BoringSSL), gnutls, go, bundled (OpenSSL linked in)
 	Obj   uint64 // the library's connection object
 	Len   int
 	Data  []byte

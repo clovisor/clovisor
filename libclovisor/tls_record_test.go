@@ -168,11 +168,11 @@ func TestTLSProgramTimeline(t *testing.T) {
 	prog := func(ms int, d TLSProgramData) AuditEvent {
 		return AuditEvent{Type: EventTLSProgram, Timestamp: at(ms), CgroupID: testRunCg, RunCgroupID: testRunCg, PID: 11, Data: d}
 	}
-	gh := TLSProgramData{Path: "/usr/bin/gh", Stack: "go1.26.8", Probed: true}
+	gh := TLSProgramData{Path: "/usr/bin/gh", Stack: "go1.26.8 crypto/tls", Lib: "go1.26.8", Probed: true}
 	tl := feed(t, r,
 		runEv(EventRunStart, 0, "/agents/run-abc"),
 		prog(1, gh), prog(2, gh),
-		prog(3, TLSProgramData{Path: "/opt/new", Stack: "go1.27.0", Reason: "Go newer than go1.26, the last tested"}),
+		prog(3, TLSProgramData{Path: "/opt/new", Stack: "go1.27.0 crypto/tls", Reason: "Go newer than go1.26, the last tested"}),
 		runEv(EventRunEnd, 4, "/agents/run-abc"),
 	)
 	p := tl.Summary.TLSPrograms

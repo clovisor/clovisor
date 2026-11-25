@@ -10,6 +10,7 @@
 package clovisor
 
 import (
+	"debug/elf"
 	"errors"
 	"fmt"
 	"log"
@@ -37,49 +38,61 @@ const (
 )
 
 type bpfTLSObjects struct {
-	Exec          *ebpf.Program `ebpf:"on_tls_exec"`
-	Exit          *ebpf.Program `ebpf:"on_tls_exit"`
-	SSLWrite      *ebpf.Program `ebpf:"tls_ssl_write"`
-	SSLWriteEx    *ebpf.Program `ebpf:"tls_ssl_write_ex"`
-	SSLWriteRet   *ebpf.Program `ebpf:"tls_ssl_write_ret"`
-	SSLWriteExRet *ebpf.Program `ebpf:"tls_ssl_write_ex_ret"`
-	SSLRead       *ebpf.Program `ebpf:"tls_ssl_read"`
-	SSLReadEx     *ebpf.Program `ebpf:"tls_ssl_read_ex"`
-	SSLReadRet    *ebpf.Program `ebpf:"tls_ssl_read_ret"`
-	SSLReadExRet  *ebpf.Program `ebpf:"tls_ssl_read_ex_ret"`
-	GnuSend       *ebpf.Program `ebpf:"tls_gnutls_send"`
-	GnuSendRet    *ebpf.Program `ebpf:"tls_gnutls_send_ret"`
-	GnuRecv       *ebpf.Program `ebpf:"tls_gnutls_recv"`
-	GnuRecvRet    *ebpf.Program `ebpf:"tls_gnutls_recv_ret"`
-	GoWrite       *ebpf.Program `ebpf:"tls_go_write"`
-	GoWriteRet    *ebpf.Program `ebpf:"tls_go_write_ret"`
-	GoRead        *ebpf.Program `ebpf:"tls_go_read"`
-	GoReadRet     *ebpf.Program `ebpf:"tls_go_read_ret"`
-	Capture       *ebpf.Map     `ebpf:"tls_capture"`
-	Held          *ebpf.Map     `ebpf:"tls_held"`
-	Pids          *ebpf.Map     `ebpf:"tls_pids"`
+	Exec     *ebpf.Program `ebpf:"on_tls_exec"`
+	Exit     *ebpf.Program `ebpf:"on_tls_exit"`
+	CEntry   *ebpf.Program `ebpf:"tls_c_entry"`
+	CReturn  *ebpf.Program `ebpf:"tls_c_return"`
+	GoEntry  *ebpf.Program `ebpf:"tls_go_entry"`
+	GoReturn *ebpf.Program `ebpf:"tls_go_ret"`
+	Capture  *ebpf.Map     `ebpf:"tls_capture"`
+	Held     *ebpf.Map     `ebpf:"tls_held"`
+	Pids     *ebpf.Map     `ebpf:"tls_pids"`
 }
 
 func (o *bpfTLSObjects) Close() {
-	for _, c := range []interface{ Close() error }{o.Exec, o.Exit, o.SSLWrite, o.SSLWriteEx, o.SSLWriteRet, o.SSLWriteExRet,
-		o.SSLRead, o.SSLReadEx, o.SSLReadRet, o.SSLReadExRet, o.GnuSend, o.GnuSendRet, o.GnuRecv, o.GnuRecvRet,
-		o.GoWrite, o.GoWriteRet, o.GoRead, o.GoReadRet, o.Capture, o.Held, o.Pids} {
+	for _, c := range []interface{ Close() error }{o.Exec, o.Exit, o.CEntry, o.CReturn, o.GoEntry, o.GoReturn,
+		o.Capture, o.Held, o.Pids} {
 		if c != nil {
 			c.Close()
 		}
 	}
 }
 
-// tlsProbe is one function of a TLS library to probe, at entry and return.
-type tlsProbe struct {
-	sym        string
-	entry, ret *ebpf.Program
+// Library tags in the probes' cookies (agent_audit.c, tls_c_entry).
+const (
+	tlsLibSSL     = 1
+	tlsLibGnuTLS  = 2
+	tlsLibBundled = 4 // OpenSSL linked into the binary (milestone 6.4)
+)
+
+// tlsFunc is a C TLS function to probe: its direction, and whether its
+// count is stored through its 4th argument (the _ex forms).
+type tlsFunc struct {
+	sym string
+	dir uint64 // 1 write, 2 read
+	ex  bool
 }
 
+var (
+	sslFuncs = []tlsFunc{{"SSL_write", 1, false}, {"SSL_write_ex", 1, true}, {"SSL_read", 2, false}, {"SSL_read_ex", 2, true}}
+	gnuFuncs = []tlsFunc{{"gnutls_record_send", 1, false}, {"gnutls_record_recv", 2, false}}
+)
+
+func tlsCookie(lib uint64, f tlsFunc) uint64 {
+	c := lib | f.dir<<8
+	if f.ex {
+		c |= 1 << 16
+	}
+	return c
+}
+
+// tlsLib is a shared TLS library found on the node, with the functions it
+// has.
 type tlsLib struct {
-	path   string
-	ex     *link.Executable
-	probes []tlsProbe
+	path  string
+	ex    *link.Executable
+	lib   uint64
+	funcs []tlsFunc
 }
 
 type tlsCapture struct {
@@ -89,29 +102,30 @@ type tlsCapture struct {
 
 	mu    sync.Mutex
 	procs map[uint32]*tlsProc // by process
-	// goBins caches what analysis found in each Go binary, by file.
-	goBins map[goExeKey]*goTLSBinary
-	// programs carries what each exec'd Go binary showed (milestone 6.3)
-	// to the reader, which sends it on with the events.
+	// bins caches what analysis found in each binary, by file.
+	bins map[exeKey]*tlsBinary
+	// programs carries what each exec'd binary with a TLS stack of its own
+	// showed (milestones 6.3 and 6.4) to the reader, which sends it on
+	// with the events.
 	programs chan AuditEvent
 	done     chan struct{}
 	wg       sync.WaitGroup
 }
 
 // tlsProc is one probed process: the library probes, which survive exec,
-// and those on its Go binary, which an exec replaces.
+// and those on the TLS stack its binary carries, which an exec replaces.
 type tlsProc struct {
-	lib, golang []link.Link
+	lib, own []link.Link
 }
 
-type goExeKey struct {
+type exeKey struct {
 	dev, ino uint64
 	size     int64
 	mtime    int64
 }
 
-// maxGoBins bounds the binaries whose analysis is cached.
-const maxGoBins = 1024
+// maxBins bounds the binaries whose analysis is cached.
+const maxBins = 1024
 
 // DefaultTLSLibraries are where the TLS libraries are looked for, as the
 // node agent sees the filesystem.
@@ -140,7 +154,7 @@ func multiarch() string {
 }
 
 func newTLSCapture(spec *ebpf.CollectionSpec, replace map[string]*ebpf.Map, candidates []string) (*tlsCapture, error) {
-	c := &tlsCapture{procs: map[uint32]*tlsProc{}, goBins: map[goExeKey]*goTLSBinary{},
+	c := &tlsCapture{procs: map[uint32]*tlsProc{}, bins: map[exeKey]*tlsBinary{},
 		programs: make(chan AuditEvent, 1024), done: make(chan struct{})}
 	if err := spec.LoadAndAssign(&c.objs, &ebpf.CollectionOptions{MapReplacements: replace}); err != nil {
 		var ve *ebpf.VerifierError
@@ -164,19 +178,39 @@ func newTLSCapture(spec *ebpf.CollectionSpec, replace map[string]*ebpf.Map, cand
 		if err != nil {
 			continue
 		}
-		lib := tlsLib{path: real, ex: ex}
-		o := &c.objs
+		lib := tlsLib{path: real, ex: ex, lib: tlsLibSSL}
+		funcs := sslFuncs
 		if filepath.Base(p) == "libgnutls.so.30" {
-			lib.probes = []tlsProbe{{"gnutls_record_send", o.GnuSend, o.GnuSendRet}, {"gnutls_record_recv", o.GnuRecv, o.GnuRecvRet}}
-		} else {
-			lib.probes = []tlsProbe{{"SSL_write", o.SSLWrite, o.SSLWriteRet}, {"SSL_write_ex", o.SSLWriteEx, o.SSLWriteExRet},
-				{"SSL_read", o.SSLRead, o.SSLReadRet}, {"SSL_read_ex", o.SSLReadEx, o.SSLReadExRet}}
+			lib.lib, funcs = tlsLibGnuTLS, gnuFuncs
+		}
+		// Only the functions this version has: a multi link fails whole.
+		have := definedSyms(real)
+		for _, f := range funcs {
+			if have[f.sym] {
+				lib.funcs = append(lib.funcs, f)
+			}
+		}
+		if len(lib.funcs) == 0 {
+			continue
 		}
 		c.libs = append(c.libs, lib)
 	}
 	if len(c.libs) == 0 {
 		c.objs.Close()
 		return nil, fmt.Errorf("no TLS library found (looked for %d paths)", len(candidates))
+	}
+	// Probes are attached as uprobe-multi links (kernel 6.6): one per
+	// program and library, each detached with one wait on the kernel.
+	if ls, err := c.attachC(c.libs[0].ex, c.libs[0].lib, c.libs[0].funcs, nil, uint32(os.Getpid())); err != nil {
+		c.Close()
+		if errors.Is(err, link.ErrNotSupported) {
+			return nil, fmt.Errorf("TLS capture needs uprobe-multi links (Linux 6.6): %w", err)
+		}
+		return nil, fmt.Errorf("attach TLS probes: %w", err)
+	} else {
+		for _, l := range ls {
+			l.Close()
+		}
 	}
 	for _, p := range []*ebpf.Program{c.objs.Exec, c.objs.Exit} {
 		l, err := link.AttachTracing(link.TracingOptions{Program: p})
@@ -211,7 +245,7 @@ func (c *tlsCapture) setRun(runCg uint64, on bool) error {
 
 // onExec attaches the probes to a process that exec'd in a capturing
 // run, then continues it if the kernel stopped it. ev is the exec, as an
-// EventTLSProgram to fill in for a Go binary.
+// EventTLSProgram to fill in for a binary with a TLS stack of its own.
 func (c *tlsCapture) onExec(ev AuditEvent, held bool) {
 	pid := ev.PID
 	defer func() {
@@ -226,8 +260,8 @@ func (c *tlsCapture) onExec(ev AuditEvent, held bool) {
 		p = &tlsProc{}
 		c.procs[pid] = p
 	}
-	old, fresh := p.golang, p.lib == nil
-	p.golang = nil
+	old, fresh := p.own, p.lib == nil
+	p.own = nil
 	c.mu.Unlock()
 	for _, l := range old { // the binary it ran before this exec
 		l.Close()
@@ -239,17 +273,17 @@ func (c *tlsCapture) onExec(ev AuditEvent, held bool) {
 			lib = []link.Link{} // attached, to nothing
 		}
 	}
-	golang, prog := c.attachGo(pid)
+	own, prog := c.attachOwn(pid)
 	c.mu.Lock()
 	if c.procs[pid] == p {
 		if fresh {
 			p.lib = lib
 		}
-		p.golang = golang
-		lib, golang = nil, nil
+		p.own = own
+		lib, own = nil, nil
 	}
 	c.mu.Unlock()
-	for _, l := range append(lib, golang...) { // it exited meanwhile
+	for _, l := range append(lib, own...) { // it exited meanwhile
 		l.Close()
 	}
 	c.objs.Pids.Put(pid, uint8(1))
@@ -268,40 +302,90 @@ func (c *tlsCapture) onExec(ev AuditEvent, held bool) {
 func (c *tlsCapture) attachLibs(pid uint32) []link.Link {
 	var links []link.Link
 	for _, lib := range c.libs {
-		for _, p := range lib.probes {
-			for i, prog := range []*ebpf.Program{p.entry, p.ret} {
-				var l link.Link
-				var err error
-				if i == 0 {
-					l, err = lib.ex.Uprobe(p.sym, prog, &link.UprobeOptions{PID: int(pid)})
-				} else {
-					l, err = lib.ex.Uretprobe(p.sym, prog, &link.UprobeOptions{PID: int(pid)})
-				}
-				if err != nil {
-					if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
-						continue // a symbol this library lacks, or the process is gone
-					}
-					log.Printf("tls: pid %d: %s %s: %v", pid, filepath.Base(lib.path), p.sym, err)
-					continue
-				}
-				links = append(links, l)
+		ls, err := c.attachC(lib.ex, lib.lib, lib.funcs, nil, pid)
+		if err != nil {
+			if !errors.Is(err, unix.ESRCH) { // the process is gone
+				log.Printf("tls: pid %d: %s: %v", pid, filepath.Base(lib.path), err)
 			}
+			continue
 		}
+		links = append(links, ls...)
 	}
 	return links
 }
 
-// attachGo probes the process's binary if it is Go with crypto/tls
-// (milestone 6.3), and says what it found; nil: not a Go binary, or one
-// without crypto/tls.
-func (c *tlsCapture) attachGo(pid uint32) ([]link.Link, *TLSProgramData) {
+// attachC attaches the C probes to funcs of ex for pid: by symbol, or at
+// addrs (file offsets, one per func) where given. Two links: entries and
+// returns.
+func (c *tlsCapture) attachC(ex *link.Executable, lib uint64, funcs []tlsFunc, addrs []uint64, pid uint32) ([]link.Link, error) {
+	var syms []string
+	var cookies []uint64
+	for _, f := range funcs {
+		cookies = append(cookies, tlsCookie(lib, f))
+		if addrs == nil {
+			syms = append(syms, f.sym)
+		}
+	}
+	opts := &link.UprobeMultiOptions{Addresses: addrs, Cookies: cookies, PID: pid}
+	entry, err := ex.UprobeMulti(syms, c.objs.CEntry, opts)
+	if err != nil {
+		return nil, err
+	}
+	ret, err := ex.UretprobeMulti(syms, c.objs.CReturn, opts)
+	if err != nil {
+		entry.Close()
+		return nil, err
+	}
+	return []link.Link{entry, ret}, nil
+}
+
+// definedSyms lists the functions a shared library defines.
+func definedSyms(path string) map[string]bool {
+	out := map[string]bool{}
+	f, err := elf.Open(path)
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+	syms, _ := f.DynamicSymbols()
+	for _, s := range syms {
+		if s.Section != elf.SHN_UNDEF && elf.ST_TYPE(s.Info) == elf.STT_FUNC {
+			out[s.Name] = true
+		}
+	}
+	return out
+}
+
+// tlsBinary is what analysis found in one binary: a Go crypto/tls
+// (milestone 6.3), or else a TLS stack linked in (6.4).
+type tlsBinary struct {
+	golang  *goTLSBinary
+	bundled *bundledTLS
+}
+
+// attachOwn probes the TLS stack the process's binary carries, if any,
+// and says what it found; nil: the binary carries none (a Go binary
+// without crypto/tls, or one that loads its TLS library).
+func (c *tlsCapture) attachOwn(pid uint32) ([]link.Link, *TLSProgramData) {
 	exe := fmt.Sprintf("/proc/%d/exe", pid)
-	bin, path := c.goBinary(exe)
-	if bin == nil || bin.Go == "" || bin.NoTLS {
+	bin, path := c.binary(exe)
+	var prog *TLSProgramData
+	switch {
+	case bin == nil:
+		return nil, nil
+	case bin.golang != nil && bin.golang.Go != "":
+		g := bin.golang
+		if g.NoTLS {
+			return nil, nil
+		}
+		prog = &TLSProgramData{Path: path, Stack: g.Go + " crypto/tls", Lib: g.Go, Reason: g.Reason}
+	case bin.bundled != nil:
+		b := bin.bundled
+		prog = &TLSProgramData{Path: path, Stack: b.Stack, Lib: b.Lib, Reason: b.Reason}
+	default:
 		return nil, nil
 	}
-	prog := &TLSProgramData{Path: path, Stack: bin.Go, Reason: bin.Reason}
-	if !bin.Probed() {
+	if prog.Reason != "" {
 		return nil, prog
 	}
 	// The binary as this process maps it, whatever its mount namespace.
@@ -311,36 +395,56 @@ func (c *tlsCapture) attachGo(pid uint32) ([]link.Link, *TLSProgramData) {
 		return nil, prog
 	}
 	var links []link.Link
-	for _, fn := range []struct {
-		f          goTLSFunc
-		entry, ret *ebpf.Program
-		name       string
-	}{{bin.Write, c.objs.GoWrite, c.objs.GoWriteRet, goTLSWrite}, {bin.Read, c.objs.GoRead, c.objs.GoReadRet, goTLSRead}} {
-		offs := append([]uint64{0}, fn.f.Rets...)
-		for i, off := range offs {
-			prog := fn.ret
-			if i == 0 {
-				prog = fn.entry
+	var aerr error
+	if g := bin.golang; g != nil && g.Go != "" {
+		// Entries, then return instructions as entry probes: a uretprobe
+		// breaks on Go's movable stacks. The cookie gives the direction.
+		var entries, eCookies, rets, rCookies []uint64
+		for _, fn := range []struct {
+			f   goTLSFunc
+			dir uint64
+		}{{g.Write, 1}, {g.Read, 2}} {
+			entries, eCookies = append(entries, fn.f.Entry), append(eCookies, fn.dir<<8)
+			for _, off := range fn.f.Rets {
+				rets, rCookies = append(rets, fn.f.Entry+off), append(rCookies, fn.dir<<8)
 			}
-			l, err := ex.Uprobe(fn.name, prog, &link.UprobeOptions{Address: fn.f.Entry, Offset: off, PID: int(pid)})
-			if err != nil {
-				for _, l := range links {
-					l.Close()
-				}
-				if errors.Is(err, unix.ESRCH) {
-					return nil, nil // gone
-				}
-				return nil, &TLSProgramData{Path: path, Stack: bin.Go, Reason: "attach: " + err.Error()}
-			}
-			links = append(links, l)
 		}
+		var l link.Link
+		if l, aerr = ex.UprobeMulti(nil, c.objs.GoEntry, &link.UprobeMultiOptions{Addresses: entries, Cookies: eCookies, PID: pid}); aerr == nil {
+			links = append(links, l)
+			if l, aerr = ex.UprobeMulti(nil, c.objs.GoReturn, &link.UprobeMultiOptions{Addresses: rets, Cookies: rCookies, PID: pid}); aerr == nil {
+				links = append(links, l)
+			}
+		}
+	} else {
+		var funcs []tlsFunc
+		var addrs []uint64
+		for _, f := range sslFuncs {
+			if a := bin.bundled.Syms[f.sym]; a != 0 { // an _ex form this OpenSSL may lack
+				funcs, addrs = append(funcs, f), append(addrs, a)
+			}
+		}
+		var ls []link.Link
+		if ls, aerr = c.attachC(ex, tlsLibBundled, funcs, addrs, pid); aerr == nil {
+			links = ls
+		}
+	}
+	if aerr != nil {
+		for _, l := range links {
+			l.Close()
+		}
+		if errors.Is(aerr, unix.ESRCH) {
+			return nil, nil // gone
+		}
+		prog.Reason = "attach: " + aerr.Error()
+		return nil, prog
 	}
 	prog.Probed = true
 	return links, prog
 }
 
-// goBinary analyses the binary at exe, once per file.
-func (c *tlsCapture) goBinary(exe string) (*goTLSBinary, string) {
+// binary analyses the binary at exe, once per file.
+func (c *tlsCapture) binary(exe string) (*tlsBinary, string) {
 	path, _ := os.Readlink(exe)
 	f, err := os.Open(exe)
 	if err != nil {
@@ -351,19 +455,24 @@ func (c *tlsCapture) goBinary(exe string) (*goTLSBinary, string) {
 	if syscall.Fstat(int(f.Fd()), &st) != nil {
 		return nil, path
 	}
-	k := goExeKey{uint64(st.Dev), st.Ino, st.Size, st.Mtim.Nano()}
+	k := exeKey{uint64(st.Dev), st.Ino, st.Size, st.Mtim.Nano()}
 	c.mu.Lock()
-	bin := c.goBins[k]
+	bin := c.bins[k]
 	c.mu.Unlock()
 	if bin != nil {
 		return bin, path
 	}
-	bin = analyzeGoTLS(f)
-	c.mu.Lock()
-	if len(c.goBins) >= maxGoBins {
-		clear(c.goBins)
+	bin = &tlsBinary{golang: analyzeGoTLS(f)}
+	if bin.golang.Go == "" {
+		if ef, err := elf.NewFile(f); err == nil {
+			bin.bundled = analyzeBundled(ef)
+		}
 	}
-	c.goBins[k] = bin
+	c.mu.Lock()
+	if len(c.bins) >= maxBins {
+		clear(c.bins)
+	}
+	c.bins[k] = bin
 	c.mu.Unlock()
 	return bin, path
 }
@@ -375,7 +484,7 @@ func (c *tlsCapture) onExit(pid uint32) {
 	delete(c.procs, pid)
 	c.mu.Unlock()
 	if p != nil {
-		for _, l := range append(p.lib, p.golang...) {
+		for _, l := range append(p.lib, p.own...) {
 			l.Close()
 		}
 	}
@@ -435,7 +544,7 @@ func (c *tlsCapture) Close() {
 	}
 	c.mu.Lock()
 	for pid, p := range c.procs {
-		for _, l := range append(p.lib, p.golang...) {
+		for _, l := range append(p.lib, p.own...) {
 			l.Close()
 		}
 		delete(c.procs, pid)

@@ -781,6 +781,7 @@ relying on it.
 | BPF LSM (`CONFIG_BPF_LSM`), active at boot | socket families, foreign sockets, Unix sockets, exec | 5.7 |
 | `bpf_d_path` | exec by resolved path | 5.10 |
 | `bpf_ima_file_hash`, the TAI clock | exec by content (`exec.allow[].hash`) | 5.18, 5.19 |
+| uprobe-multi links with cookies | TLS plaintext (`-uprobes`) | 6.6 |
 
 **Enabling BPF LSM.** Transparent mode works without it, but socket
 families, foreign sockets, Unix sockets and exec are then not governed. The
@@ -1126,6 +1127,9 @@ run's processes:
     other Go tools. Each Go binary a run executes is listed under
     `Programs with their own TLS` in `agentctl events`, as probed or not
     visible, with the reason (a Go version not yet tested, for instance).
+  - OpenSSL linked into a binary that exports it: official Node builds
+    (from nodejs.org, nvm, or the Docker `node` images), labelled with
+    the OpenSSL version.
 - **What is recorded.** Each request's method, host, path (without the
   query string) and status, and for MCP the JSON-RPC method and tool name.
   These go under `Seen in TLS plaintext` in `agentctl events`, and `tls` in
@@ -1138,8 +1142,9 @@ run's processes:
   about 5 µs in a VM. That is why it is per profile: turn it on for the runs
   you are learning from.
 - **Not seen:**
-  - other statically linked TLS stacks: Bun-built binaries (Claude Code
-    among them), rustls;
+  - other TLS stacks linked in: Bun-built binaries (Claude Code among
+    them), rustls, OpenSSL linked in without its symbols. These are listed
+    under `Programs with their own TLS` as not visible, with the reason;
   - Go binaries of other versions or architectures (listed as not
     visible);
   - a process that forks without exec (the child is not probed);
@@ -1282,7 +1287,8 @@ agentctl events --json <run-id>
 | A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
 | A run is revoked with "the node agent restarted and could not restore its policy" | Its grants could not be rebuilt after a restart: the reason follows. Start the run again. |
 | `grants: ... must be owned by root` at start | `<state-dir>/grants.json` has the wrong owner or mode. Fix it, or move it aside to start without restoring runs (they come back unprofiled). |
-| `Seen in TLS plaintext` is missing for a run under `observe.tls_plaintext` | The node runs without `-uprobes` (the receipt says so), or the client's TLS is not a shared OpenSSL, BoringSSL or GnuTLS nor Go's `crypto/tls` (Bun, rustls), or it forked without exec. A Go client of an untested version is listed under `Programs with their own TLS` with the reason. |
+| `Seen in TLS plaintext` is missing for a run under `observe.tls_plaintext` | The node runs without `-uprobes` (the receipt says so), or the client's TLS is not a shared OpenSSL, BoringSSL or GnuTLS nor Go's `crypto/tls` nor OpenSSL exported by the binary (Bun, rustls; listed under `Programs with their own TLS`), or it forked without exec. A Go client of an untested version is listed under `Programs with their own TLS` with the reason. |
+| The node agent refuses to start with `TLS capture needs uprobe-multi links (Linux 6.6)` | `-uprobes` needs Linux 6.6 or later. Run without it, or upgrade the kernel. |
 | `tls: pid N held at exec for over 1s without its probes; continued` | Attaching stalled or an event was lost: that process ran unobserved. |
 | A pinned binary fails with `Permission denied` after an upgrade (transparent) | Its content no longer matches the `hash` in `exec.allow`; the timeline's `exec_path` note names the content that ran. Add its `sha256sum` to the entry (up to four), then remove the old one. |
 | `exec hashes unavailable` in the node agent's log | The kernel lacks `bpf_ima_file_hash` (5.18) or the TAI clock (5.19), so exec is decided by path alone and enforcing profiles with hashes do not load. |
@@ -1392,7 +1398,14 @@ ignore the proxy, it checks:
   until probed), Python and git (GnuTLS) recorded with their statuses and
   without query strings; a Go client and its stripped build, the second
   started through `env`, probed and their HTTP/2 requests recorded; a run
-  under a profile that does not ask, not probed;
+  under a profile that does not ask, not probed. With `CLOVISOR_IT_NODE`
+  set to an official Node binary, its `fetch` recorded from the OpenSSL
+  linked into it. With `CLOVISOR_IT_RUSTLS` set to a rustls binary (such
+  as `uv`), it listed as not visible. With `CLOVISOR_IT_BUN` set to an
+  app compiled with `bun build --compile` that fetches its first argument,
+  its request got through and it listed as not visible.
+  `CLOVISOR_IT_LOG=1` prints the node agent's log even when the checks
+  pass;
 - restart: a run going across a node agent restart refused the same things
   after it as before (a path rule, an unlisted host and its name, an
   untrusted exec), a run revoked before it stayed revoked, `agentctl status`

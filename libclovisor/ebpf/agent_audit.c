@@ -2534,7 +2534,7 @@ struct tls_exec_event {
 struct tls_data_event {
     struct event_hdr hdr;
     __u32 dir;     /* 1 write, 2 read */
-    __u32 lib;     /* 1 OpenSSL or BoringSSL, 2 GnuTLS, 3 Go crypto/tls */
+    __u32 lib;     /* 1 OpenSSL or BoringSSL, 2 GnuTLS, 3 Go crypto/tls, 4 OpenSSL linked in */
     __u64 obj;     /* SSL *, gnutls_session_t or *tls.Conn: the connection */
     __u32 len;     /* bytes the call wrote or read */
     __u32 caplen;
@@ -2695,31 +2695,40 @@ static __always_inline int tls_done(void *m, __u32 dir, __u32 lib, __s64 ret, in
     return tls_emit(dir, lib, obj, buf, n);
 }
 
-SEC("uprobe")
-int BPF_UPROBE(tls_ssl_write, void *ssl, const void *buf, int num) { return tls_stash_call(&tls_writes, ssl, buf, 0); }
-SEC("uprobe")
-int BPF_UPROBE(tls_ssl_write_ex, void *ssl, const void *buf, __u64 num, __u64 *written) { return tls_stash_call(&tls_writes, ssl, buf, written); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_ssl_write_ret, int ret) { return tls_done(&tls_writes, 1, 1, ret, 0); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_ssl_write_ex_ret, int ret) { return tls_done(&tls_writes, 1, 1, ret, 1); }
-SEC("uprobe")
-int BPF_UPROBE(tls_ssl_read, void *ssl, void *buf, int num) { return tls_stash_call(&tls_reads, ssl, buf, 0); }
-SEC("uprobe")
-int BPF_UPROBE(tls_ssl_read_ex, void *ssl, void *buf, __u64 num, __u64 *readbytes) { return tls_stash_call(&tls_reads, ssl, buf, readbytes); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_ssl_read_ret, int ret) { return tls_done(&tls_reads, 2, 1, ret, 0); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_ssl_read_ex_ret, int ret) { return tls_done(&tls_reads, 2, 1, ret, 1); }
-/* gnutls_record_send/recv(session, data, size) return ssize_t. */
-SEC("uprobe")
-int BPF_UPROBE(tls_gnutls_send, void *sess, const void *buf, __u64 n) { return tls_stash_call(&tls_writes, sess, buf, 0); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_gnutls_send_ret, long ret) { return tls_done(&tls_writes, 1, 2, ret, 0); }
-SEC("uprobe")
-int BPF_UPROBE(tls_gnutls_recv, void *sess, void *buf, __u64 n) { return tls_stash_call(&tls_reads, sess, buf, 0); }
-SEC("uretprobe")
-int BPF_URETPROBE(tls_gnutls_recv_ret, long ret) { return tls_done(&tls_reads, 2, 2, ret, 0); }
+/* The C libraries' probes (6.2, 6.4): one entry and one return program,
+ * attached with uprobe-multi links per library and process. Each
+ * attachment's cookie says what it is:
+ *   bits 0-7   library: 1 libssl (OpenSSL or BoringSSL), 2 GnuTLS,
+ *              4 OpenSSL linked into the binary
+ *   bits 8-15  direction: 1 write, 2 read
+ *   bit 16     an _ex form, whose count is stored through its 4th argument
+ * SSL_write(ssl, buf, num), SSL_write_ex(ssl, buf, num, &written),
+ * gnutls_record_send(session, buf, size) and their read forms all take
+ * the connection and the buffer first. Multi links detach with one wait on
+ * the kernel each; one link per probe made a process's exit cost about
+ * 0.6 s of detaching, which held the next exec (6.4). */
+#define TLS_COOKIE_LIB(c) ((__u32)((c) & 0xff))
+#define TLS_COOKIE_DIR(c) ((__u32)(((c) >> 8) & 0xff))
+#define TLS_COOKIE_EX(c)  ((int)(((c) >> 16) & 1))
+
+SEC("uprobe.multi")
+int tls_c_entry(struct pt_regs *ctx)
+{
+    __u64 c = bpf_get_attach_cookie(ctx);
+    void *m = TLS_COOKIE_DIR(c) == 1 ? (void *)&tls_writes : (void *)&tls_reads;
+    return tls_stash_call(m, (void *)PT_REGS_PARM1(ctx), (const void *)PT_REGS_PARM2(ctx),
+                          TLS_COOKIE_EX(c) ? (void *)PT_REGS_PARM4(ctx) : 0);
+}
+
+SEC("uretprobe.multi")
+int tls_c_return(struct pt_regs *ctx)
+{
+    __u64 c = bpf_get_attach_cookie(ctx);
+    __u32 dir = TLS_COOKIE_DIR(c);
+    void *m = dir == 1 ? (void *)&tls_writes : (void *)&tls_reads;
+    __s64 ret = TLS_COOKIE_LIB(c) == 2 ? (__s64)PT_REGS_RC(ctx) : (__s64)(int)PT_REGS_RC(ctx);
+    return tls_done(m, dir, TLS_COOKIE_LIB(c), ret, TLS_COOKIE_EX(c));
+}
 
 /* Go crypto/tls (milestone 6.3): (*Conn).Write and (*Conn).Read, linked
  * into each Go binary. Go's register ABI (ABIInternal) passes the
@@ -2773,14 +2782,12 @@ static __always_inline int tls_go_return(struct pt_regs *ctx, __u32 dir)
     return tls_emit(dir, 3, obj, buf, (__s64)GO_ARG0(ctx));
 }
 
-SEC("uprobe")
-int tls_go_write(struct pt_regs *ctx) { return tls_go_enter(ctx, 1); }
-SEC("uprobe")
-int tls_go_write_ret(struct pt_regs *ctx) { return tls_go_return(ctx, 1); }
-SEC("uprobe")
-int tls_go_read(struct pt_regs *ctx) { return tls_go_enter(ctx, 2); }
-SEC("uprobe")
-int tls_go_read_ret(struct pt_regs *ctx) { return tls_go_return(ctx, 2); }
+/* Attached with uprobe-multi links: entries, and the return instructions
+ * (as entry probes), the cookie giving the direction. */
+SEC("uprobe.multi")
+int tls_go_entry(struct pt_regs *ctx) { return tls_go_enter(ctx, TLS_COOKIE_DIR(bpf_get_attach_cookie(ctx))); }
+SEC("uprobe.multi")
+int tls_go_ret(struct pt_regs *ctx) { return tls_go_return(ctx, TLS_COOKIE_DIR(bpf_get_attach_cookie(ctx))); }
 #endif
 
 char LICENSE[] SEC("license") = "GPL";

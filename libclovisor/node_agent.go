@@ -51,7 +51,7 @@ type NodeAgent struct {
 	uprobes    bool // TLS plaintext capture (milestone 6.2)
 	restored   RestoreReport
 	tlsParser  *tlsParser        // TLS plaintext (milestone 6.2)
-	tlsStacks  map[uint32]string // Go version, by probed process (milestone 6.3)
+	tlsStacks  map[uint32]string // a probed process's own TLS stack, as its records name it (milestones 6.3, 6.4)
 	tlsLibs    []string
 	relay      *QUICRelay
 	stopChan   chan bool
@@ -883,7 +883,7 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		lib := ""
 		if d, ok := event.Data.(TLSData); ok {
 			lib = d.Lib
-			if v := na.tlsStacks[event.PID]; lib == "go" && v != "" {
+			if v := na.tlsStacks[event.PID]; (lib == "go" || lib == "bundled") && v != "" {
 				lib = v
 			}
 			reqs = na.tlsParser.feed(event.PID, d.Obj, d.Write, d.Data, d.Len)
@@ -907,11 +907,11 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			return
 		}
 		if d.Probed {
-			na.tlsStacks[event.PID] = d.Stack
-			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s crypto/tls probed\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack)
+			na.tlsStacks[event.PID] = d.Lib
+			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s probed\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack)
 		} else {
 			delete(na.tlsStacks, event.PID)
-			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s crypto/tls not visible: %s\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack, d.Reason)
+			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s not visible: %s\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack, d.Reason)
 		}
 	case EventTLS:
 		d := event.Data.(TLSEventData)

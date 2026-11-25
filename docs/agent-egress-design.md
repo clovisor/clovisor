@@ -121,6 +121,7 @@ place:
 | Change | Where |
 |---|---|
 | Go `crypto/tls` probed in each Go binary a capturing run executes, go1.21 to go1.26, arm64 and amd64: functions found by symbol or by Go's function table, so stripped builds too; return probes on decoded return instructions; offsets checked against Go's prologue. Every exec in a capturing run is now reported, so a process that execs another binary gets it probed. Go binaries listed per run, probed or not visible and why. Found: stripped Go is visible after all; the function table's text address is not `.text`'s in an external link. | [6.3 status](#63-status-2026-11-25) |
+| Bundled stacks: OpenSSL linked into a binary and exported (official Node builds) probed in the binary itself, labelled by its banner; Bun's BoringSSL and rustls listed as not visible, with the reason. The Bun-built `claude` binary was not examined, but an app compiled with Bun was. Found: detaching one link per probe held the next exec up to 1.6 s, so all TLS probes are now uprobe-multi links (Linux 6.6 for `-uprobes`). | [6.4 status](#64-status-2026-11-25) |
 
 ---
 
@@ -4581,6 +4582,109 @@ Verified:
   a Go client and its stripped build, the second started through `env`,
   were probed, and their HTTP/2 requests recorded with statuses and
   without the query string.
+
+#### 6.4 status (2026-11-25)
+
+Implemented, under the same opt-in. For each exec in a capturing run that
+is not Go, the node agent also checks the binary for a TLS stack linked
+into it. A binary that loads libssl or GnuTLS is left to the library
+probes.
+
+- **Bundled OpenSSL, probed.** Official Node builds link OpenSSL in and
+  export `SSL_write`, `SSL_read` and their `_ex` forms from the binary.
+  The node agent finds them in its dynamic or static symbols and attaches
+  the libssl programs to the binary itself, per process and through the
+  same hold. An attach cookie tags these records, so they are labelled with
+  the stack's version from OpenSSL's banner (`OpenSSL 3.5.9`), not as
+  `libssl`. Node's export list is long (89,000 symbols), so the first exec
+  of a build costs about 65 ms of analysis; later ones hit the cache.
+- **Not visible, and said so.** Recorded under `Programs with their own
+  TLS`, as Go binaries are, with the reason:
+  - Bun (its `.bun` section): BoringSSL linked in without symbols;
+  - rustls (its crate path, which Rust keeps in panic locations, e.g.
+    `rustls 0.23.46` in `uv`): no stable symbols to probe;
+  - an OpenSSL banner or BoringSSL's name with no symbols: linked in
+    without its symbols.
+- **What is matched.** An OpenSSL banner must carry its version and date,
+  as libcrypto's does (`OpenSSL 3.5.9 29 Sep 2026`). Official Node also
+  contains the word BoringSSL, so a banner wins. Only `.rodata` is read.
+  The distribution's curl, Python, git, Node and docker show no marker.
+
+Found on the way:
+
+- **Detaching probes held the next exec.** Each uprobe link waits on the
+  kernel when closed. A process had 12 library probes, and a Go binary 17
+  more. Its exit cost about 0.6 s of detaching (measured: 580 ms for the
+  12). That ran alongside the next exec's attach and slowed it: holds of
+  0.3 to 1.6 s, and the 1 s watchdog released some processes unprobed.
+  6.3's stripped Go client in the integration test was one of them,
+  intermittently.
+
+  All probes are now uprobe-multi links, with one entry and one return
+  program each for the C libraries and for Go. An attach cookie per
+  function carries the library, the direction and the `_ex` form. A
+  process has two links per library and two for its own stack. Detaching
+  the library links takes about 40 ms, and holds in the integration test
+  dropped to under 10 ms, the longest 68 ms (official Node's first
+  analysis).
+- **Uprobe-multi needs Linux 6.6.** With older kernels `-uprobes` is
+  refused at start, naming the reason. Multi probes with a PID filter
+  survive exec, as single ones do: tested by attaching to a shell that
+  then execs Python.
+
+Not done:
+
+- **The Bun-built `claude` binary was not examined.** Claude Code's
+  auto-mode check refused to let the assistant building this milestone
+  inspect the Claude Code binary it runs in. Detection was checked
+  instead on an app compiled with `bun build --compile` from a Bun
+  release, once the operator allowed that one command. Like the runtime,
+  it keeps its `.bun` section, which holds the script, and BoringSSL's
+  name.
+- **Node's own HTTP/2 client** (`http2.connect`) goes through the same
+  `SSL_write`, so it should be seen like curl's. Only `fetch` (HTTP/1.1)
+  was run.
+
+Limits:
+
+- Other runtimes that link OpenSSL in without exporting it (some Electron
+  and Python distributions) are "linked in without its symbols".
+- Markers are strings in the binary: a stack renamed or with its banner
+  removed is not reported at all.
+
+Verified:
+
+- Unit tests build C binaries that:
+  - export OpenSSL's functions with a banner (probed, offsets as file
+    offsets, a missing `_ex` form skipped);
+  - carry a `.bun` section, a rustls crate path, or a banner alone (not
+    visible, each with its reason);
+  - only reference `SSL_write`, mention OpenSSL in prose, or load libssl
+    (none).
+
+  Banner and crate path parsing are tested too.
+- Offline, on release binaries checked against their published SHA-256:
+  - Node v22.23.5 (`OpenSSL 3.5.9, bundled`, four functions);
+  - Bun, and an app compiled with it (`Bun's BoringSSL`);
+  - uv (`rustls 0.23.46`);
+  - the distribution's binaries: none.
+- The four TLS probe programs load, at most 983 instructions. The object
+  compiles for x86.
+- `make integration-transparent`, twenty-nine checks. With optional
+  binaries named:
+  - `CLOVISOR_IT_NODE`, the official Node build: its `fetch` was probed in
+    the `node` binary and recorded as `OpenSSL 3.5.9, HTTP/1.1`;
+  - `CLOVISOR_IT_RUSTLS`, uv: listed as `rustls 0.23.46 not visible`;
+  - `CLOVISOR_IT_BUN`, the Bun-compiled app: its `fetch` got through, and
+    it was listed as `Bun's BoringSSL not visible`, with nothing in `Seen
+    in TLS plaintext`.
+
+  Without them, these checks are skipped. No process was held past the
+  watchdog. In one of five runs, the 6.1 restart check failed, under
+  `tp`, which does not capture. A run's first request, made before the
+  restart, got a 403 from the proxy with no decision logged by ext_proc.
+  It happened right after another run was revoked. The cause is not yet
+  found; it is open for 6.6.
 
 ---
 

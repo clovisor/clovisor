@@ -146,8 +146,8 @@ type RunSummary struct {
 	TLS        []TLSUse `json:"tls,omitempty"`
 	TLSDropped int      `json:"tls_dropped,omitempty"`
 	// TLSPrograms are the binaries exec'd in a capturing run with a TLS
-	// stack linked in (milestone 6.3: Go), and whether it was probed: at
-	// most MaxTLSPrograms.
+	// stack linked in (milestones 6.3 and 6.4: Go, bundled OpenSSL, Bun,
+	// rustls), and whether it was probed: at most MaxTLSPrograms.
 	TLSPrograms []TLSProgram `json:"tls_programs,omitempty"`
 	// Spend is the run's own budgeted model calls (milestone 5.4), by host
 	// and model: tokens, and cost at the node's prices.
@@ -204,7 +204,7 @@ type tlsKey struct{ host, method, path, mcp, tool string }
 // captures TLS plaintext, and whether that stack was probed.
 type TLSProgram struct {
 	Path   string `json:"path"`
-	Stack  string `json:"stack"` // e.g. go1.26.8
+	Stack  string `json:"stack"` // e.g. "go1.26.8 crypto/tls", "Bun's BoringSSL"
 	Probed bool   `json:"probed"`
 	Reason string `json:"reason,omitempty"` // why not
 	Execs  int    `json:"execs"`
@@ -1020,9 +1020,9 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			}
 			u = &TLSProgram{Path: d.Path, Stack: d.Stack, Probed: d.Probed, Reason: d.Reason}
 			st.tlsProg[k] = u
-			note := d.Stack + " crypto/tls probed"
+			note := d.Stack + " probed"
 			if !d.Probed {
-				note = d.Stack + " crypto/tls not visible: " + d.Reason
+				note = d.Stack + " not visible: " + d.Reason
 			}
 			st.add(TimelineEvent{Time: ev.Timestamp, Type: "tls-program", PID: ev.PID, CgroupID: ev.CgroupID,
 				Path: d.Path, Note: note}, r.MaxEvents)

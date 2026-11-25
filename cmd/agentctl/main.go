@@ -1007,7 +1007,7 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			if !p.Probed {
 				state = "not visible: " + p.Reason
 			}
-			fmt.Printf("  %-48s x%-4d %s crypto/tls %s\n", p.Path, p.Execs, p.Stack, state)
+			fmt.Printf("  %-48s x%-4d %s %s\n", p.Path, p.Execs, p.Stack, state)
 		}
 	}
 	if len(tl.Summary.Models) > 0 {

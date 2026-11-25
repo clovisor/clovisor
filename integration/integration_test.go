@@ -185,6 +185,23 @@ func (e *env) build() {
 			t.Fatalf("build %s: %v\n%s", name, err, out)
 		}
 	}
+	// Binaries with TLS linked in (milestone 6.4), if named: an official
+	// Node build (OpenSSL, exported), a rustls binary such as uv, and an
+	// app compiled with bun build --compile that fetches its first
+	// argument. Their checks are skipped otherwise.
+	for env, name := range map[string]string{"CLOVISOR_IT_NODE": "node-official", "CLOVISOR_IT_RUSTLS": "rustls-bin", "CLOVISOR_IT_BUN": "bun-app"} {
+		src := os.Getenv(env)
+		if src == "" {
+			continue
+		}
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("%s: %v", env, err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, name), data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// The QUIC client and server (milestone 5.6): a module of their own.
 	cmd := exec.Command("go", "build", "-o", filepath.Join(bin, "quictest"), ".")
 	cmd.Dir = filepath.Join(root, "integration", "quic")

@@ -2,5 +2,5 @@
 # Clovisor's own binaries are mounted in, not built here.
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client python3 python3-requests \
+ && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client python3 python3-requests libstdc++6 \
  && rm -rf /var/lib/apt/lists/*

@@ -971,7 +971,7 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			data = data[:e.Caplen]
 		}
 		ev.Type = EventTLSData
-		ev.Data = TLSData{Write: e.Dir == 1, Lib: map[uint32]string{1: "libssl", 2: "gnutls", 3: "go"}[e.Lib], Obj: e.Obj, Len: int(e.Len),
+		ev.Data = TLSData{Write: e.Dir == 1, Lib: map[uint32]string{1: "libssl", 2: "gnutls", 3: "go", 4: "bundled"}[e.Lib], Obj: e.Obj, Len: int(e.Len),
 			Data: append([]byte(nil), data...)}
 
 	case bpfEventRunStart, bpfEventRunEnd:
