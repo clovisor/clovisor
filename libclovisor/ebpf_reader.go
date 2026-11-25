@@ -621,7 +621,13 @@ type EBPFReader struct {
 	execProg *ebpf.Program
 	// heldLSM are the previous node agent's LSM links, kept attached
 	// until restored runs have their policy in the new maps.
-	heldLSM  []link.Link
+	heldLSM []link.Link
+	// restored is closed once runs that outlived the previous node agent
+	// have their grants back; with DeferBeat the heartbeat waits for it.
+	restored     chan struct{}
+	restoredOnce sync.Once
+	// tls is the TLS plaintext capture (milestone 6.2), or nil.
+	tls      *tlsCapture
 	lsmState string // what the socket hooks do, for status
 	execMu   sync.Mutex
 	execKeys map[uint64][]bpfExecKey // exec_allow entries written, per run
@@ -646,6 +652,7 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 		done:        make(chan struct{}),
 		transparent: t,
 		execKeys:    map[uint64][]bpfExecKey{},
+		restored:    make(chan struct{}),
 	}
 
 	if err := spec.LoadAndAssign(&r.objs, nil); err != nil {
@@ -670,6 +677,19 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 	if err := r.objs.Config.Put(uint32(0), cfg); err != nil {
 		r.Close()
 		return nil, fmt.Errorf("failed to write BPF config: %w", err)
+	}
+	if t.TLSCapture {
+		libs := t.TLSLibraries
+		if len(libs) == 0 {
+			libs = DefaultTLSLibraries()
+		}
+		replace := map[string]*ebpf.Map{"config": r.objs.Config, "events": r.objs.Events, "lost": r.objs.Lost,
+			"suppressed": r.objs.Suppressed, "run_budget": r.objs.RunBudget, "nested_run": r.objs.NestedRun,
+			"heartbeat": r.objs.Heartbeat}
+		if r.tls, err = newTLSCapture(spec, replace, libs); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 	// A heartbeat before any hook can see a connect, unless runs await
 	// their grants: then the heartbeat loop's first beat, once they have
@@ -787,6 +807,26 @@ func (r *EBPFReader) readLoop() {
 			continue
 		}
 
+		if r.tls != nil && len(rec.RawSample) >= 4 {
+			// Holding a process (milestone 6.2): attach without waiting
+			// for the events behind it.
+			switch binary.LittleEndian.Uint32(rec.RawSample) {
+			case bpfEventTLSExec:
+				var e bpfTLSExecEvent
+				if binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &e) == nil {
+					go r.tls.onExec(e.Hdr.PID, e.Held != 0)
+				}
+				continue
+			case bpfEventTLSExit:
+				var e bpfTLSExecEvent
+				if binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &e) == nil {
+					// Detaching waits on the kernel for each probe:
+					// not in the way of the next exec, held meanwhile.
+					go r.tls.onExit(e.Hdr.PID)
+				}
+			}
+		}
+
 		ev, err := r.decode(rec.RawSample)
 		if err != nil {
 			log.Printf("decode BPF event: %v", err)
@@ -890,6 +930,23 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			d.Hash = policy.FormatExecHash(e.Sha)
 		}
 		ev.Data = d
+
+	case bpfEventTLSExit:
+		ev.Type = EventTLSExit
+
+	case bpfEventTLSData:
+		var e bpfTLSDataHead
+		rd := bytes.NewReader(raw)
+		if err := binary.Read(rd, binary.LittleEndian, &e); err != nil {
+			return AuditEvent{}, err
+		}
+		data := raw[binary.Size(e):]
+		if int(e.Caplen) < len(data) {
+			data = data[:e.Caplen]
+		}
+		ev.Type = EventTLSData
+		ev.Data = TLSData{Write: e.Dir == 1, Lib: map[uint32]string{1: "libssl", 2: "gnutls"}[e.Lib], Obj: e.Obj, Len: int(e.Len),
+			Data: append([]byte(nil), data...)}
 
 	case bpfEventRunStart, bpfEventRunEnd:
 		var e bpfCgroupEvent
@@ -1060,6 +1117,45 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
+// TLS capture wire formats (agent_audit.c, milestone 6.2).
+const (
+	bpfEventTLSExec = 9
+	bpfEventTLSExit = 10
+	bpfEventTLSData = 11
+)
+
+type bpfTLSExecEvent struct {
+	Hdr  bpfEventHdr
+	Held uint32
+	_    uint32
+}
+
+type bpfTLSDataHead struct {
+	Hdr    bpfEventHdr
+	Dir    uint32
+	Lib    uint32
+	Obj    uint64
+	Len    uint32
+	Caplen uint32
+}
+
+// SetTLSCapture turns TLS plaintext capture on or off for a run, by its
+// policy run's cgroup. Without -uprobes it does nothing.
+func (r *EBPFReader) SetTLSCapture(runCg uint64, on bool) error {
+	if r.tls == nil {
+		return nil
+	}
+	return r.tls.setRun(runCg, on)
+}
+
+// TLSLibraries lists the TLS libraries probed, or nil without -uprobes.
+func (r *EBPFReader) TLSLibraries() []string {
+	if r.tls == nil {
+		return nil
+	}
+	return r.tls.Libraries()
+}
+
 // Exec programs (milestone 5.7): the sleepable one hashes files for
 // exec.allow entries with hashes; the other decides by path alone, for
 // kernels without bpf_ima_file_hash (5.18) or the TAI clock (5.19).
@@ -1116,12 +1212,14 @@ func ExecHashSupported(objPath string) bool {
 }
 
 // ReleaseHeldLSM detaches the previous node agent's LSM programs, once
-// the runs they governed have their policy in this one's maps.
+// the runs they governed have their policy in this one's maps, and lets
+// the heartbeat start (milestone 6.1).
 func (r *EBPFReader) ReleaseHeldLSM() {
 	for _, l := range r.heldLSM {
 		l.Close()
 	}
 	r.heldLSM = nil
+	r.restoredOnce.Do(func() { close(r.restored) })
 }
 
 // LSMState says what the BPF LSM socket hooks do on this node.
@@ -1203,6 +1301,14 @@ func (r *EBPFReader) heartbeatLoop() {
 	defer close(r.beatDone)
 	tick := time.NewTicker(r.transparent.Stale / 3)
 	defer tick.Stop()
+	if r.transparent.DeferBeat {
+		// No heartbeat until restored runs have their grants (6.1).
+		select {
+		case <-r.restored:
+		case <-r.done:
+			return
+		}
+	}
 	now := make(chan time.Time, 1)
 	now <- time.Now() // the first beat at once: with DeferBeat, nothing has beaten yet
 	for {
@@ -1343,6 +1449,9 @@ func (r *EBPFReader) Close() {
 			r.wg.Wait()
 		}
 		r.ReleaseHeldLSM()
+		if r.tls != nil {
+			r.tls.Close()
+		}
 		r.objs.Close()
 		r.lsm.Close()
 		if r.execProg != nil {

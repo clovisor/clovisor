@@ -102,6 +102,7 @@
  */
 
 #include <linux/bpf.h>
+#include <asm/ptrace.h> /* pt_regs for the uprobes (milestone 6.2) */
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
@@ -138,6 +139,9 @@
 #define EVENT_SOCKET    6
 #define EVENT_UNIX      7
 #define EVENT_EXEC_PATH 8
+#define EVENT_TLS_EXEC  9  /* a process to attach TLS probes to (milestone 6.2) */
+#define EVENT_TLS_EXIT  10 /* a process with TLS probes exited */
+#define EVENT_TLS_DATA  11 /* plaintext a TLS library wrote or read */
 
 /* CO-RE: only the fields we need; relocated against kernel BTF at load. */
 struct file;
@@ -2480,5 +2484,233 @@ int on_lsm_socket_sendmsg(__u64 *ctx)
         return lsm_prev(ret);
     return foreign_socket((struct socket *)ctx[0], SOCK_OP_SEND);
 }
+
+/* ---- TLS plaintext (milestone 6.2) ----
+ *
+ * For runs whose profile asks (observe.tls_plaintext) on nodes with
+ * -uprobes. Uprobes on a shared library trap in every process that maps
+ * it (6.0), so the node agent attaches them per process: on_tls_exec
+ * reports each exec in such a run, and while the node agent is alive
+ * stops the process (SIGSTOP) until its probes are attached and it is
+ * continued. The node agent also continues any process held for more than
+ * a second, so a lost event cannot leave one stopped. The probes copy
+ * bounded plaintext; nothing here decides anything.
+ */
+
+#define TLS_CAP_WRITE 2048 /* request lines and headers, an MCP call */
+#define TLS_CAP_READ  512  /* a status line or HEADERS frame */
+#define SIGSTOP_ 19
+
+/* Per policy run: capture TLS plaintext. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, __u8);
+} tls_capture SEC(".maps");
+
+/* Processes stopped at exec, by tgid: when (for the node agent's watchdog). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u32);
+    __type(value, __u64);
+} tls_held SEC(".maps");
+
+/* Processes with probes attached, by tgid (written by the node agent). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u8);
+} tls_pids SEC(".maps");
+
+struct tls_exec_event {
+    struct event_hdr hdr;
+    __u32 held;
+    __u32 _pad;
+};
+
+struct tls_data_event {
+    struct event_hdr hdr;
+    __u32 dir;     /* 1 write, 2 read */
+    __u32 lib;     /* 1 OpenSSL or BoringSSL, 2 GnuTLS */
+    __u64 obj;     /* SSL * or gnutls_session_t: the connection */
+    __u32 len;     /* bytes the call wrote or read */
+    __u32 caplen;
+    __u8  data[TLS_CAP_WRITE];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct tls_data_event);
+} tls_scratch SEC(".maps");
+
+struct tls_stash {
+    __u64 obj;
+    __u64 buf;
+    __u64 extra; /* the _ex forms: where the byte count is stored */
+};
+
+/* By pid_tgid: between a call's entry and its return. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, struct tls_stash);
+} tls_writes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, struct tls_stash);
+} tls_reads SEC(".maps");
+
+SEC("tp_btf/sched_process_exec")
+int on_tls_exec(__u64 *ctx)
+{
+    struct audit_config *cfg = get_config();
+    if (!cfg)
+        return 0;
+    __u64 run = current_run(cfg);
+    if (run == 0)
+        return 0;
+    __u64 prun = policy_run(cfg, run);
+    if (!bpf_map_lookup_elem(&tls_capture, &prun))
+        return 0;
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (bpf_map_lookup_elem(&tls_pids, &pid))
+        return 0; /* probes already attached: they survive exec */
+    struct tls_exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        note_lost(run);
+        return 0; /* not stopped: no one would continue it */
+    }
+    if (!fill_hdr(&e->hdr, EVENT_TLS_EXEC)) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
+    /* Stop it only while the node agent is alive to continue it. */
+    __u32 held = healthy(cfg);
+    e->held = held;
+    e->_pad = 0;
+    if (held) {
+        __u64 now = bpf_ktime_get_ns();
+        bpf_map_update_elem(&tls_held, &pid, &now, BPF_ANY);
+    }
+    bpf_ringbuf_submit(e, 0);
+    if (held)
+        bpf_send_signal(SIGSTOP_);
+    return 0;
+}
+
+SEC("tp_btf/sched_process_exit")
+int on_tls_exit(__u64 *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    if ((__u32)id != pid)
+        return 0; /* a thread, not the process */
+    if (bpf_map_delete_elem(&tls_pids, &pid) != 0)
+        return 0;
+    bpf_map_delete_elem(&tls_held, &pid);
+    struct tls_exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+    if (!fill_hdr(&e->hdr, EVENT_TLS_EXIT)) {
+        /* Its cgroup may be gone already: report it anyway. */
+        __builtin_memset(&e->hdr, 0, sizeof(e->hdr));
+        e->hdr.type = EVENT_TLS_EXIT;
+        e->hdr.pid = pid;
+    }
+    e->held = 0;
+    e->_pad = 0;
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+static __always_inline int tls_stash_call(void *m, void *obj, const void *buf, void *extra)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct tls_stash st = {.obj = (__u64)obj, .buf = (__u64)buf, .extra = (__u64)extra};
+    bpf_map_update_elem(m, &id, &st, BPF_ANY);
+    return 0;
+}
+
+/* At return: copy what the call wrote or read. Writes are taken at
+ * return, with the count written, because a call made before the
+ * handshake completes fails and is retried (6.0: Node). */
+static __always_inline int tls_done(void *m, __u32 dir, __u32 lib, __s64 ret, int ex)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct tls_stash *st = bpf_map_lookup_elem(m, &id);
+    if (!st)
+        return 0;
+    __u64 obj = st->obj, buf = st->buf, extra = st->extra;
+    bpf_map_delete_elem(m, &id);
+    __s64 n = ret;
+    if (ex) {
+        __u64 cnt = 0;
+        if (ret != 1 || bpf_probe_read_user(&cnt, sizeof(cnt), (void *)extra))
+            return 0;
+        n = cnt;
+    }
+    if (n <= 0)
+        return 0;
+    __u32 zero = 0;
+    struct tls_data_event *e = bpf_map_lookup_elem(&tls_scratch, &zero);
+    if (!e)
+        return 0;
+    if (!fill_hdr(&e->hdr, EVENT_TLS_DATA))
+        return 0;
+    __u32 cap = dir == 1 ? TLS_CAP_WRITE : TLS_CAP_READ;
+    __u32 cl = n > cap ? cap : (__u32)n;
+    if (cl > TLS_CAP_WRITE)
+        cl = TLS_CAP_WRITE;
+    e->dir = dir;
+    e->lib = lib;
+    e->obj = obj;
+    e->len = n > 0xffffffff ? 0xffffffff : (__u32)n;
+    if (bpf_probe_read_user(e->data, cl, (void *)buf))
+        cl = 0;
+    e->caplen = cl;
+    __u32 size = offsetof(struct tls_data_event, data) + cl;
+    if (size > sizeof(*e))
+        size = sizeof(*e);
+    if (!within_budget(e->hdr.run_cgroup_id, size))
+        return 0;
+    if (bpf_ringbuf_output(&events, e, size, 0))
+        note_lost(e->hdr.run_cgroup_id);
+    return 0;
+}
+
+SEC("uprobe")
+int BPF_UPROBE(tls_ssl_write, void *ssl, const void *buf, int num) { return tls_stash_call(&tls_writes, ssl, buf, 0); }
+SEC("uprobe")
+int BPF_UPROBE(tls_ssl_write_ex, void *ssl, const void *buf, __u64 num, __u64 *written) { return tls_stash_call(&tls_writes, ssl, buf, written); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_ssl_write_ret, int ret) { return tls_done(&tls_writes, 1, 1, ret, 0); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_ssl_write_ex_ret, int ret) { return tls_done(&tls_writes, 1, 1, ret, 1); }
+SEC("uprobe")
+int BPF_UPROBE(tls_ssl_read, void *ssl, void *buf, int num) { return tls_stash_call(&tls_reads, ssl, buf, 0); }
+SEC("uprobe")
+int BPF_UPROBE(tls_ssl_read_ex, void *ssl, void *buf, __u64 num, __u64 *readbytes) { return tls_stash_call(&tls_reads, ssl, buf, readbytes); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_ssl_read_ret, int ret) { return tls_done(&tls_reads, 2, 1, ret, 0); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_ssl_read_ex_ret, int ret) { return tls_done(&tls_reads, 2, 1, ret, 1); }
+/* gnutls_record_send/recv(session, data, size) return ssize_t. */
+SEC("uprobe")
+int BPF_UPROBE(tls_gnutls_send, void *sess, const void *buf, __u64 n) { return tls_stash_call(&tls_writes, sess, buf, 0); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_gnutls_send_ret, long ret) { return tls_done(&tls_writes, 1, 2, ret, 0); }
+SEC("uprobe")
+int BPF_UPROBE(tls_gnutls_recv, void *sess, void *buf, __u64 n) { return tls_stash_call(&tls_reads, sess, buf, 0); }
+SEC("uretprobe")
+int BPF_URETPROBE(tls_gnutls_recv_ret, long ret) { return tls_done(&tls_reads, 2, 2, ret, 0); }
 
 char LICENSE[] SEC("license") = "GPL";

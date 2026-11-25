@@ -125,6 +125,8 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-udp-allow ip:port,…` | UDP destinations runs may reach in transparent mode (NTP, say). All other UDP but DNS is refused. At most four. |
 | `-quic` | Relay QUIC (UDP 443) by server name in transparent enforce mode (§11 QUIC). Off by default: QUIC is refused and clients use TCP. |
 | `-quic-port 15443` | The QUIC relay's port, on `127.0.0.1` and `::1`. |
+| `-uprobes` | Record requests from the TLS plaintext of runs whose profile sets `observe.tls_plaintext` (§11 TLS plaintext). Cgroup identity; any transparent mode, or none. |
+| `-uprobe-libs path,…` | The TLS libraries to probe. Default: `libssl.so.3`, `libssl.so.1.1` and `libgnutls.so.30` in the usual library directories. |
 | `-dns-upstream ip:port,…` | Where the local resolver forwards allowed names. Default: the nameservers in `/etc/resolv.conf`. |
 
 Signals: `SIGHUP` reloads the policy directory (a bad edit is rejected and the
@@ -262,6 +264,7 @@ spec:
 | `icmp` | Ping (echo) destinations | the kernel, transparent mode | §11 |
 | `content` | Patterns in request bodies and query strings: deny, redact or record | the proxy, on hosts it terminates or that are plaintext | §10 |
 | `limits` | How long a run may last, how many connections a minute, how many bytes it may send | the node agent, the proxy, the kernel | below |
+| `observe` | Visibility only: `tls_plaintext` records requests from the TLS plaintext of the run's processes | uprobes, with the node's `-uprobes` | §11 TLS plaintext |
 
 A third kind of document, `ModelPrices`, holds the node's model prices
 (§6 Budgets). At most one per policy directory.
@@ -1102,6 +1105,48 @@ unknown behaviour: an allowed interpreter runs any code it is given (design
 - per-cgroup attachment of the LSM programs (`lsm_cgroup`). The hooks are
   global and stand down outside runs.
 
+### TLS plaintext (uprobes)
+
+For hosts the proxy does not terminate (`no_terminate`, clients that pin
+certificates, nodes with no node CA in the agents' trust), the timeline
+otherwise shows only the host. A profile can ask to see the requests:
+
+```yaml
+spec:
+  observe: { tls_plaintext: true }
+```
+
+With `-uprobes` on the node, the node agent probes the TLS libraries of that
+run's processes:
+- **What is covered.** OpenSSL, BoringSSL and GnuTLS as shared libraries:
+  curl, Python, the distribution's Node, git (GnuTLS on Debian and Ubuntu).
+- **What is recorded.** Each request's method, host, path (without the
+  query string) and status, and for MCP the JSON-RPC method and tool name.
+  These go under `Seen in TLS plaintext` in `agentctl events`, and `tls` in
+  the timeline. Bodies, headers and arguments are not kept.
+- **It never decides.** Nothing seen this way is refused; the proxy still
+  makes every decision. A run can avoid the probes by bringing its own TLS.
+- **What it costs.** Only the run's processes pay: the probes are attached
+  per process. Each exec in the run is held stopped until they are, about
+  1 to 15 ms. Each TLS call then costs a few microseconds more, measured at
+  about 5 µs in a VM. That is why it is per profile: turn it on for the runs
+  you are learning from.
+- **Not seen:**
+  - statically linked or stripped TLS stacks: Go programs, Bun-built
+    binaries (Claude Code among them), rustls;
+  - a process that forks without exec (the child is not probed);
+  - libraries at paths the node agent does not see (another mount
+    namespace's copies).
+- **learn and check.** For a host the proxy did not terminate, `learn` lists
+  the paths seen and writes them as a path rule left commented out, since
+  enabling it means terminating the host. `check` replays them as path rules
+  would decide them.
+- **Safety.** A process is held only while the node agent's heartbeat is
+  fresh. One held for more than a second is continued without its probes. A
+  restarted node agent continues processes left stopped in runs that capture.
+
+`agentctl status` lists the libraries probed (`TLS capture`).
+
 ## 12. Incident response
 
 ```sh
@@ -1228,6 +1273,8 @@ agentctl events --json <run-id>
 | A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
 | A run is revoked with "the node agent restarted and could not restore its policy" | Its grants could not be rebuilt after a restart: the reason follows. Start the run again. |
 | `grants: ... must be owned by root` at start | `<state-dir>/grants.json` has the wrong owner or mode. Fix it, or move it aside to start without restoring runs (they come back unprofiled). |
+| `Seen in TLS plaintext` is missing for a run under `observe.tls_plaintext` | The node runs without `-uprobes` (the receipt says so), or the client's TLS is not a shared OpenSSL, BoringSSL or GnuTLS (Go, Bun, rustls), or it forked without exec. |
+| `tls: pid N held at exec for over 1s without its probes; continued` | Attaching stalled or an event was lost: that process ran unobserved. |
 | A pinned binary fails with `Permission denied` after an upgrade (transparent) | Its content no longer matches the `hash` in `exec.allow`; the timeline's `exec_path` note names the content that ran. Add its `sha256sum` to the entry (up to four), then remove the old one. |
 | `exec hashes unavailable` in the node agent's log | The kernel lacks `bpf_ima_file_hash` (5.18) or the TAI clock (5.19), so exec is decided by path alone and enforcing profiles with hashes do not load. |
 | UDP tool fails with `Operation not permitted` (transparent) | UDP is refused except DNS, `-udp-allow`, and what both the ceiling's and the profile's `udp.allow` name. Check `udp_refused` and the connect events in the timeline. |
@@ -1331,6 +1378,11 @@ ignore the proxy, it checks:
   name resolved and the default's not, and a held request approved by the
   run's owner;
 - `check --transparent` on the recorded runs;
+- TLS plaintext with `-uprobes`: under a profile with
+  `observe.tls_plaintext`, requests from curl (three, each held at exec
+  until probed), Python and git (GnuTLS) recorded with their statuses and
+  without query strings; a run under a profile that does not ask, not
+  probed;
 - restart: a run going across a node agent restart refused the same things
   after it as before (a path rule, an unlisted host and its name, an
   untrusted exec), a run revoked before it stayed revoked, `agentctl status`

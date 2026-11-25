@@ -48,6 +48,17 @@ type Spec struct {
 	// Ask is the default for ask rules, mode ask and sampling ask
 	// (milestone 5.5).
 	Ask *Ask `yaml:"ask,omitempty" json:"ask,omitempty"`
+	// Observe asks for visibility that costs the run (milestone 6.2).
+	Observe *Observe `yaml:"observe,omitempty" json:"observe,omitempty"`
+}
+
+// Observe is the observe block: audit only, never a decision.
+type Observe struct {
+	// TLSPlaintext records requests from the TLS plaintext of the run's
+	// processes, through uprobes on their TLS libraries, where the node
+	// runs with -uprobes. It costs every TLS call of those processes a few
+	// microseconds, and each exec up to about 15 ms.
+	TLSPlaintext bool `yaml:"tls_plaintext,omitempty" json:"tls_plaintext,omitempty"`
 }
 
 // Egress is the egress block.

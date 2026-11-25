@@ -48,7 +48,10 @@ type NodeAgent struct {
 	lsm        bool
 	quic       bool
 	execHash   bool // the kernel's exec hook hashes files (milestone 5.7)
+	uprobes    bool // TLS plaintext capture (milestone 6.2)
 	restored   RestoreReport
+	tlsParser  *tlsParser // TLS plaintext (milestone 6.2)
+	tlsLibs    []string
 	relay      *QUICRelay
 	stopChan   chan bool
 	handled    chan struct{} // closed when handleEvents has drained
@@ -203,7 +206,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	// Whether exec.allow hashes can be verified decides how profiles
 	// compile, so it is probed before they load.
 	t.ExecHash = lsm && ExecHashSupported(opts.BPFObjPath)
-	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsm, quic, t.ExecHash)
+	if t.TLSCapture && credential {
+		return nil, fmt.Errorf("-uprobes needs cgroup identity: probes are attached to a run's processes")
+	}
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsm, quic, t.ExecHash, t.TLSCapture)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +425,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		lsm:        lsm,
 		quic:       quic,
 		execHash:   t.ExecHash,
+		uprobes:    t.TLSCapture,
 		relay:      relay,
+		tlsParser:  newTLSParser(),
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -437,9 +445,12 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	// Per-run kernel policy: UDP and ICMP in transparent mode (milestone
 	// 4.7), and with BPF LSM, Unix sockets and exec. The LSM writers do
 	// nothing where it is not loaded.
-	if r := audit.reader; r != nil && !credential && t.Mode != TransparentOff {
+	if r := audit.reader; r != nil && !credential && (t.Mode != TransparentOff || t.TLSCapture) {
 		api.OnPolicy = func(runCg uint64, uid int, eff *policy.Effective, nested bool) error {
 			var errs []error
+			if err := r.SetTLSCapture(runCg, eff.CapturesTLS()); err != nil {
+				errs = append(errs, fmt.Errorf("tls capture: %w", err))
+			}
 			if err := r.SetNetPolicy(runCg, eff.Net()); err != nil {
 				errs = append(errs, fmt.Errorf("udp and icmp: %w", err))
 			}
@@ -463,7 +474,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			}
 			return err
 		}
-		api.OnNestedEnd = r.ForgetNestedRun
+		api.OnNestedEnd = func(runCg uint64) {
+			r.ForgetNestedRun(runCg)
+			r.SetTLSCapture(runCg, false)
+		}
 	}
 	if xp != nil && resolver != nil {
 		xp.Names = resolver.NamesFor
@@ -541,7 +555,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic, na.execHash)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic, na.execHash, na.uprobes)
 	if err != nil {
 		return err
 	}
@@ -671,12 +685,13 @@ func lsmFor(t TransparentOptions, credential bool) bool {
 	return !credential && t.Mode != TransparentOff && BPFLSMActive()
 }
 
-func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic, execHash bool) (*policy.Set, error) {
+func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic, execHash, uprobes bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
-	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic, ExecHash: execHash}, os.Geteuid() == 0)
+	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic, ExecHash: execHash,
+		Uprobes: uprobes}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -860,6 +875,32 @@ func (na *NodeAgent) StopSignal() {
 func (na *NodeAgent) processEvent(event AuditEvent) {
 	ts := event.Timestamp.Format(time.RFC3339Nano)
 	switch event.Type {
+	case EventTLSData, EventTLSExit:
+		// TLS plaintext (milestone 6.2): parsed here, never recorded.
+		var reqs []TLSRequest
+		lib := ""
+		if d, ok := event.Data.(TLSData); ok {
+			lib = d.Lib
+			reqs = na.tlsParser.feed(event.PID, d.Obj, d.Write, d.Data, d.Len)
+		} else {
+			reqs = na.tlsParser.close(event.PID)
+		}
+		for _, r := range reqs {
+			ev := event
+			ev.Type, ev.Data = EventTLS, TLSEventData{TLSRequest: r, Lib: lib}
+			if lib == "" {
+				ev.Data = TLSEventData{TLSRequest: r, Lib: "libssl"}
+			}
+			na.processEvent(ev)
+		}
+		return
+	case EventTLS:
+		d := event.Data.(TLSEventData)
+		extra := ""
+		if d.Tool != "" {
+			extra = " mcp=" + d.MCPMethod + ":" + d.Tool
+		}
+		fmt.Printf("%s [TLS] run=%d pid=%d %s %s %s%s status=%d (%s)%s\n", ts, event.RunCgroupID, event.PID, d.Proto, d.Method, d.Host, d.Path, d.Status, d.Lib, extra)
 	case EventExec:
 		d := event.Data.(ExecData)
 		fmt.Printf("%s [EXEC] run=%d cgroup=%d pid=%d ppid=%d binary=%s args=%q\n",
@@ -1012,6 +1053,7 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			na.audit.reader.ForgetExecPolicy(event.RunCgroupID)
 			na.audit.reader.ForgetNestedRun(event.RunCgroupID)
 			na.audit.reader.ForgetNetPolicy(event.RunCgroupID)
+			na.audit.reader.SetTLSCapture(event.RunCgroupID, false)
 		}
 		fmt.Printf("%s [RUN END] run=%d path=%s\n", ts, event.RunCgroupID, event.Data.(RunData).CgroupPath)
 	}
@@ -1116,6 +1158,9 @@ func (na *NodeAgent) Status() NodeStatus {
 		s.ActiveRuns = na.api.ActiveRuns()
 		if r := na.restored; r.Restored+r.Gone > 0 {
 			s.Restored = r.String()
+		}
+		if na.audit != nil && na.audit.reader != nil {
+			s.TLSCapture = na.audit.reader.TLSLibraries()
 		}
 	}
 	return s

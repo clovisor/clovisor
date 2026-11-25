@@ -528,6 +528,17 @@ func LimitedProfile(msg string) *CompiledProfile {
 	return cp
 }
 
+// CapturesTLS says whether any layer asks for TLS plaintext (milestone
+// 6.2). Observation is not a permission, so one layer suffices.
+func (e *Effective) CapturesTLS() bool {
+	for _, l := range e.Layers {
+		if l.Profile.CapturesTLS() {
+			return true
+		}
+	}
+	return false
+}
+
 // UnixAllow is the run's effective unix.allow for uid: the intersection
 // across its enforce-mode layers, with {uid} filled in. A run with no
 // enforce layer has none (and nothing is refused: audit layers only

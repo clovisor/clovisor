@@ -81,6 +81,7 @@ func TestTransparent(t *testing.T) {
 	t.Run("host-daemons", e.testHostDaemons)
 	t.Run("exec", e.testExec)
 	t.Run("exec-hash", e.testExecHash)
+	t.Run("tls-plaintext", e.testTLSPlaintext)
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
@@ -146,7 +147,7 @@ func (e *env) startNodeAgent() {
 		"echo $$ > /run/node-agent.pid; exec /it/bin/node-agent -identity cgroup -bpf /it/bin/agent_audit.o"+
 			" -agents-cgroup "+e.agentsCgroup()+
 			" -policy-dir /etc/clovisor/policy -proxy-listen 127.0.0.1:18000 -envoy-upstream-ca /run/clovisor/upstream.pem"+
-			" -transparent enforce -quic -udp-allow "+e.originIP+":5000 >> /var/log/node-agent.log 2>&1")
+			" -transparent enforce -quic -uprobes -udp-allow "+e.originIP+":5000 >> /var/log/node-agent.log 2>&1")
 }
 
 // startTransparent brings up the origin (TLS, a banner port, a UDP echo),
@@ -518,6 +519,44 @@ cp /it/bin/pinned.sh /tmp/h/pinned.sh && /tmp/h/pinned.sh && echo "tmp restored:
 	}
 	out, _ = e.agentRun("tp-hash", `/it/bin/pinned.sh && echo "bin restored: ran"`)
 	expect(t, out, "bin restored: ran")
+}
+
+func (e *env) testTLSPlaintext(t *testing.T) {
+	// Milestone 6.2: under tp-observe, requests from curl (OpenSSL), Python
+	// (OpenSSL, loaded at import) and git (GnuTLS, through libcurl-gnutls)
+	// are read from their TLS plaintext. Each process is held at exec
+	// until its probes are attached, so even curl, which is done in
+	// milliseconds, is seen. A run under tp, which does not ask, is not.
+	status, _, _ := e.sh("/it/bin/agentctl status")
+	expect(t, status, "TLS capture   for profiles that ask: ", "libssl.so.3", "libgnutls.so.30")
+	s := e.script("tlscap", `for i in 1 2 3; do curl -s -o /dev/null -w "curl$i %{http_code}\n" "https://origin.test/allowed?try=$i"; done
+python3 -c 'import urllib.request; print("python", urllib.request.urlopen("https://origin.test/headers").status)'
+git ls-remote https://origin.test/repo.git >/dev/null 2>&1; echo "git done"
+`)
+	out, id := e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
+	expect(t, out, "curl1 200", "curl2 200", "curl3 200", "python 200", "git done")
+	tl := e.timeline(id) // once the run's end is recorded
+	shown, _, err := e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Seen in TLS plaintext (3)")
+	sec := shown[strings.Index(shown, "Seen in TLS plaintext"):]
+	sec = sec[:strings.Index(sec, "Via proxy")]
+	if !regexp.MustCompile(`GET origin.test/allowed +x3 +200 x3 \(libssl, HTTP/2\)`).MatchString(sec) ||
+		!strings.Contains(sec, "GET origin.test/headers") || !regexp.MustCompile(`repo.git/info/refs .*\(gnutls, `).MatchString(sec) {
+		t.Errorf("TLS plaintext section:\n%s", sec)
+	}
+	if strings.Contains(sec, "try=") {
+		t.Errorf("a query string was kept:\n%s", sec)
+	}
+	expect(t, tl, `"type": "tls"`, `seen in the process (libssl, `)
+
+	out, id = e.trun(`curl -s -o /dev/null -w "plain %{http_code}\n" https://origin.test/allowed`)
+	expect(t, out, "plain 200")
+	if tl := e.timeline(id); strings.Contains(tl, `"tls"`) {
+		t.Errorf("a run whose profile does not ask was captured:\n%s", tl)
+	}
 }
 
 func (e *env) testToolCalls(t *testing.T) {

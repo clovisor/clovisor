@@ -29,7 +29,26 @@ const (
 	EventContent  // content rules matched a request, or its body could not be checked (milestone 5.1)
 	EventModel    // a request a model rule decided, and the model it named (milestone 5.3)
 	EventUsage    // a budgeted model call's usage and what it was charged (milestone 5.4)
+	EventTLSData  // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
+	EventTLSExit  // a process with TLS probes exited
+	EventTLS      // a request parsed from TLS plaintext
 )
+
+// TLSEventData is a request parsed from TLS plaintext, for the recorder.
+type TLSEventData struct {
+	TLSRequest
+	Lib string
+}
+
+// TLSData is one TLS call's captured plaintext: at most its first few
+// kilobytes, of Len.
+type TLSData struct {
+	Write bool
+	Lib   string // libssl (OpenSSL or BoringSSL), gnutls
+	Obj   uint64 // the library's connection object
+	Len   int
+	Data  []byte
+}
 
 // ExecPathData is what the exec hook saw: the resolved path the kernel ran,
 // whether it passed the trusted-path test, and the verdict. Reported once

@@ -550,6 +550,9 @@ func showStatus() error {
 	if s.Restored != "" {
 		fmt.Printf("Restored      %s at start\n", s.Restored)
 	}
+	if len(s.TLSCapture) > 0 {
+		fmt.Printf("TLS capture   for profiles that ask: %s\n", strings.Join(s.TLSCapture, ", "))
+	}
 	fmt.Printf("Lost events   %d (ring buffer full), %d suppressed (a run over its event budget)\n", s.LostEvents, s.SuppressedEvents)
 	return nil
 }
@@ -835,6 +838,8 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			detail += " (" + e.Note + ")"
 		case "usage":
 			detail = fmt.Sprintf("%s %s:%d%s model %q: %s", e.Method, e.DstName, e.DstPort, e.Path, e.Model, e.Note)
+		case "tls":
+			detail = fmt.Sprintf("%s %s%s (%s)", e.Method, e.DstName, e.Path, e.Note)
 		case "model":
 			detail = fmt.Sprintf("%s %s:%d%s -> %s", e.Method, e.DstName, e.DstPort, e.Path, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -967,6 +972,30 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			}
 			fmt.Printf("  %-28s %-28s x%-4d %d in, %d out, %d cache, $%.4f%s\n", u.Host, strconv.Quote(u.Model), u.Requests,
 				u.Usage.Input, u.Usage.Output, u.Usage.CacheRead+u.Usage.CacheWrite, u.CostUSD, note)
+		}
+	}
+	if len(tl.Summary.TLS) > 0 {
+		fmt.Printf("Seen in TLS plaintext (%d)\n", len(tl.Summary.TLS))
+		for _, u := range tl.Summary.TLS {
+			var sts []string
+			for st, n := range u.Statuses {
+				if st == 0 {
+					sts = append(sts, fmt.Sprintf("no response %d", n))
+				} else {
+					sts = append(sts, fmt.Sprintf("%d x%d", st, n))
+				}
+			}
+			sort.Strings(sts)
+			what := ""
+			if u.Tool != "" {
+				what = " MCP " + u.MCPMethod + " " + u.Tool
+			} else if u.MCPMethod != "" {
+				what = " MCP " + u.MCPMethod
+			}
+			fmt.Printf("  %-48s x%-4d %s (%s, %s)%s\n", u.Method+" "+u.Host+u.Path, u.Requests, strings.Join(sts, ", "), u.Lib, u.Proto, what)
+		}
+		if tl.Summary.TLSDropped > 0 {
+			fmt.Printf("  (%d more requests past the per-run cap, not listed)\n", tl.Summary.TLSDropped)
 		}
 	}
 	if len(tl.Summary.Models) > 0 {

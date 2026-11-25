@@ -64,6 +64,9 @@ type Options struct {
 	// QUIC: transparent enforce relays QUIC by server name (milestone
 	// 5.6, node -quic); otherwise UDP 443 is refused like other UDP.
 	QUIC bool
+	// Uprobes: the node captures TLS plaintext for runs that ask
+	// (milestone 6.2, node -uprobes).
+	Uprobes bool
 	// ExecHash: the kernel's exec hook hashes files (milestone 5.7:
 	// bpf_ima_file_hash, Linux 5.18, and the TAI clock, 5.19), so
 	// exec.allow hashes are verified where exec is enforceable.
@@ -292,6 +295,7 @@ func (c *compiler) profile(p *AgentProfile) *CompiledProfile {
 				"forwarded to the address the name resolves to, not the one the run chose"}})
 	}
 	c.exec(p, cp)
+	c.observe(p, cp)
 	c.mcp(p, cp)
 	c.unix(p, cp)
 	c.net(p, cp)
@@ -515,6 +519,32 @@ func mayCarryRawTCP(ports []uint16) bool {
 		}
 	}
 	return false
+}
+
+// observe places the observe block (milestone 6.2): visibility only.
+func (c *compiler) observe(p *AgentProfile, cp *CompiledProfile) {
+	o := p.Spec.Observe
+	if o == nil || !o.TLSPlaintext {
+		return
+	}
+	pl := Placement{Rule: "observe/tls-plaintext", Tier: "audit",
+		EnforcedBy: "uprobes on OpenSSL, BoringSSL and GnuTLS in the run's processes",
+		Notes: []string{"visibility only: requests are recorded, never decided",
+			"each TLS call of the run's processes costs a few microseconds, and each exec up to about 15 ms"}}
+	switch {
+	case !c.opts.Linux:
+		pl.EnforcedBy, pl.Notes = "not observed: needs the Linux node agent", nil
+	case !c.opts.Uprobes:
+		pl.EnforcedBy, pl.Notes = "not observed: needs the node agent's -uprobes", nil
+	default:
+		pl.Notes = append(pl.Notes, "not seen: statically linked or stripped TLS stacks (Go, Bun, rustls), and forked children that do not exec")
+	}
+	cp.Placements = append(cp.Placements, pl)
+}
+
+// CapturesTLS says whether the profile asks for TLS plaintext.
+func (cp *CompiledProfile) CapturesTLS() bool {
+	return cp.Profile != nil && cp.Profile.Spec.Observe != nil && cp.Profile.Spec.Observe.TLSPlaintext
 }
 
 func (c *compiler) exec(p *AgentProfile, cp *CompiledProfile) {

@@ -114,6 +114,7 @@ place:
 | Phase 6 broken into milestones: restart recovery first, since a restarted node agent forgets what runs were granted; then TLS uprobes for visibility only, per library (libssl, Go, Node and Bun), capturing request lines and headers, not bodies. | [Phase 6 plan](#phase-6-plan-2026-11-24) |
 | 6.0 spikes: a node agent restart lifts every rule from runs in progress, revocations included; uprobes read requests from libssl, GnuTLS and Go 1.25 and 1.26 but tax every process using the library unless attached per process, which needs each exec held until attached; the Bun-built `claude` binary cannot be hooked; about 5 µs per TLS call in a VM. | [6.0 spike results](#60-spike-results-2026-11-24) |
 | Restart recovery: live runs' grants kept in a root-owned file at each change and restored, bound version and kernel state included, before the first heartbeat; old LSM links kept until then; unrestorable runs revoked; `agentctl run` reconnects to report the exit code. Found: status said healthy before the first heartbeat. | [6.1 status](#61-status-2026-11-24) |
+| TLS plaintext (opt-in: node `-uprobes`, profile `observe.tls_plaintext`): probes on OpenSSL, BoringSSL and GnuTLS attached per process, each exec held until they are; HTTP/1.1 and HTTP/2 requests and MCP calls recorded, never decided; learn drafts commented path rules, check replays them. Found: the 6.1 heartbeat beat before restore. | [6.2 status](#62-status-2026-11-24) |
 
 ---
 
@@ -4366,6 +4367,112 @@ Verified:
   - status reported 2 runs restored;
   - `agentctl run` reported the exit code;
   - the timeline lists the restore.
+
+#### 6.2 status (2026-11-24)
+
+Implemented, with cgroup identity, in any transparent mode or none:
+
+- **Opt-in twice.** The node runs with `-uprobes` (and `-uprobe-libs` to
+  name the libraries). A profile asks with `observe: { tls_plaintext: true
+  }`: any layer asking is enough, since observing is not a permission.
+  The receipt places it as audit, and says when the node cannot observe.
+- **Per process, held at exec.**
+  - The node agent marks capturing runs in a kernel map.
+  - On each exec in one, `on_tls_exec` reports the process and, while the
+    node agent's heartbeat is fresh, stops it.
+  - The node agent attaches entry and return probes for that process to
+    `SSL_write`, `SSL_write_ex`, `SSL_read`, `SSL_read_ex`,
+    `gnutls_record_send` and `gnutls_record_recv` in the libraries it
+    found, then continues it.
+  - Probes survive later execs of the same process, and are detached when
+    it exits.
+  - A watchdog continues any process held longer than a second. The node
+    agent continues held processes when it stops. A restarted one continues
+    stopped processes in restored runs that capture.
+- **Capture.** Writes are copied at return (up to 2 KB), reads too (up to
+  512 bytes), through the shared ring buffer and the run's event budget.
+- **Parsing,** in the node agent:
+  - HTTP/1.1 from the start of each call;
+  - HTTP/2 frames across calls, with HPACK per direction, and bytes past a
+    call's capture skipped by frame length;
+  - a connection whose frame sync or header table is lost is given up,
+    not guessed at;
+  - requests paired with responses, in order for HTTP/1.1 and by stream for
+    HTTP/2;
+  - for a JSON body within the capture, the JSON-RPC method and the tool a
+    `tools/call` names.
+
+  Only method, host, path without the query, status, and the MCP method
+  and tool are kept.
+- **Records.** A `tls` event per request. In the summary, `tls` entries by
+  host, method, path and tool, with counts per status, at most 256 per run.
+  `agentctl events` lists them under `Seen in TLS plaintext`, and
+  `agentctl status` names the libraries probed.
+- **learn and check.** For a host the proxy did not terminate:
+  - `learn` lists the requests seen under its rule, and writes the paths as
+    an `http: { paths: [...] }` left commented out;
+  - `check` replays them as path rules decide (`... (seen in the process)`).
+
+  Hosts the proxy terminated are left to the proxy's own records.
+
+Found on the way:
+
+- **A 6.1 ordering bug.** The heartbeat loop starts when BPF is loaded, not
+  when the node agent starts. Once 6.1 made it beat at once, it beat before
+  restored runs had their grants. Nothing served yet, so nothing passed,
+  but the ordering claimed was not the one in force. With runs to restore,
+  the loop now waits until the restore releases it.
+- **Detaching probes is slow.** Each detach waits on the kernel. Done in
+  the event loop, it delayed the next exec event, whose process sat held:
+  about 400 ms per curl in a loop. It is done aside now; the test's curls
+  are about 50 ms apart, the curl itself included.
+- **The spike's HTTP/2 parser counted lost bytes twice.** The rest of a
+  frame cut off by the capture was skipped once as the frame's remainder
+  and again as uncaptured bytes. The spike's bulk test was not HTTP/2, so
+  it never showed.
+
+Decisions:
+
+- **MCP names from the body.** The plan kept capture to request lines and
+  headers. An MCP call's tool is in its body, so the JSON-RPC method and
+  tool are read from a body that fits in the capture. The arguments are
+  not kept.
+- **Commented path rules.** Enabling a path rule makes the proxy terminate
+  the host, which its rule may have avoided on purpose, so learn leaves the
+  choice to the operator.
+- **Hold every exec of a capturing run.** Telling in advance which binaries
+  will load a TLS library misses `dlopen` (Python loads `_ssl` at import).
+  The cost falls only on runs that asked.
+
+Limits:
+
+- Statically linked or stripped stacks (Go, Bun, rustls) are not seen. Go
+  is 6.3.
+- A process that forks without exec is not probed: probes do not follow
+  `fork`.
+- Libraries are found as the node agent sees the filesystem, so a run in
+  another mount namespace with its own libssl is not probed.
+- A held process is visible to a parent that waits for stops, or to a
+  debugger.
+
+Verified:
+
+- Unit tests:
+  - HTTP/1.1 with an MCP body, a body-only call, an interim 100 and a
+    request with no response at exit;
+  - HTTP/2 from the real framer, with a header block split across calls, a
+    100 KB DATA frame cut off at the capture, and responses read 7 bytes at
+    a time;
+  - timeline records and notes; learn's commented path rule; check
+    replaying an allowed and a refused path; the receipt with and without
+    `-uprobes`.
+- All capture programs load (at most 531 instructions).
+- `make integration-transparent`, now twenty-eight checks, with `-uprobes`.
+  Under `tp-observe`:
+  - three curls (each held at exec until probed), Python's urllib and git's
+    `ls-remote` (GnuTLS) were recorded with their statuses, HTTP/2 and
+    HTTP/1.1, without the query string;
+  - a run under `tp`, which does not ask, had no TLS records.
 
 ---
 

@@ -348,6 +348,13 @@ func (s *RunAPIServer) adopt(g runGrant, path string, eff *policy.Effective) {
 			log.Printf("run api: restored run %s: kernel policy: %v", g.RunID, err)
 		}
 	}
+	if eff != nil && eff.CapturesTLS() {
+		// The previous node agent may have died holding a process at
+		// exec (milestone 6.2).
+		if n := ContinueStopped(path); n > 0 {
+			log.Printf("run api: restored run %s: continued %d stopped processes", g.RunID, n)
+		}
+	}
 	what := "unprofiled"
 	if eff != nil {
 		var names []string

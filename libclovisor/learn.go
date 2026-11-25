@@ -101,6 +101,10 @@ type Draft struct {
 	execHashes   map[string][]string
 	execUnpinned []string // pinned paths with more contents than exec.allow holds
 
+	// Requests seen in TLS plaintext (milestone 6.2), by host: "METHOD
+	// /path", with an MCP tool where there was one.
+	tlsSeen map[string]map[string]bool
+
 	// Models (milestone 5.3), by rule name.
 	ruleModels    map[string]*draftModel
 	modelsDropped int
@@ -347,9 +351,65 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 			d.Profile.Spec.Exec.Allow = append(d.Profile.Spec.Exec.Allow, a)
 		}
 	}
+	d.tlsSeen = map[string]map[string]bool{}
+	for _, tl := range runs {
+		for _, u := range tl.Summary.TLS {
+			if u.Host == "" {
+				continue
+			}
+			if d.tlsSeen[u.Host] == nil {
+				d.tlsSeen[u.Host] = map[string]bool{}
+			}
+			k := u.Method + " " + u.Path
+			if u.Tool != "" {
+				k += " (MCP tools/call " + u.Tool + ")"
+			} else if u.MCPMethod != "" {
+				k += " (MCP " + u.MCPMethod + ")"
+			}
+			d.tlsSeen[u.Host][k] = true
+		}
+	}
 	d.learnModels(runs)
 	d.learnMCP(runs)
 	return d
+}
+
+// maxTLSPathsDrafted bounds the paths a draft lists per host from TLS
+// plaintext.
+const maxTLSPathsDrafted = 20
+
+// writeTLSSeen writes the requests seen in a host's TLS plaintext as a
+// path rule left commented out: enforcing one makes the proxy terminate
+// the host, which its rule may have been chosen to avoid.
+func (d *Draft) writeTLSSeen(p func(string, ...interface{}), host string) bool {
+	seen := sortedSet(d.tlsSeen[host])
+	if len(seen) == 0 {
+		return false
+	}
+	p("      # Seen in the TLS plaintext of the run's processes (observe.tls_plaintext):")
+	paths := map[string]bool{}
+	for i, k := range seen {
+		if i == maxTLSPathsDrafted {
+			p("      #   ... and %d more", len(seen)-i)
+			break
+		}
+		p("      #   %s", commentSafe(k))
+		f := strings.Fields(k)
+		if len(f) >= 2 {
+			paths[f[1]] = true
+		}
+	}
+	var ps []string
+	for _, x := range sortedSet(paths) {
+		ps = append(ps, q(x))
+	}
+	if len(ps) > maxTLSPathsDrafted {
+		ps = ps[:maxTLSPathsDrafted]
+	}
+	p("      # To allow only these, add under the rule below (the proxy then terminates")
+	p("      # this host, so its clients must trust the node CA):")
+	p("      #   http: { paths: [%s] }", strings.Join(ps, ", "))
+	return true
 }
 
 var nonRuleChars = regexp.MustCompile(`[^a-z0-9]+`)
@@ -468,7 +528,7 @@ func (d *Draft) WriteYAML(w io.Writer, now time.Time) error {
 		}
 		h := d.hosts[r.Name]
 		p("      # %s%s", hostSeen(h), runsNote(h.runs, total))
-		if d.opaque[r.Name] {
+		if !d.writeTLSSeen(p, h.name) && d.opaque[r.Name] {
 			p("      # Used through a TLS tunnel the proxy did not terminate, so the paths are")
 			p("      # unseen. To learn them, run under an audit profile whose rule for this")
 			p("      # host has http: { paths: [\"*\"] }.")

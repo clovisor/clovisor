@@ -44,4 +44,7 @@ type NodeStatus struct {
 	// Restored is what the node agent did at start with runs that
 	// outlived the previous one (milestone 6.1).
 	Restored string `json:"restored,omitempty"`
+	// TLSCapture lists the TLS libraries probed for runs that capture
+	// TLS plaintext (milestone 6.2); empty without -uprobes.
+	TLSCapture []string `json:"tls_capture,omitempty"`
 }

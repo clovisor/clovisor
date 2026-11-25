@@ -139,6 +139,7 @@ func CheckRunsWith(cp *policy.CompiledProfile, runs []*RunTimeline, o CheckOptio
 	for _, tl := range runs {
 		rep.Runs = append(rep.Runs, tl.RunID)
 		l7 := checkL7(cp, tl, add)
+		checkTLS(cp, tl, add)
 		if o.Transparent {
 			// The node's resolver answers a name only if some rule could
 			// allow a connection to it.
@@ -498,6 +499,34 @@ func checkL7(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) []Dest
 		}
 	}
 	return legacy
+}
+
+// checkTLS replays requests seen in the TLS plaintext of a run's
+// processes (milestone 6.2) as path rules would decide them, for hosts
+// whose requests the proxy did not see itself: tunnels it did not
+// terminate. Those it terminated are the path replay's.
+func checkTLS(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) {
+	terminated := map[string]bool{}
+	for _, p := range tl.Summary.Proxied {
+		if len(p.Paths) > 0 || p.PathsDropped > 0 {
+			terminated[p.Host] = true
+		}
+	}
+	for _, u := range tl.Summary.TLS {
+		if terminated[u.Host] || u.Host == "" {
+			continue
+		}
+		r := policy.Request{Port: 443, Method: u.Method, Path: u.Path, Phase: policy.PhaseRequest}
+		if ip, err := netip.ParseAddr(u.Host); err == nil {
+			r.IP = ip
+		} else {
+			r.Host = u.Host
+		}
+		egressFinding(add, "http", u.Method+" "+u.Host+":443"+u.Path+" (seen in the process)", cp.Decide(r), tl.RunID, u.Requests)
+	}
+	if tl.Summary.TLSDropped > 0 {
+		add("unverifiable", "requests seen in TLS plaintext past the per-run cap", CheckFinding{Decision: "unrecorded"}, tl.RunID, tl.Summary.TLSDropped)
+	}
 }
 
 // checkModels replays the models the run's requests named (milestone

@@ -9,7 +9,8 @@
 
 # Compiler and flags
 CC = clang
-BPF_CFLAGS = -target bpf -g -O2 -Wall -I/usr/include/$(shell uname -m)-linux-gnu
+BPF_ARCH = $(shell uname -m | sed -e s/aarch64/arm64/ -e s/x86_64/x86/)
+BPF_CFLAGS = -target bpf -g -O2 -Wall -D__TARGET_ARCH_$(BPF_ARCH) -I/usr/include/$(shell uname -m)-linux-gnu
 
 # Directories
 BPF_SRC = libclovisor/ebpf/agent_audit.c

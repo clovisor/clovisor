@@ -23,19 +23,24 @@ func NewEBPFReader(bpfObjPath, agentsDir string, agentsCgroupID uint64, agentsLe
 	return nil, errors.New("kernel audit (BPF) needs Linux")
 }
 
-func (r *EBPFReader) Start() error                                   { return nil }
-func (r *EBPFReader) Stop() error                                    { return nil }
-func (r *EBPFReader) Events() <-chan AuditEvent                      { return nil }
-func (r *EBPFReader) Close()                                         {}
-func (r *EBPFReader) SetHealth(func() error)                         {}
-func (r *EBPFReader) Healthy() bool                                  { return false }
-func (r *EBPFReader) LostFor(uint64) (uint64, uint64)                { return 0, 0 }
-func (r *EBPFReader) LostTotal() (uint64, uint64)                    { return 0, 0 }
-func (r *EBPFReader) ProxyRefused() uint64                           { return 0 }
-func (r *EBPFReader) GateProxy(string) error                         { return errors.New("needs Linux") }
-func (r *EBPFReader) GatedProxy() string                             { return "" }
-func (r *EBPFReader) LSMState() string                               { return "needs Linux" }
-func (r *EBPFReader) ReleaseHeldLSM()                                {}
+func (r *EBPFReader) Start() error                     { return nil }
+func (r *EBPFReader) Stop() error                      { return nil }
+func (r *EBPFReader) Events() <-chan AuditEvent        { return nil }
+func (r *EBPFReader) Close()                           {}
+func (r *EBPFReader) SetHealth(func() error)           {}
+func (r *EBPFReader) Healthy() bool                    { return false }
+func (r *EBPFReader) LostFor(uint64) (uint64, uint64)  { return 0, 0 }
+func (r *EBPFReader) LostTotal() (uint64, uint64)      { return 0, 0 }
+func (r *EBPFReader) ProxyRefused() uint64             { return 0 }
+func (r *EBPFReader) GateProxy(string) error           { return errors.New("needs Linux") }
+func (r *EBPFReader) GatedProxy() string               { return "" }
+func (r *EBPFReader) LSMState() string                 { return "needs Linux" }
+func (r *EBPFReader) ReleaseHeldLSM()                  {}
+func (r *EBPFReader) SetTLSCapture(uint64, bool) error { return nil }
+func (r *EBPFReader) TLSLibraries() []string           { return nil }
+
+// ContinueStopped needs Linux.
+func ContinueStopped(string) int                                     { return 0 }
 func (r *EBPFReader) SetUnixPolicy(uint64, []string, bool) error     { return nil }
 func (r *EBPFReader) ForgetUnixPolicy(uint64)                        {}
 func (r *EBPFReader) SetUnixNode([]string) error                     { return nil }

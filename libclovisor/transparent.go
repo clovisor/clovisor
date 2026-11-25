@@ -61,6 +61,12 @@ type TransparentOptions struct {
 	// also keeps the previous node agent's pinned LSM programs attached
 	// until ReleaseHeldLSM, so their maps keep enforcing meanwhile.
 	DeferBeat bool
+	// TLSCapture loads the TLS plaintext probes (milestone 6.2, node
+	// -uprobes), for runs whose profile asks; TLSLibraries are the
+	// libraries to probe, DefaultTLSLibraries() if empty. Independent of
+	// the transparent mode.
+	TLSCapture   bool
+	TLSLibraries []string
 	// ExecHash loads the exec program that hashes files (milestone 5.7),
 	// where ExecHashSupported says the kernel can; otherwise exec is
 	// decided by path alone.

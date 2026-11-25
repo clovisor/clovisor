@@ -1,0 +1,11 @@
+# TLS plaintext (milestone 6.2, node -uprobes): requests from the run's
+# processes recorded through uprobes on OpenSSL and GnuTLS.
+kind: AgentProfile
+metadata: { name: tp-observe }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: origin, to: { fqdn: ["origin.test"], ports: [443] }, action: allow }
+  observe: { tls_plaintext: true }

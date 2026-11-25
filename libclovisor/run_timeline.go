@@ -140,6 +140,11 @@ type RunSummary struct {
 	// ModelsDropped.
 	Models        []ModelUse `json:"models,omitempty"`
 	ModelsDropped int        `json:"models_dropped,omitempty"`
+	// TLS are requests seen in the TLS plaintext of the run's processes
+	// (milestone 6.2), by host, method, path and MCP tool: at most
+	// MaxTLSUses entries, requests beyond counted in TLSDropped.
+	TLS        []TLSUse `json:"tls,omitempty"`
+	TLSDropped int      `json:"tls_dropped,omitempty"`
 	// Spend is the run's own budgeted model calls (milestone 5.4), by host
 	// and model: tokens, and cost at the node's prices.
 	Spend []SpendUse `json:"spend,omitempty"`
@@ -174,6 +179,25 @@ type ModelUse struct {
 	Denied    int    `json:"denied,omitempty"`
 	WouldDeny int    `json:"would_deny,omitempty"`
 }
+
+// TLSUse is a request seen in TLS plaintext, with how often, and the
+// statuses it got.
+type TLSUse struct {
+	Host      string      `json:"host"`
+	Method    string      `json:"method"`
+	Path      string      `json:"path"`
+	Proto     string      `json:"proto"`
+	MCPMethod string      `json:"mcp_method,omitempty"`
+	Tool      string      `json:"tool,omitempty"`
+	Requests  int         `json:"requests"`
+	Statuses  map[int]int `json:"statuses,omitempty"` // 0: no response seen
+	Lib       string      `json:"lib"`
+}
+
+type tlsKey struct{ host, method, path, mcp, tool string }
+
+// MaxTLSUses bounds the distinct TLS entries kept per run.
+const MaxTLSUses = 256
 
 // MaxModelUses bounds the distinct model entries kept per run: the run
 // chooses the names and paths.
@@ -302,7 +326,7 @@ type Destination struct {
 // TimelineEvent is one entry in a run's timeline.
 type TimelineEvent struct {
 	Time     time.Time   `json:"time"`
-	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, model, usage, drop, socket, unix, gap
+	Type     string      `json:"type"` // exec, exec_path, connect, dns, http, mcp, content, model, usage, tls, drop, socket, unix, gap
 	PID      uint32      `json:"pid,omitempty"`
 	PPID     uint32      `json:"ppid,omitempty"`
 	CgroupID uint64      `json:"cgroup_id,omitempty"`
@@ -381,6 +405,7 @@ type runState struct {
 	mcp     map[mcpKey]*MCPUse
 	content map[contentKey]*ContentUse
 	models  map[modelKey]*ModelUse
+	tls     map[tlsKey]*TLSUse
 	spend   map[spendKey]*SpendUse
 	// callFor names the call a cgroup belongs to; calls counts events
 	// per call.
@@ -541,6 +566,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		mcp:      make(map[mcpKey]*MCPUse),
 		content:  make(map[contentKey]*ContentUse),
 		models:   make(map[modelKey]*ModelUse),
+		tls:      make(map[tlsKey]*TLSUse),
 		spend:    make(map[spendKey]*SpendUse),
 		calls:    make(map[string]*CallSummary),
 		callFor: func(cg uint64) string {
@@ -573,6 +599,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for i := range prev.Summary.Spend {
 				u := prev.Summary.Spend[i]
 				st.spend[spendKey{u.Host, u.Model}] = &u
+			}
+			for i := range prev.Summary.TLS {
+				u := prev.Summary.TLS[i]
+				st.tls[tlsKey{u.Host, u.Method, u.Path, u.MCPMethod, u.Tool}] = &u
 			}
 			for i := range prev.Summary.Models {
 				u := prev.Summary.Models[i]
@@ -917,6 +947,40 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			Note:     note,
 		}, r.MaxEvents)
 
+	case EventTLS:
+		d := ev.Data.(TLSEventData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		k := tlsKey{d.Host, d.Method, d.Path, d.MCPMethod, d.Tool}
+		u := st.tls[k]
+		if u == nil && len(st.tls) < MaxTLSUses {
+			u = &TLSUse{Host: d.Host, Method: d.Method, Path: d.Path, Proto: d.Proto, MCPMethod: d.MCPMethod, Tool: d.Tool,
+				Statuses: map[int]int{}, Lib: d.Lib}
+			st.tls[k] = u
+		}
+		if u == nil {
+			st.tl.Summary.TLSDropped++
+		} else {
+			u.Requests++
+			if u.Statuses == nil {
+				u.Statuses = map[int]int{}
+			}
+			u.Statuses[d.Status]++
+		}
+		note := "seen in the process (" + d.Lib + ", " + d.Proto + ")"
+		if d.Status != 0 {
+			note += ", status " + strconv.Itoa(d.Status)
+		}
+		if d.Tool != "" {
+			note += ", MCP " + d.MCPMethod + " " + d.Tool
+		} else if d.MCPMethod != "" {
+			note += ", MCP " + d.MCPMethod
+		}
+		st.add(TimelineEvent{Time: ev.Timestamp, Type: "tls", PID: ev.PID, CgroupID: ev.CgroupID, Method: d.Method,
+			DstName: d.Host, Path: d.Path, Note: note, MCPName: d.Tool}, r.MaxEvents)
+
 	case EventModel:
 		d := ev.Data.(ModelData)
 		st := r.state(ev, "")
@@ -1221,6 +1285,24 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 			return a.Host < b.Host
 		}
 		return a.Model < b.Model
+	})
+
+	tl.Summary.TLS = nil
+	for _, u := range st.tls {
+		tl.Summary.TLS = append(tl.Summary.TLS, *u)
+	}
+	sort.Slice(tl.Summary.TLS, func(i, j int) bool {
+		a, b := tl.Summary.TLS[i], tl.Summary.TLS[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		return a.Tool < b.Tool
 	})
 
 	tl.Summary.Models = nil
