@@ -528,7 +528,7 @@ func (c *compiler) observe(p *AgentProfile, cp *CompiledProfile) {
 		return
 	}
 	pl := Placement{Rule: "observe/tls-plaintext", Tier: "audit",
-		EnforcedBy: "uprobes on OpenSSL, BoringSSL and GnuTLS in the run's processes",
+		EnforcedBy: "uprobes on OpenSSL, BoringSSL, GnuTLS and Go crypto/tls in the run's processes",
 		Notes: []string{"visibility only: requests are recorded, never decided",
 			"each TLS call of the run's processes costs a few microseconds, and each exec up to about 15 ms"}}
 	switch {
@@ -537,7 +537,7 @@ func (c *compiler) observe(p *AgentProfile, cp *CompiledProfile) {
 	case !c.opts.Uprobes:
 		pl.EnforcedBy, pl.Notes = "not observed: needs the node agent's -uprobes", nil
 	default:
-		pl.Notes = append(pl.Notes, "not seen: statically linked or stripped TLS stacks (Go, Bun, rustls), and forked children that do not exec")
+		pl.Notes = append(pl.Notes, "not seen: Go binaries of versions not yet tested, other statically linked TLS stacks (Bun, rustls), and forked children that do not exec")
 	}
 	cp.Placements = append(cp.Placements, pl)
 }

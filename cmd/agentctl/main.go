@@ -551,7 +551,7 @@ func showStatus() error {
 		fmt.Printf("Restored      %s at start\n", s.Restored)
 	}
 	if len(s.TLSCapture) > 0 {
-		fmt.Printf("TLS capture   for profiles that ask: %s\n", strings.Join(s.TLSCapture, ", "))
+		fmt.Printf("TLS capture   for profiles that ask: %s; Go crypto/tls, %s\n", strings.Join(s.TLSCapture, ", "), s.TLSGo)
 	}
 	fmt.Printf("Lost events   %d (ring buffer full), %d suppressed (a run over its event budget)\n", s.LostEvents, s.SuppressedEvents)
 	return nil
@@ -840,6 +840,8 @@ func printTimeline(tl *clovisor.RunTimeline) {
 			detail = fmt.Sprintf("%s %s:%d%s model %q: %s", e.Method, e.DstName, e.DstPort, e.Path, e.Model, e.Note)
 		case "tls":
 			detail = fmt.Sprintf("%s %s%s (%s)", e.Method, e.DstName, e.Path, e.Note)
+		case "tls-program":
+			detail = e.Path + ": " + e.Note
 		case "model":
 			detail = fmt.Sprintf("%s %s:%d%s -> %s", e.Method, e.DstName, e.DstPort, e.Path, e.Decision)
 			if e.Decision == "deny" && !e.Enforced {
@@ -996,6 +998,16 @@ func printTimeline(tl *clovisor.RunTimeline) {
 		}
 		if tl.Summary.TLSDropped > 0 {
 			fmt.Printf("  (%d more requests past the per-run cap, not listed)\n", tl.Summary.TLSDropped)
+		}
+	}
+	if len(tl.Summary.TLSPrograms) > 0 {
+		fmt.Printf("Programs with their own TLS (%d)\n", len(tl.Summary.TLSPrograms))
+		for _, p := range tl.Summary.TLSPrograms {
+			state := "probed"
+			if !p.Probed {
+				state = "not visible: " + p.Reason
+			}
+			fmt.Printf("  %-48s x%-4d %s crypto/tls %s\n", p.Path, p.Execs, p.Stack, state)
 		}
 	}
 	if len(tl.Summary.Models) > 0 {

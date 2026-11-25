@@ -47,4 +47,6 @@ type NodeStatus struct {
 	// TLSCapture lists the TLS libraries probed for runs that capture
 	// TLS plaintext (milestone 6.2); empty without -uprobes.
 	TLSCapture []string `json:"tls_capture,omitempty"`
+	// TLSGo is the Go versions whose crypto/tls is probed (milestone 6.3).
+	TLSGo string `json:"tls_go,omitempty"`
 }

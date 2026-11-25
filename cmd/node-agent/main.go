@@ -45,7 +45,7 @@ var (
 	udpOK      = flag.String("udp-allow", "", "Comma-separated ip:port UDP destinations runs may reach in transparent mode (0.0.0.0:port: any loopback address); other UDP but DNS is refused")
 	dnsUp      = flag.String("dns-upstream", "", "Comma-separated ip:port resolvers the local resolver forwards to (default: the nameservers in /etc/resolv.conf)")
 	tStale     = flag.Duration("transparent-stale", clovisor.DefaultHeartbeatStale, "How long after the node agent stops connects are refused")
-	uprobes    = flag.Bool("uprobes", false, "Record requests from the TLS plaintext of runs whose profile sets observe.tls_plaintext, through uprobes on OpenSSL, BoringSSL and GnuTLS (cgroup identity; visibility only)")
+	uprobes    = flag.Bool("uprobes", false, "Record requests from the TLS plaintext of runs whose profile sets observe.tls_plaintext, through uprobes on OpenSSL, BoringSSL, GnuTLS and Go crypto/tls (cgroup identity; visibility only)")
 	uprobeLibs = flag.String("uprobe-libs", "", "Comma-separated TLS libraries to probe with -uprobes (default: libssl and libgnutls in the usual library directories)")
 	quic       = flag.Bool("quic", false, "Relay QUIC (UDP 443) from runs by the server name in its Initial, decided as TLS by name is (transparent enforce only); otherwise QUIC is refused and clients use TCP")
 	quicP      = flag.Uint("quic-port", clovisor.DefaultQUICPort, "QUIC relay port, on 127.0.0.1 and ::1 (with -quic)")

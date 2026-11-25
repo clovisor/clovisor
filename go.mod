@@ -12,6 +12,7 @@ require (
 	github.com/sirupsen/logrus v1.10.2
 	github.com/uber/jaeger-client-go v2.30.0+incompatible
 	github.com/vishvananda/netlink v1.3.1
+	golang.org/x/arch v0.18.0
 	golang.org/x/net v0.34.0
 	golang.org/x/sys v0.29.0
 	google.golang.org/grpc v1.70.0

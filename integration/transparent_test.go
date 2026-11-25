@@ -557,6 +557,32 @@ git ls-remote https://origin.test/repo.git >/dev/null 2>&1; echo "git done"
 	if tl := e.timeline(id); strings.Contains(tl, `"tls"`) {
 		t.Errorf("a run whose profile does not ask was captured:\n%s", tl)
 	}
+
+	// Milestone 6.3: Go's crypto/tls, linked into each binary, probed
+	// from its symbols, or from Go's function table once stripped. env
+	// execs the client in its own process, which already had probes from
+	// its first exec: the new binary is probed all the same.
+	s = e.script("gotls", `/it/bin/gotls "https://origin.test/allowed?try=go" https://origin.test/headers
+env /it/bin/gotls-stripped https://origin.test/allowed
+`)
+	out, id = e.agentRun("tp-observe", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "+s)
+	expect(t, out, "gotls HTTP/2.0 200")
+	e.timeline(id)
+	shown, _, err = e.sh("/it/bin/agentctl events " + id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, shown, "Programs with their own TLS (2)")
+	if !regexp.MustCompile(`/it/bin/gotls +x1 +go1\.\d+\S* crypto/tls probed`).MatchString(shown) ||
+		!regexp.MustCompile(`/it/bin/gotls-stripped +x1 +go1\.\d+\S* crypto/tls probed`).MatchString(shown) {
+		t.Errorf("programs:\n%s", shown)
+	}
+	sec = shown[strings.Index(shown, "Seen in TLS plaintext"):]
+	sec = sec[:strings.Index(sec, "Programs with their own TLS")]
+	if !regexp.MustCompile(`GET origin.test/allowed +x2 +200 x2 \(go1\.\d+\S*, HTTP/2\)`).MatchString(sec) ||
+		!regexp.MustCompile(`GET origin.test/headers +x1 +200 x1 \(go1`).MatchString(sec) || strings.Contains(sec, "try=") {
+		t.Errorf("Go TLS plaintext section:\n%s", sec)
+	}
 }
 
 func (e *env) testToolCalls(t *testing.T) {

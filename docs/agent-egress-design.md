@@ -116,6 +116,12 @@ place:
 | Restart recovery: live runs' grants kept in a root-owned file at each change and restored, bound version and kernel state included, before the first heartbeat; old LSM links kept until then; unrestorable runs revoked; `agentctl run` reconnects to report the exit code. Found: status said healthy before the first heartbeat. | [6.1 status](#61-status-2026-11-24) |
 | TLS plaintext (opt-in: node `-uprobes`, profile `observe.tls_plaintext`): probes on OpenSSL, BoringSSL and GnuTLS attached per process, each exec held until they are; HTTP/1.1 and HTTP/2 requests and MCP calls recorded, never decided; learn drafts commented path rules, check replays them. Found: the 6.1 heartbeat beat before restore. | [6.2 status](#62-status-2026-11-24) |
 
+### 2026-11-25 — Go crypto/tls
+
+| Change | Where |
+|---|---|
+| Go `crypto/tls` probed in each Go binary a capturing run executes, go1.21 to go1.26, arm64 and amd64: functions found by symbol or by Go's function table, so stripped builds too; return probes on decoded return instructions; offsets checked against Go's prologue. Every exec in a capturing run is now reported, so a process that execs another binary gets it probed. Go binaries listed per run, probed or not visible and why. Found: stripped Go is visible after all; the function table's text address is not `.text`'s in an external link. | [6.3 status](#63-status-2026-11-25) |
+
 ---
 
 ## 1. Provenance: what Clovisor was
@@ -4473,6 +4479,108 @@ Verified:
     `ls-remote` (GnuTLS) were recorded with their statuses, HTTP/2 and
     HTTP/1.1, without the query string;
   - a run under `tp`, which does not ask, had no TLS records.
+
+#### 6.3 status (2026-11-25)
+
+Implemented, under the same opt-in as 6.2 (`-uprobes`, and a profile with
+`observe.tls_plaintext`):
+
+- **Analysis at exec.** For each exec in a capturing run, the node agent
+  opens the binary as the process maps it (`/proc/<pid>/exe`, so another
+  mount namespace's binary is the one read) and checks for Go build info.
+  For a Go binary:
+  - It finds `crypto/tls.(*Conn).Write` and `Read` by name, in the symbol
+    table, or else in Go's function table, which `-s -w` leaves. It looks
+    in `.gopclntab`, then `.data.rel.ro.gopclntab` (a PIE). Failing both,
+    it searches the read-only data for the table's header, where an
+    external link left the table no section of its own.
+  - It lists each function's return instructions. On arm64 instructions
+    are fixed at four bytes. On amd64 they are decoded
+    (`golang.org/x/arch`), since a return's byte also occurs inside other
+    instructions, where a probe would corrupt the program.
+  - It probes only a function whose entry holds Go's stack-check prologue,
+    so a wrong offset is reported, not probed.
+  - Results are cached per file (device, inode, size, mtime): about 0.5 to
+    4 ms for most binaries, and 37 ms for the 90 MB `dockerd`, once.
+- **Probes.** An entry probe stashes the connection and buffer, keyed by
+  process and goroutine (the g register: `x28` on arm64, `r14` on amd64),
+  since a goroutine can change threads inside a call. A probe on each
+  return instruction copies what was written or read, bounded as for
+  libssl. All of them are attached to the one process, through the same
+  hold at exec. Records carry the Go version as their library
+  (`go1.26.8`).
+- **Every exec reported.** In 6.2 a process with probes was not reported
+  again at exec, since library probes survive exec. A Go binary's probes
+  are on the binary it ran, so the kernel now reports each exec in a
+  capturing run. The node agent keeps the library probes, drops the old
+  binary's and probes the new one: `env gh` and a shell that execs its last
+  command are covered.
+- **Supported versions.** go1.21 to go1.26. The probes read arguments by
+  Go's internal register ABI, which Go does not promise to keep, so a newer
+  Go is reported as not visible until it is tested. Older ones are
+  reported the same way.
+- **Records.** Each Go binary with `crypto/tls` that a capturing run
+  executes is listed once per run, under `tls_programs` in the summary,
+  with its version, how often it ran, and whether it was probed or why not
+  (`tls-program` events). `agentctl events` shows them under `Programs with
+  their own TLS`. `agentctl status` names the Go versions probed. A Go
+  binary without `crypto/tls` has nothing to miss and is not listed.
+
+Found on the way:
+
+- **Stripped Go is visible.** The plan expected stripped binaries to be
+  unhookable. Go keeps its function table for tracebacks and `-s -w` does
+  not remove it, so stripped builds, as most release builds are, are
+  probed at the same offsets as unstripped ones.
+- **The function table's text address is not `.text`'s.** An external
+  link puts C code at the start of `.text`, so Go's text (`runtime.text`)
+  starts later: 0x130 bytes later in the distribution's `containerd`.
+  Function addresses are relative to Go's text, so the table's header is
+  read for it, and `.text` is used only when a PIE leaves the header's
+  field to a relocation (`/usr/bin/go`). The prologue check catches either
+  going wrong.
+- **Distribution builds hide the table.** Ubuntu's `containerd` has no
+  `.gopclntab` section, hence the search by header. Its `docker` has the
+  PIE section name.
+
+Limits:
+
+- Go versions outside go1.21 to go1.26 are recorded, not probed.
+- Architectures other than arm64 and amd64 are not probed.
+- A Go binary with a TLS stack other than `crypto/tls` is not seen. One
+  that calls libssl through cgo is, by the library probes.
+- A buffer on a goroutine stack could move if the stack grows inside the
+  call, and the copy at return would then read stale memory. `net/http`
+  and its HTTP/2 transport pass buffers on the heap.
+- The x86 BPF object was compiled, not run: amd64 analysis is checked
+  against `go tool objdump`, but the probes' register reads ran only on
+  arm64.
+
+Verified:
+
+- Unit tests:
+  - binaries built in the test for arm64 and amd64, stripped and not, with
+    return offsets equal to `go tool objdump`'s, and entries as file
+    offsets;
+  - a Go binary without `crypto/tls`; versions too new and too old (the
+    build info rewritten); a script; amd64 decoding past a `0xc3` inside
+    an instruction;
+  - program records in the timeline.
+- Offline, with the analysis: go1.21.13, go1.23.12, go1.25.9 and go1.26.8
+  clients on both architectures, stripped and not; Ubuntu's `docker`,
+  `dockerd`, `containerd`, `ctr` (go1.24) and `go` (go1.26), each entry
+  checked for the prologue, and `docker`'s return offsets checked by hand.
+- On the host, under a profile with `observe.tls_plaintext`, Ubuntu's `go
+  mod download` (a PIE, its text address left to a relocation) was probed
+  at exec. Its 15 HTTP/2 requests to `proxy.golang.org` and
+  `sum.golang.org` were recorded with their statuses, concurrent streams
+  included.
+- The Go probes load (at most 537 instructions). The object compiles for
+  x86.
+- `make integration-transparent`, twenty-nine checks. Under `tp-observe`,
+  a Go client and its stripped build, the second started through `env`,
+  were probed, and their HTTP/2 requests recorded with statuses and
+  without the query string.
 
 ---
 

@@ -50,7 +50,8 @@ type NodeAgent struct {
 	execHash   bool // the kernel's exec hook hashes files (milestone 5.7)
 	uprobes    bool // TLS plaintext capture (milestone 6.2)
 	restored   RestoreReport
-	tlsParser  *tlsParser // TLS plaintext (milestone 6.2)
+	tlsParser  *tlsParser        // TLS plaintext (milestone 6.2)
+	tlsStacks  map[uint32]string // Go version, by probed process (milestone 6.3)
 	tlsLibs    []string
 	relay      *QUICRelay
 	stopChan   chan bool
@@ -428,6 +429,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		uprobes:    t.TLSCapture,
 		relay:      relay,
 		tlsParser:  newTLSParser(),
+		tlsStacks:  map[uint32]string{},
 		stopChan:   make(chan bool),
 		running:    false,
 	}
@@ -881,8 +883,13 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 		lib := ""
 		if d, ok := event.Data.(TLSData); ok {
 			lib = d.Lib
+			if v := na.tlsStacks[event.PID]; lib == "go" && v != "" {
+				lib = v
+			}
 			reqs = na.tlsParser.feed(event.PID, d.Obj, d.Write, d.Data, d.Len)
 		} else {
+			lib = na.tlsStacks[event.PID]
+			delete(na.tlsStacks, event.PID)
 			reqs = na.tlsParser.close(event.PID)
 		}
 		for _, r := range reqs {
@@ -894,6 +901,18 @@ func (na *NodeAgent) processEvent(event AuditEvent) {
 			na.processEvent(ev)
 		}
 		return
+	case EventTLSProgram:
+		d, ok := event.Data.(TLSProgramData)
+		if !ok {
+			return
+		}
+		if d.Probed {
+			na.tlsStacks[event.PID] = d.Stack
+			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s crypto/tls probed\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack)
+		} else {
+			delete(na.tlsStacks, event.PID)
+			fmt.Printf("%s [TLS] run=%d pid=%d %s: %s crypto/tls not visible: %s\n", ts, event.RunCgroupID, event.PID, d.Path, d.Stack, d.Reason)
+		}
 	case EventTLS:
 		d := event.Data.(TLSEventData)
 		extra := ""
@@ -1161,6 +1180,9 @@ func (na *NodeAgent) Status() NodeStatus {
 		}
 		if na.audit != nil && na.audit.reader != nil {
 			s.TLSCapture = na.audit.reader.TLSLibraries()
+			if len(s.TLSCapture) > 0 {
+				s.TLSGo = GoTLSVersions
+			}
 		}
 	}
 	return s

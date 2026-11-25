@@ -125,7 +125,7 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 | `-udp-allow ip:port,…` | UDP destinations runs may reach in transparent mode (NTP, say). All other UDP but DNS is refused. At most four. |
 | `-quic` | Relay QUIC (UDP 443) by server name in transparent enforce mode (§11 QUIC). Off by default: QUIC is refused and clients use TCP. |
 | `-quic-port 15443` | The QUIC relay's port, on `127.0.0.1` and `::1`. |
-| `-uprobes` | Record requests from the TLS plaintext of runs whose profile sets `observe.tls_plaintext` (§11 TLS plaintext). Cgroup identity; any transparent mode, or none. |
+| `-uprobes` | Record requests from the TLS plaintext of runs whose profile sets `observe.tls_plaintext` (§11 TLS plaintext): shared OpenSSL, BoringSSL and GnuTLS, and Go's `crypto/tls`. Cgroup identity; any transparent mode, or none. |
 | `-uprobe-libs path,…` | The TLS libraries to probe. Default: `libssl.so.3`, `libssl.so.1.1` and `libgnutls.so.30` in the usual library directories. |
 | `-dns-upstream ip:port,…` | Where the local resolver forwards allowed names. Default: the nameservers in `/etc/resolv.conf`. |
 
@@ -1118,8 +1118,14 @@ spec:
 
 With `-uprobes` on the node, the node agent probes the TLS libraries of that
 run's processes:
-- **What is covered.** OpenSSL, BoringSSL and GnuTLS as shared libraries:
-  curl, Python, the distribution's Node, git (GnuTLS on Debian and Ubuntu).
+- **What is covered.**
+  - OpenSSL, BoringSSL and GnuTLS as shared libraries: curl, Python, the
+    distribution's Node, git (GnuTLS on Debian and Ubuntu).
+  - Go's `crypto/tls` in Go binaries built with go1.21 to go1.26, on arm64
+    and amd64, stripped or not: `gh`, `terraform`, the `go` command and
+    other Go tools. Each Go binary a run executes is listed under
+    `Programs with their own TLS` in `agentctl events`, as probed or not
+    visible, with the reason (a Go version not yet tested, for instance).
 - **What is recorded.** Each request's method, host, path (without the
   query string) and status, and for MCP the JSON-RPC method and tool name.
   These go under `Seen in TLS plaintext` in `agentctl events`, and `tls` in
@@ -1132,8 +1138,10 @@ run's processes:
   about 5 µs in a VM. That is why it is per profile: turn it on for the runs
   you are learning from.
 - **Not seen:**
-  - statically linked or stripped TLS stacks: Go programs, Bun-built
-    binaries (Claude Code among them), rustls;
+  - other statically linked TLS stacks: Bun-built binaries (Claude Code
+    among them), rustls;
+  - Go binaries of other versions or architectures (listed as not
+    visible);
   - a process that forks without exec (the child is not probed);
   - libraries at paths the node agent does not see (another mount
     namespace's copies).
@@ -1145,7 +1153,8 @@ run's processes:
   fresh. One held for more than a second is continued without its probes. A
   restarted node agent continues processes left stopped in runs that capture.
 
-`agentctl status` lists the libraries probed (`TLS capture`).
+`agentctl status` lists the libraries probed and the Go versions
+(`TLS capture`).
 
 ## 12. Incident response
 
@@ -1273,7 +1282,7 @@ agentctl events --json <run-id>
 | A QUIC client reports `CONNECTION_REFUSED` with a reason | The node's QUIC relay refused it (§11 QUIC); the reason says why. The client should fall back to TCP, where it is decided as usual. |
 | A run is revoked with "the node agent restarted and could not restore its policy" | Its grants could not be rebuilt after a restart: the reason follows. Start the run again. |
 | `grants: ... must be owned by root` at start | `<state-dir>/grants.json` has the wrong owner or mode. Fix it, or move it aside to start without restoring runs (they come back unprofiled). |
-| `Seen in TLS plaintext` is missing for a run under `observe.tls_plaintext` | The node runs without `-uprobes` (the receipt says so), or the client's TLS is not a shared OpenSSL, BoringSSL or GnuTLS (Go, Bun, rustls), or it forked without exec. |
+| `Seen in TLS plaintext` is missing for a run under `observe.tls_plaintext` | The node runs without `-uprobes` (the receipt says so), or the client's TLS is not a shared OpenSSL, BoringSSL or GnuTLS nor Go's `crypto/tls` (Bun, rustls), or it forked without exec. A Go client of an untested version is listed under `Programs with their own TLS` with the reason. |
 | `tls: pid N held at exec for over 1s without its probes; continued` | Attaching stalled or an event was lost: that process ran unobserved. |
 | A pinned binary fails with `Permission denied` after an upgrade (transparent) | Its content no longer matches the `hash` in `exec.allow`; the timeline's `exec_path` note names the content that ran. Add its `sha256sum` to the entry (up to four), then remove the old one. |
 | `exec hashes unavailable` in the node agent's log | The kernel lacks `bpf_ima_file_hash` (5.18) or the TAI clock (5.19), so exec is decided by path alone and enforcing profiles with hashes do not load. |
@@ -1381,8 +1390,9 @@ ignore the proxy, it checks:
 - TLS plaintext with `-uprobes`: under a profile with
   `observe.tls_plaintext`, requests from curl (three, each held at exec
   until probed), Python and git (GnuTLS) recorded with their statuses and
-  without query strings; a run under a profile that does not ask, not
-  probed;
+  without query strings; a Go client and its stripped build, the second
+  started through `env`, probed and their HTTP/2 requests recorded; a run
+  under a profile that does not ask, not probed;
 - restart: a run going across a node agent restart refused the same things
   after it as before (a path rule, an unlisted host and its name, an
   untrusted exec), a run revoked before it stayed revoked, `agentctl status`

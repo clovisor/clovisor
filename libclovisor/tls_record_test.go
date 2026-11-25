@@ -123,7 +123,7 @@ spec:
 		opts policy.Options
 		want string
 	}{
-		{policy.Options{Linux: true, Uprobes: true}, "uprobes on OpenSSL, BoringSSL and GnuTLS"},
+		{policy.Options{Linux: true, Uprobes: true}, "uprobes on OpenSSL, BoringSSL, GnuTLS and Go crypto/tls"},
 		{policy.Options{Linux: true}, "needs the node agent's -uprobes"},
 		{policy.Options{}, "needs the Linux node agent"},
 	} {
@@ -157,5 +157,35 @@ spec:
 	// A profile without the block keeps its version.
 	if b, _ := json.Marshal(plain); strings.Contains(string(b), "observe") {
 		t.Error("an absent observe block appears in the profile's JSON")
+	}
+}
+
+// Go binaries exec'd in a capturing run are listed once each (milestone
+// 6.3), probed or not visible and why, with how often they ran.
+func TestTLSProgramTimeline(t *testing.T) {
+	r := newTestRecorder(t)
+	r.Meta.Put(RunMeta{RunID: "abc", Command: []string{"agent"}, UID: os.Getuid()})
+	prog := func(ms int, d TLSProgramData) AuditEvent {
+		return AuditEvent{Type: EventTLSProgram, Timestamp: at(ms), CgroupID: testRunCg, RunCgroupID: testRunCg, PID: 11, Data: d}
+	}
+	gh := TLSProgramData{Path: "/usr/bin/gh", Stack: "go1.26.8", Probed: true}
+	tl := feed(t, r,
+		runEv(EventRunStart, 0, "/agents/run-abc"),
+		prog(1, gh), prog(2, gh),
+		prog(3, TLSProgramData{Path: "/opt/new", Stack: "go1.27.0", Reason: "Go newer than go1.26, the last tested"}),
+		runEv(EventRunEnd, 4, "/agents/run-abc"),
+	)
+	p := tl.Summary.TLSPrograms
+	if len(p) != 2 || p[0].Path != "/opt/new" || p[0].Probed || p[1].Path != "/usr/bin/gh" || !p[1].Probed || p[1].Execs != 2 {
+		t.Fatalf("programs: %+v", p)
+	}
+	var notes []string
+	for _, e := range tl.Events {
+		if e.Type == "tls-program" {
+			notes = append(notes, e.Note)
+		}
+	}
+	if len(notes) != 2 || notes[0] != "go1.26.8 crypto/tls probed" || !strings.Contains(notes[1], "not visible: Go newer") {
+		t.Errorf("notes: %q", notes)
 	}
 }

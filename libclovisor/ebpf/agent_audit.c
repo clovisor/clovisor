@@ -2534,8 +2534,8 @@ struct tls_exec_event {
 struct tls_data_event {
     struct event_hdr hdr;
     __u32 dir;     /* 1 write, 2 read */
-    __u32 lib;     /* 1 OpenSSL or BoringSSL, 2 GnuTLS */
-    __u64 obj;     /* SSL * or gnutls_session_t: the connection */
+    __u32 lib;     /* 1 OpenSSL or BoringSSL, 2 GnuTLS, 3 Go crypto/tls */
+    __u64 obj;     /* SSL *, gnutls_session_t or *tls.Conn: the connection */
     __u32 len;     /* bytes the call wrote or read */
     __u32 caplen;
     __u8  data[TLS_CAP_WRITE];
@@ -2582,8 +2582,9 @@ int on_tls_exec(__u64 *ctx)
     if (!bpf_map_lookup_elem(&tls_capture, &prun))
         return 0;
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (bpf_map_lookup_elem(&tls_pids, &pid))
-        return 0; /* probes already attached: they survive exec */
+    /* Reported also when the process already has probes: the library
+     * probes survive exec, but a Go binary's are on the binary it left
+     * (milestone 6.3). */
     struct tls_exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         note_lost(run);
@@ -2640,24 +2641,10 @@ static __always_inline int tls_stash_call(void *m, void *obj, const void *buf, v
     return 0;
 }
 
-/* At return: copy what the call wrote or read. Writes are taken at
- * return, with the count written, because a call made before the
- * handshake completes fails and is retried (6.0: Node). */
-static __always_inline int tls_done(void *m, __u32 dir, __u32 lib, __s64 ret, int ex)
+/* Copy n bytes of what a call wrote (dir 1) or read (dir 2), bounded,
+ * to the node agent. */
+static __always_inline int tls_emit(__u32 dir, __u32 lib, __u64 obj, __u64 buf, __s64 n)
 {
-    __u64 id = bpf_get_current_pid_tgid();
-    struct tls_stash *st = bpf_map_lookup_elem(m, &id);
-    if (!st)
-        return 0;
-    __u64 obj = st->obj, buf = st->buf, extra = st->extra;
-    bpf_map_delete_elem(m, &id);
-    __s64 n = ret;
-    if (ex) {
-        __u64 cnt = 0;
-        if (ret != 1 || bpf_probe_read_user(&cnt, sizeof(cnt), (void *)extra))
-            return 0;
-        n = cnt;
-    }
     if (n <= 0)
         return 0;
     __u32 zero = 0;
@@ -2687,6 +2674,27 @@ static __always_inline int tls_done(void *m, __u32 dir, __u32 lib, __s64 ret, in
     return 0;
 }
 
+/* At return: copy what the call wrote or read. Writes are taken at
+ * return, with the count written, because a call made before the
+ * handshake completes fails and is retried (6.0: Node). */
+static __always_inline int tls_done(void *m, __u32 dir, __u32 lib, __s64 ret, int ex)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct tls_stash *st = bpf_map_lookup_elem(m, &id);
+    if (!st)
+        return 0;
+    __u64 obj = st->obj, buf = st->buf, extra = st->extra;
+    bpf_map_delete_elem(m, &id);
+    __s64 n = ret;
+    if (ex) {
+        __u64 cnt = 0;
+        if (ret != 1 || bpf_probe_read_user(&cnt, sizeof(cnt), (void *)extra))
+            return 0;
+        n = cnt;
+    }
+    return tls_emit(dir, lib, obj, buf, n);
+}
+
 SEC("uprobe")
 int BPF_UPROBE(tls_ssl_write, void *ssl, const void *buf, int num) { return tls_stash_call(&tls_writes, ssl, buf, 0); }
 SEC("uprobe")
@@ -2712,5 +2720,67 @@ SEC("uprobe")
 int BPF_UPROBE(tls_gnutls_recv, void *sess, void *buf, __u64 n) { return tls_stash_call(&tls_reads, sess, buf, 0); }
 SEC("uretprobe")
 int BPF_URETPROBE(tls_gnutls_recv_ret, long ret) { return tls_done(&tls_reads, 2, 2, ret, 0); }
+
+/* Go crypto/tls (milestone 6.3): (*Conn).Write and (*Conn).Read, linked
+ * into each Go binary. Go's register ABI (ABIInternal) passes the
+ * receiver, b.ptr and b.len in the first three integer registers and
+ * returns n in the first; the goroutine (g) has a register of its own.
+ * A uretprobe would rewrite the return address on a stack Go may move,
+ * so the node agent puts the return probe on each of the function's
+ * return instructions instead. A goroutine can change threads inside a
+ * call, so calls are stashed by process and goroutine, not by thread.
+ * Only the versions the node agent knows are probed. */
+#if defined(__TARGET_ARCH_arm64)
+#define GO_ARG0(c) (((struct user_pt_regs *)(c))->regs[0])
+#define GO_ARG1(c) (((struct user_pt_regs *)(c))->regs[1])
+#define GO_G(c)    (((struct user_pt_regs *)(c))->regs[28])
+#elif defined(__TARGET_ARCH_x86)
+#define GO_ARG0(c) ((c)->rax)
+#define GO_ARG1(c) ((c)->rbx)
+#define GO_G(c)    ((c)->r14)
+#endif
+
+#ifdef GO_G
+struct tls_go_key {
+    __u64 g;
+    __u32 tgid;
+    __u32 dir;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct tls_go_key);
+    __type(value, struct tls_stash);
+} tls_go_calls SEC(".maps");
+
+static __always_inline int tls_go_enter(struct pt_regs *ctx, __u32 dir)
+{
+    struct tls_go_key k = {.g = GO_G(ctx), .tgid = bpf_get_current_pid_tgid() >> 32, .dir = dir};
+    struct tls_stash st = {.obj = GO_ARG0(ctx), .buf = GO_ARG1(ctx)};
+    bpf_map_update_elem(&tls_go_calls, &k, &st, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int tls_go_return(struct pt_regs *ctx, __u32 dir)
+{
+    struct tls_go_key k = {.g = GO_G(ctx), .tgid = bpf_get_current_pid_tgid() >> 32, .dir = dir};
+    struct tls_stash *st = bpf_map_lookup_elem(&tls_go_calls, &k);
+    if (!st)
+        return 0;
+    __u64 obj = st->obj, buf = st->buf;
+    bpf_map_delete_elem(&tls_go_calls, &k);
+    return tls_emit(dir, 3, obj, buf, (__s64)GO_ARG0(ctx));
+}
+
+SEC("uprobe")
+int tls_go_write(struct pt_regs *ctx) { return tls_go_enter(ctx, 1); }
+SEC("uprobe")
+int tls_go_write_ret(struct pt_regs *ctx) { return tls_go_return(ctx, 1); }
+SEC("uprobe")
+int tls_go_read(struct pt_regs *ctx) { return tls_go_enter(ctx, 2); }
+SEC("uprobe")
+int tls_go_read_ret(struct pt_regs *ctx) { return tls_go_return(ctx, 2); }
+#endif
 
 char LICENSE[] SEC("license") = "GPL";

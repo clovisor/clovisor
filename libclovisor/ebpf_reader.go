@@ -807,6 +807,9 @@ func (r *EBPFReader) readLoop() {
 			continue
 		}
 
+		if r.tls != nil && !r.forwardPrograms() {
+			return
+		}
 		if r.tls != nil && len(rec.RawSample) >= 4 {
 			// Holding a process (milestone 6.2): attach without waiting
 			// for the events behind it.
@@ -814,7 +817,9 @@ func (r *EBPFReader) readLoop() {
 			case bpfEventTLSExec:
 				var e bpfTLSExecEvent
 				if binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &e) == nil {
-					go r.tls.onExec(e.Hdr.PID, e.Held != 0)
+					if ev, err := r.decode(rec.RawSample); err == nil {
+						go r.tls.onExec(ev, e.Held != 0)
+					}
 				}
 				continue
 			case bpfEventTLSExit:
@@ -837,6 +842,24 @@ func (r *EBPFReader) readLoop() {
 		case r.eventsCh <- ev:
 		case <-r.done:
 			return
+		}
+	}
+}
+
+// forwardPrograms sends on what TLS capture found in the binaries
+// exec'd (milestone 6.3). A process's record is queued before it is
+// continued, so it precedes anything the process does after its exec.
+func (r *EBPFReader) forwardPrograms() bool {
+	for {
+		select {
+		case ev := <-r.tls.programs:
+			select {
+			case r.eventsCh <- ev:
+			case <-r.done:
+				return false
+			}
+		default:
+			return true
 		}
 	}
 }
@@ -931,6 +954,9 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 		}
 		ev.Data = d
 
+	case bpfEventTLSExec:
+		ev.Type = EventTLSProgram // filled in by TLS capture
+
 	case bpfEventTLSExit:
 		ev.Type = EventTLSExit
 
@@ -945,7 +971,7 @@ func (r *EBPFReader) decode(raw []byte) (AuditEvent, error) {
 			data = data[:e.Caplen]
 		}
 		ev.Type = EventTLSData
-		ev.Data = TLSData{Write: e.Dir == 1, Lib: map[uint32]string{1: "libssl", 2: "gnutls"}[e.Lib], Obj: e.Obj, Len: int(e.Len),
+		ev.Data = TLSData{Write: e.Dir == 1, Lib: map[uint32]string{1: "libssl", 2: "gnutls", 3: "go"}[e.Lib], Obj: e.Obj, Len: int(e.Len),
 			Data: append([]byte(nil), data...)}
 
 	case bpfEventRunStart, bpfEventRunEnd:
@@ -1117,7 +1143,7 @@ func (r *EBPFReader) attachLSM(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
-// TLS capture wire formats (agent_audit.c, milestone 6.2).
+// TLS capture wire formats (agent_audit.c, milestones 6.2 and 6.3).
 const (
 	bpfEventTLSExec = 9
 	bpfEventTLSExit = 10

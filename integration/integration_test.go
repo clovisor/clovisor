@@ -175,6 +175,16 @@ func (e *env) build() {
 			t.Fatalf("build %s: %v\n%s", pkg, err, out)
 		}
 	}
+	// The Go HTTPS client (milestone 6.3), also stripped: Go's function
+	// table is still there to find crypto/tls by.
+	for name, flags := range map[string]string{"gotls": "", "gotls-stripped": "-s -w"} {
+		cmd := exec.Command("go", "build", "-ldflags="+flags, "-o", filepath.Join(bin, name), "./integration/gotls")
+		cmd.Dir = root
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", name, err, out)
+		}
+	}
 	// The QUIC client and server (milestone 5.6): a module of their own.
 	cmd := exec.Command("go", "build", "-o", filepath.Join(bin, "quictest"), ".")
 	cmd.Dir = filepath.Join(root, "integration", "quic")

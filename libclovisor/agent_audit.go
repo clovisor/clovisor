@@ -17,22 +17,32 @@ import (
 const (
 	EventExec = iota
 	EventConnect
-	EventRunStart // a run cgroup (agents/<name>) was created
-	EventRunEnd   // a run cgroup was removed; always the run's last event
-	EventDNS      // a resolver reply delivered to a socket in a run
-	EventHTTP     // a request through the node's proxy, and its decision
-	EventMCP      // an MCP operation through the local gateway, and its decision
-	EventDrop     // packets from a run the backstop dropped (milestone 3.3)
-	EventSocket   // a socket refused at creation, connect or send (milestones 4.1, 4.3)
-	EventUnix     // a Unix socket outside the run, first use (milestone 4.2)
-	EventExecPath // an exec's resolved path, first use per verdict (milestone 4.4)
-	EventContent  // content rules matched a request, or its body could not be checked (milestone 5.1)
-	EventModel    // a request a model rule decided, and the model it named (milestone 5.3)
-	EventUsage    // a budgeted model call's usage and what it was charged (milestone 5.4)
-	EventTLSData  // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
-	EventTLSExit  // a process with TLS probes exited
-	EventTLS      // a request parsed from TLS plaintext
+	EventRunStart   // a run cgroup (agents/<name>) was created
+	EventRunEnd     // a run cgroup was removed; always the run's last event
+	EventDNS        // a resolver reply delivered to a socket in a run
+	EventHTTP       // a request through the node's proxy, and its decision
+	EventMCP        // an MCP operation through the local gateway, and its decision
+	EventDrop       // packets from a run the backstop dropped (milestone 3.3)
+	EventSocket     // a socket refused at creation, connect or send (milestones 4.1, 4.3)
+	EventUnix       // a Unix socket outside the run, first use (milestone 4.2)
+	EventExecPath   // an exec's resolved path, first use per verdict (milestone 4.4)
+	EventContent    // content rules matched a request, or its body could not be checked (milestone 5.1)
+	EventModel      // a request a model rule decided, and the model it named (milestone 5.3)
+	EventUsage      // a budgeted model call's usage and what it was charged (milestone 5.4)
+	EventTLSData    // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
+	EventTLSExit    // a process with TLS probes exited
+	EventTLS        // a request parsed from TLS plaintext
+	EventTLSProgram // a Go binary exec'd in a capturing run, and whether its crypto/tls is probed (milestone 6.3)
 )
+
+// TLSProgramData is a binary exec'd in a capturing run whose TLS stack is
+// linked into it (milestone 6.3: Go), and whether it could be probed.
+type TLSProgramData struct {
+	Path   string
+	Stack  string // the Go version, e.g. go1.26.8
+	Probed bool
+	Reason string `json:",omitempty"` // why not
+}
 
 // TLSEventData is a request parsed from TLS plaintext, for the recorder.
 type TLSEventData struct {
@@ -44,7 +54,7 @@ type TLSEventData struct {
 // kilobytes, of Len.
 type TLSData struct {
 	Write bool
-	Lib   string // libssl (OpenSSL or BoringSSL), gnutls
+	Lib   string // libssl (OpenSSL or BoringSSL), gnutls, go
 	Obj   uint64 // the library's connection object
 	Len   int
 	Data  []byte

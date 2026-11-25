@@ -145,6 +145,10 @@ type RunSummary struct {
 	// MaxTLSUses entries, requests beyond counted in TLSDropped.
 	TLS        []TLSUse `json:"tls,omitempty"`
 	TLSDropped int      `json:"tls_dropped,omitempty"`
+	// TLSPrograms are the binaries exec'd in a capturing run with a TLS
+	// stack linked in (milestone 6.3: Go), and whether it was probed: at
+	// most MaxTLSPrograms.
+	TLSPrograms []TLSProgram `json:"tls_programs,omitempty"`
 	// Spend is the run's own budgeted model calls (milestone 5.4), by host
 	// and model: tokens, and cost at the node's prices.
 	Spend []SpendUse `json:"spend,omitempty"`
@@ -195,6 +199,21 @@ type TLSUse struct {
 }
 
 type tlsKey struct{ host, method, path, mcp, tool string }
+
+// TLSProgram is a binary with its own TLS stack, exec'd in a run that
+// captures TLS plaintext, and whether that stack was probed.
+type TLSProgram struct {
+	Path   string `json:"path"`
+	Stack  string `json:"stack"` // e.g. go1.26.8
+	Probed bool   `json:"probed"`
+	Reason string `json:"reason,omitempty"` // why not
+	Execs  int    `json:"execs"`
+}
+
+type tlsProgKey struct{ path, stack, reason string }
+
+// MaxTLSPrograms bounds the programs kept per run.
+const MaxTLSPrograms = 64
 
 // MaxTLSUses bounds the distinct TLS entries kept per run.
 const MaxTLSUses = 256
@@ -406,6 +425,7 @@ type runState struct {
 	content map[contentKey]*ContentUse
 	models  map[modelKey]*ModelUse
 	tls     map[tlsKey]*TLSUse
+	tlsProg map[tlsProgKey]*TLSProgram
 	spend   map[spendKey]*SpendUse
 	// callFor names the call a cgroup belongs to; calls counts events
 	// per call.
@@ -567,6 +587,7 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 		content:  make(map[contentKey]*ContentUse),
 		models:   make(map[modelKey]*ModelUse),
 		tls:      make(map[tlsKey]*TLSUse),
+		tlsProg:  make(map[tlsProgKey]*TLSProgram),
 		spend:    make(map[spendKey]*SpendUse),
 		calls:    make(map[string]*CallSummary),
 		callFor: func(cg uint64) string {
@@ -603,6 +624,10 @@ func (r *RunRecorder) state(ev AuditEvent, path string) *runState {
 			for i := range prev.Summary.TLS {
 				u := prev.Summary.TLS[i]
 				st.tls[tlsKey{u.Host, u.Method, u.Path, u.MCPMethod, u.Tool}] = &u
+			}
+			for i := range prev.Summary.TLSPrograms {
+				u := prev.Summary.TLSPrograms[i]
+				st.tlsProg[tlsProgKey{u.Path, u.Stack, u.Reason}] = &u
 			}
 			for i := range prev.Summary.Models {
 				u := prev.Summary.Models[i]
@@ -981,6 +1006,29 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 		st.add(TimelineEvent{Time: ev.Timestamp, Type: "tls", PID: ev.PID, CgroupID: ev.CgroupID, Method: d.Method,
 			DstName: d.Host, Path: d.Path, Note: note, MCPName: d.Tool}, r.MaxEvents)
 
+	case EventTLSProgram:
+		d, ok := ev.Data.(TLSProgramData)
+		st := r.state(ev, "")
+		if !ok || st == nil {
+			return nil, nil
+		}
+		k := tlsProgKey{d.Path, d.Stack, d.Reason}
+		u := st.tlsProg[k]
+		if u == nil {
+			if len(st.tlsProg) >= MaxTLSPrograms {
+				return nil, nil
+			}
+			u = &TLSProgram{Path: d.Path, Stack: d.Stack, Probed: d.Probed, Reason: d.Reason}
+			st.tlsProg[k] = u
+			note := d.Stack + " crypto/tls probed"
+			if !d.Probed {
+				note = d.Stack + " crypto/tls not visible: " + d.Reason
+			}
+			st.add(TimelineEvent{Time: ev.Timestamp, Type: "tls-program", PID: ev.PID, CgroupID: ev.CgroupID,
+				Path: d.Path, Note: note}, r.MaxEvents)
+		}
+		u.Execs++
+
 	case EventModel:
 		d := ev.Data.(ModelData)
 		st := r.state(ev, "")
@@ -1285,6 +1333,18 @@ func (r *RunRecorder) write(st *runState) (*RunTimeline, error) {
 			return a.Host < b.Host
 		}
 		return a.Model < b.Model
+	})
+
+	tl.Summary.TLSPrograms = nil
+	for _, u := range st.tlsProg {
+		tl.Summary.TLSPrograms = append(tl.Summary.TLSPrograms, *u)
+	}
+	sort.Slice(tl.Summary.TLSPrograms, func(i, j int) bool {
+		a, b := tl.Summary.TLSPrograms[i], tl.Summary.TLSPrograms[j]
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.Stack+a.Reason < b.Stack+b.Reason
 	})
 
 	tl.Summary.TLS = nil
