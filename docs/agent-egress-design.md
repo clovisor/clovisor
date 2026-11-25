@@ -124,6 +124,7 @@ place:
 | Bundled stacks: OpenSSL linked into a binary and exported (official Node builds) probed in the binary itself, labelled by its banner; Bun's BoringSSL and rustls listed as not visible, with the reason. The Bun-built `claude` binary was not examined, but an app compiled with Bun was. Found: detaching one link per probe held the next exec up to 1.6 s, so all TLS probes are now uprobe-multi links (Linux 6.6 for `-uprobes`). | [6.4 status](#64-status-2026-11-25) |
 | Visibility report: per run and destination, the best level anything saw it at (requests, plaintext, name, address) and why not better, in the timeline and `agentctl events`; the receipt's TLS posture gains what audit will see. | [6.5 status](#65-status-2026-11-25) |
 | Runs' requests inside terminated tunnels could be taken as another run's while that run had a tunnel to the same host open: Envoy pooled the connections to the terminating listener without the client's identity in the key. Fixed by carrying it in the hashed upstream server name; restart Envoy after upgrading. Restored capturing runs get their running processes probed again; Debian's Node in the tests. Phase 6 complete. | [6.6 status](#66-status-2026-11-25) |
+| Phase 7 planned: validation against the agents people run (Claude Code, Codex, Gemini CLI, OpenCode, a LangGraph server, the OpenAI Agents SDK) and hardening; then Kubernetes through Agent Substrate, with Actor identity and Clovisor as its egress policy point. Kernel constructs for identity beyond cgroups weighed; sandboxes (gVisor has no eBPF; microVMs do, inside the guest) set what the kernel layer can see. | [Phase 7 plan](#phase-7-plan-2026-11-25) |
 
 ---
 
@@ -1540,6 +1541,7 @@ kernel objects. Treat this as a new codebase in Clovisor's lineage, not a port.
 | **4** | Exec gating via BPF LSM; raw-socket and `AF_UNIX` gating. Child cgroups per tool call. Sub-agent attenuation. | Medium |
 | **5** | Budgets (stateful), content policy, ask-mode with a human approval UI, MCP sampling control, opt-in SNI-forwarded QUIC. | Higher |
 | **6** | Restart recovery, then TLS uprobes for visibility without termination. *Revised 2026-11-24: restart recovery added* ([Phase 6 plan](#phase-6-plan-2026-11-24)). | Low |
+| **7** | Validation against real agents and hardening; then Kubernetes: Actor identity and Clovisor as Agent Substrate's egress policy point. *New 2026-11-25* ([Phase 7 plan](#phase-7-plan-2026-11-25)). | Low on nodes; new on Kubernetes |
 
 **Why this order.** The original order put the proxy at Phase 3 and MCP at
 Phase 5, behind kernel enforcement. That front-loaded the least novel part
@@ -4858,6 +4860,148 @@ Open:
 - Explicit mode's identity fix was not separately tested live.
 - The x86 BPF object compiles but has not run.
 - The Bun-built `claude` binary was not examined.
+
+### Phase 7 plan (2026-11-25)
+
+Phases 1 to 6 built Clovisor on one Linux node, and tested it with curl,
+Python, git, Go and Node standing in for agents. Phase 7 has two aims. It
+validates against the agents people actually run, and hardens what that
+finds. It also takes the policy layer to Kubernetes, starting where agents
+there are going: Agent Substrate.
+
+#### What shapes the plan
+
+1. **What makes an agent easy or hard is not its framework.** Five
+   properties decide how Clovisor sees and governs it:
+   - **Process model.** One process per session, as the coding-agent CLIs
+     have, is a run. Many sessions in one process, as a LangGraph or Agents
+     SDK server has, gets per-process enforcement only
+     ([§5.8](#58-enforcement-granularity-is-the-process-tree)).
+   - **TLS stack.** It decides what uprobes can see (Phase 6).
+   - **Proxy and trust settings.** Whether the client honours
+     `HTTPS_PROXY`, and the trust store variables termination relies on. A
+     client with built-in roots (rustls with `webpki-roots`) fails on
+     every terminated host.
+   - **MCP transport:** stdio children, or remote servers.
+   - **The agent's own sandbox:** bubblewrap in Claude Code, Landlock and
+     seccomp in Codex. Neither has been tested stacked on Clovisor's cgroups
+     and BPF LSM.
+2. **The agents to validate:**
+
+   | Agent | Runtime, so TLS stack | Process model | Notes |
+   |---|---|---|---|
+   | Claude Code (and the Claude Agent SDK, which spawns it) | Bun: not visible to uprobes | one per session; sub-agents | Heavy MCP use; own sandbox. The binary was not examined in 6.4. |
+   | OpenAI Codex CLI | Rust: likely rustls | one per session | Trust store handling decides termination; own sandbox. |
+   | Gemini CLI | Node | one per session | Covered by 6.2 and 6.4, depending on the Node build. |
+   | OpenCode | to check | one per session | |
+   | LangGraph server | Python | many sessions per process | The case per-process identity serves least. |
+   | OpenAI Agents SDK | Python | either | Native MCP. |
+
+   Each needs a model endpoint. The integration origin already serves
+   `/v1/messages` and `/v1/chat/completions` (5.3), and the agents take a
+   base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`), so tests need no
+   real model or key. Scripted model responses make an agent call tools
+   deterministically.
+3. **The kernel identifies tasks, not sessions.** Every kernel construct
+   that could name a run belongs to a task or a thread:
+
+   | Construct | Granularity | Read from a socket | Trade-off |
+   |---|---|---|---|
+   | cgroup (today) | process tree | yes (`sk_cgrp`, sock_diag) | Moving a process is a privileged write; the parked child solved it (Phase 1). |
+   | threaded cgroup (v2) | thread | yes: a socket takes its creating thread's cgroup | Only for a framework that runs each session on its own thread; async runtimes share threads. |
+   | network namespace | process tree | yes (netns cookie) | Strongest isolation, but each run needs routing; the alternative weighed in [§3.1](#31-prior-art-and-positioning). |
+   | a uid per run (dynamic users) | process tree | yes (socket uid) | Simple and long proven (Android); files the run writes are owned by its uid. |
+   | BPF task storage, copied at fork | process or thread | at socket creation | Needs no privileged writes, but every fork path must be hooked. Survives nothing that cgroups do not. |
+
+   None of them tells sessions apart that share a thread. That takes
+   cooperation from the process: a credential per session, as credential
+   identity already has (§4.3), carried by the framework's HTTP client. A
+   small adapter per framework could do it. The proxy would then hold the
+   session as the run, and the cgroup as the boundary that it cannot
+   leave. Cgroups stay the identity; the table is what exists if a case
+   needs another.
+4. **Sandboxes change what the kernel layer can see.**
+   - **gVisor** implements system calls in userspace. It does not run eBPF
+     for the sandboxed program: `bpf(2)` only loads cgroup device programs,
+     which "have no effect" (gVisor's syscall compatibility table). The
+     host's hooks see gVisor's own system calls, not the agent's. With
+     gVisor's network stack they do not see its connects at all.
+   - gVisor's replacement is **Runtime Monitoring**: trace points streamed
+     to a process outside the sandbox. Falco consumes it. It observes and
+     alerts. It does not decide, and whether it can block is to be found
+     out.
+   - **MicroVMs** (Cloud Hypervisor, Firecracker, Kata) run a real Linux
+     guest. eBPF works inside the guest, so a node agent in the guest
+     works as on any node. From the host the guest is opaque.
+5. **Agent Substrate already does what transparent mode exists for.**
+   Substrate is a CNCF Sandbox project, donated by Google in November 2026.
+   - **Its model.** An Actor (an agent session) runs in its own gVisor or
+     microVM sandbox, on a Worker Pod shared with other Actors. It is
+     suspended to storage between turns, and resumed anywhere.
+   - **Its egress.** nftables sends an Actor's traffic into a local tunnel.
+     The tunnel opens mTLS to an Envoy or agentgateway egress gateway, with
+     a certificate minted for that Actor (atespace, name, UID). The gateway
+     checks a per-Actor `EgressPolicy`, through an `ext_proc` container in
+     its Envoy mode. Traffic capture is unbypassable, and the identity
+     cannot be forged.
+   - **What it lacks.** That is what Clovisor's proxy layer has:
+     - MCP tool policy and pinning;
+     - narrated denials and the receipt;
+     - learn and check;
+     - budgets, model, content and `ask` rules;
+     - timelines and the visibility report.
+   - **What does not carry over.** Clovisor's kernel layer: cgroups name a
+     Worker, not an Actor; host BPF does not see into gVisor; restart
+     recovery and per-process probes assume a process stays on its node.
+   - **The likely fit:** Clovisor as Substrate's egress policy point.
+     Substrate's pluggable egress design (its issue #430) is new, closed
+     in November 2026 in favour of follow-up work. The protocol between its
+     proxy and the policy point, and how identity is represented, are not
+     settled.
+6. **Phase 6 left open:**
+   - the x86 BPF object has compiled but never run;
+   - explicit mode's identity fix was not tested live;
+   - the legacy packages (`libproto`, `k8s-ctlr`) do not build.
+
+   And 6.6 found an identity bug that had been there since 2.7. Identity
+   across the proxy's hops deserves a review of its own.
+
+#### Milestones
+
+| # | Milestone | Delivers | Useful alone because |
+|---|---|---|---|
+| **7.0** | Spikes | Each agent in the table, under explicit and transparent mode against the mock model: its TLS stack and trust handling, whether it honours the proxy, MCP children, its own sandbox stacked on Clovisor's. A LangGraph server's sessions: what per-process identity gives, and what a per-session credential needs from the framework. Substrate on a local cluster: replace its egress `ext_proc` with Clovisor's, and read the Actor certificate. gVisor Runtime Monitoring as an event source for exec and connect. The x86 object, run. | Settles what the agents and Substrate allow before code depends on it. |
+| **7.1** | Agent validation | A suite that runs the agents 7.0 says can run in a container (licences, sign-in), with scripted model responses that call tools. Each agent's run must be recorded, governed and learned like the stand-ins. Fixes for what it finds. Each agent's visibility (Phase 6) documented. | The agents people use are known to work, and how. |
+| **7.2** | Hardening | CI on x86 and arm64, and on kernels from the documented floor. A review of identity across every proxy hop, explicit mode included, with a test per hop. The legacy packages removed, or fenced out of the build. Packaging: a systemd unit, Envoy setup, a distribution package. | A node can be installed, upgraded and trusted. |
+| **7.3** | Actor identity | A third identity mode beside cgroup and credential: the Actor, read from Substrate's certificate and checked against its API, as its gateway does. The Actor is the run: its timeline spans suspend, resume and Worker moves. Profiles bound by ActorTemplate and atespace: the `namespace` and `serviceAccount` selectors the compiler rejects today. | Clovisor's records and receipts for Actors. |
+| **7.4** | Substrate egress policy | Clovisor's `ext_proc` as Substrate's egress policy point, in place of `EgressPolicy` or beside it. MCP gateway and tool policy for Actors' remote MCP. The receipt for an ActorTemplate. | Clovisor's policy for agents on Kubernetes, with Substrate's enforcement. |
+| **7.5** | Sandbox audit | If 7.0 finds it fit: exec and connect from gVisor Runtime Monitoring, attributed to Actors, in timelines. The equivalent of Phase 1's kernel audit, for gVisor. | What Actors ran, not only what they sent. |
+| **7.6** | Tests and docs | Integration tests on a local cluster with Substrate. Operator guide for Kubernetes, and for each validated agent. | Phase 7 ships. |
+
+Order: 7.0 first. 7.1 and 7.2 are independent of Kubernetes, and either
+can go first. The x86 run depends on nothing else and can happen at any
+point. CI is started (`.github/workflows/ci.yml`): `make check` and both
+integration suites on GitHub's x86 and arm64 runners. Those runners boot
+without BPF LSM, so its checks skip there. A host booted with it (an EC2
+instance, say) runs the full suite before a release. 7.3 then 7.4. 7.5 is optional, after 7.3. 7.6 last. If 7.0
+finds Substrate's egress design unready, 7.3 and 7.4 wait, and Phase 7
+ships with 7.1 and 7.2.
+
+#### Proposed decisions
+
+- **Identity is pluggable; cgroups stay the default on a node.** Credential
+  identity stays the answer for sessions that share a process. Actor
+  identity is the answer for Substrate. Threaded cgroups and per-run uids
+  stay in reserve.
+- **Where a sandbox captures traffic, Clovisor does not.** In Substrate,
+  capture and identity are Substrate's. Clovisor decides, records and
+  explains. Its kernel layer is for nodes it runs on.
+- **Validate agents as they ship.** Test the released binaries, against a
+  mock model, not patched builds. Record what each one's TLS and trust
+  handling allows.
+- **No dependency on Substrate's unsettled protocol.** Integrate through
+  its Envoy `ext_proc` and its certificate. Follow its identity and proxy
+  protocol work, and contribute to it, rather than build on drafts.
 
 ---
 

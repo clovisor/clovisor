@@ -1,0 +1,136 @@
+# Clovisor CI (milestone 7.2): the checks and both integration suites on
+# x86 and arm64 GitHub-hosted runners.
+#
+# What the hosted runners do not give:
+# - BPF LSM. It is compiled into Ubuntu's kernel, but the runners boot
+#   without it in lsm=, which cannot be changed there. The transparent
+#   checks that need it (exec, Unix and socket-family gating, sub-agents,
+#   restart) skip, and say so. Run the full suite on a host booted with
+#   BPF LSM (operator guide §11) before a release.
+# - The optional binaries (CLOVISOR_IT_NODE, _RUSTLS, _BUN): their checks
+#   skip.
+name: ci
+
+on:
+  push:
+    branches: [master, "phase*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The main module needs Go 1.23; the QUIC test client (integration/quic)
+  # needs 1.26.
+  GO_VERSION: "1.26.x"
+
+jobs:
+  check:
+    name: check (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install BPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+      - name: Build the BPF object
+        run: make bpf
+      - name: gofmt
+        # The legacy packages are not formatted, and not built (Phase 7.2).
+        run: |
+          out=$(gofmt -l cmd libclovisor integration | grep -v -e 'libclovisor/clovisor_\(bcc\|cfg\|http_server\|k8s\)\.go' -e libclovisor/libproto/ || true)
+          if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
+      - name: make check
+        run: make check
+
+  integration:
+    name: integration (${{ matrix.arch }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Explicit-proxy suite
+        run: make integration
+
+  integration-transparent:
+    name: integration-transparent (${{ matrix.arch }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install BPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+      - name: Kernel
+        # What the suite will find: the kernel (uprobe-multi links need
+        # 6.6), whether BPF LSM is active, and BTF.
+        run: |
+          uname -a
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unreadable)"
+          ls -l /sys/kernel/btf/vmlinux
+          {
+            echo "### Kernel ($(uname -m))"
+            echo "- $(uname -r)"
+            if grep -qw bpf /sys/kernel/security/lsm 2>/dev/null; then
+              echo "- BPF LSM active: every transparent check runs"
+            else
+              echo "- BPF LSM not active: the checks that need it skip"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Transparent suite
+        # CLOVISOR_IT_LOG prints the node agent's log even when every check
+        # passes, so a run can be read afterwards.
+        # shell: bash runs with pipefail, so tee keeps the suite's status.
+        shell: bash
+        env:
+          CLOVISOR_IT_LOG: "1"
+        run: make integration-transparent 2>&1 | tee transparent.log
+      - name: Skipped checks
+        if: always()
+        run: |
+          {
+            echo "### Transparent checks ($(uname -m))"
+            echo "- passed: $(grep -c -- '--- PASS' transparent.log || true)"
+            echo "- skipped: $(grep -c -- '--- SKIP' transparent.log || true)"
+            grep -A1 -- '--- SKIP' transparent.log | grep -v -- '^--$' | sed 's/^ */    /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transparent-${{ matrix.arch }}.log
+          path: transparent.log
+          retention-days: 14
