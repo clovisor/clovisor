@@ -7,10 +7,12 @@
 
 .PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent format doc
 
-# Compiler and flags
+# Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
+# clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
+# no 32-bit atomic exchange and fails on_egress.
 CC = clang
 BPF_ARCH = $(shell uname -m | sed -e s/aarch64/arm64/ -e s/x86_64/x86/)
-BPF_CFLAGS = -target bpf -g -O2 -Wall -D__TARGET_ARCH_$(BPF_ARCH) -I/usr/include/$(shell uname -m)-linux-gnu
+BPF_CFLAGS = -target bpf -mcpu=v3 -g -O2 -Wall -D__TARGET_ARCH_$(BPF_ARCH) -I/usr/include/$(shell uname -m)-linux-gnu
 
 # Directories
 BPF_SRC = libclovisor/ebpf/agent_audit.c
