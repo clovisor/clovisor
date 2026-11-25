@@ -186,6 +186,16 @@ func (e *env) startTransparent() {
 		t.Fatalf("prepare: %v %s", err, errOut)
 	}
 	e.run("cp", "policy-transparent", e.name("agent")+":/etc/clovisor/policy")
+	// Without BPF LSM, exec rules cannot be enforced, and the node agent
+	// refuses profiles that would gate exec. There, the profiles keep
+	// them as audit only, and the checks that need BPF LSM skip
+	// (needLSM): GitHub's runners boot without it.
+	if lsm, _ := os.ReadFile("/sys/kernel/security/lsm"); !strings.Contains(","+strings.TrimSpace(string(lsm))+",", ",bpf,") {
+		t.Log("BPF LSM not active on this host: exec rules are audit only, and the checks that need BPF LSM skip")
+		if _, errOut, err := e.sh(`sed -i 's/^  exec:$/  exec:\n    audit_only: true/' /etc/clovisor/policy/*.yaml`); err != nil {
+			t.Fatalf("audit-only exec: %v %s", err, errOut)
+		}
+	}
 	// The policy names the origin by address (udp and icmp blocks); ping
 	// sockets are for everyone, as on most distributions.
 	if out, errOut, err := e.sh(`set -e
