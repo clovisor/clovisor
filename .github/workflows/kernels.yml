@@ -35,7 +35,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: ["5.10-main", "5.15-main", "rhel9.7-main", "6.1-main", "6.6-main", "6.12-main", "6.18-main"]
+        # Dated images, pinned: the action names an image's file by its
+        # version less the date, so "-main" tags do not boot.
+        kernel: ["5.10", "5.15", "rhel9.7", "6.1", "6.6", "6.12", "6.18"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -57,7 +59,7 @@ jobs:
         with:
           test-name: clovisor-bpf-load
           image: kind
-          image-version: ${{ matrix.kernel }}
+          image-version: ${{ matrix.kernel }}-20261021.083220
           host-mount: ./
           cpu: 2
           mem: 4G
