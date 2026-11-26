@@ -744,6 +744,8 @@ cd $HOME && MOCK_KEY=x timeout 120 $(ls /it/agents/@openai/codex/node_modules/@o
 	"gemini": `mkdir -p $HOME/.gemini && echo '{"security": {"auth": {"selectedType": "gemini-api-key"}, "folderTrust": {"enabled": false}}}' > $HOME/.gemini/settings.json
 M=/it/agents/@google/gemini-cli
 cd $HOME && GEMINI_API_KEY=x GOOGLE_GEMINI_BASE_URL=https://origin.test:8443 timeout 120 /it/bin/node-official $M/$(/it/bin/node-official -p "Object.values(require('$M/package.json').bin)[0]") -m mock --yolo -p "run the command"`,
+	"claude-quiet": `cd $HOME && CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ANTHROPIC_BASE_URL=https://origin.test:8443 ANTHROPIC_API_KEY=x timeout 120 /it/agents/@anthropic-ai/claude-code/bin/claude.exe -p "run the command" --model mock --allowedTools Bash`,
+	"claude": `cd $HOME && ANTHROPIC_BASE_URL=https://origin.test:8443 ANTHROPIC_API_KEY=x timeout 120 /it/agents/@anthropic-ai/claude-code/bin/claude.exe -p "run the command" --model mock --allowedTools Bash`,
 	"opencode": `mkdir -p $HOME/.config/opencode && cat > $HOME/.config/opencode/opencode.json <<T
 {"provider": {"mock": {"npm": "@ai-sdk/openai-compatible", "name": "mock",
    "options": {"baseURL": "https://origin.test:8443/v1", "apiKey": "x"}, "models": {"mock": {"name": "mock"}}}},
@@ -773,7 +775,7 @@ func (e *env) runAgents(t *testing.T, profile, prefix string) {
 	if os.Getenv("CLOVISOR_IT_AGENTS") == "" {
 		t.Skip("CLOVISOR_IT_AGENTS unset: real agents not run")
 	}
-	for _, name := range []string{"codex", "gemini", "opencode"} {
+	for _, name := range []string{"codex", "gemini", "opencode", "claude", "claude-quiet"} {
 		t.Run(name, func(t *testing.T) {
 			if name == "gemini" && os.Getenv("CLOVISOR_IT_NODE") == "" {
 				t.Skip("Gemini CLI needs Node 20 or later: set CLOVISOR_IT_NODE")

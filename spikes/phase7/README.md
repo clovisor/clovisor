@@ -70,5 +70,37 @@ Findings:
   where the proxy terminates. Their phoning home, tunnelled, is a name and
   nothing more.
 
-Not yet: Claude Code; a LangGraph server's sessions; gVisor Runtime
-Monitoring; Agent Substrate.
+### Claude Code (2026-11-26)
+
+Claude Code 2.1.332, npm install, in a container. This is not the copy
+the session that built Clovisor runs in. Its npm package ships the native
+binary twice (`bin/claude.exe`, and the platform package it copies it
+from), 368 MB each. The spike keeps one.
+
+- **Against the mock** (`ANTHROPIC_BASE_URL`, `--allowedTools Bash`): it
+  completed the turn. It probes `HEAD /api/hello` on the base URL before
+  its first call. Its request offers 12 tools: `Bash`, `Agent`,
+  `Workflow` and `ScheduleWakeup` among them.
+- **Under Clovisor**, transparent and explicit: it finished its turn in
+  both. It honours `https_proxy` with the run's credential, and trusts
+  the node CA, so its model calls are terminated and decided per request.
+- **TLS:** Bun, BoringSSL linked in. It is listed `Bun's BoringSSL not
+  visible`, as 6.4 inferred from the Bun runtime without examining this
+  binary.
+- **Reached besides the model:** `api.anthropic.com`, four connections,
+  though `ANTHROPIC_BASE_URL` names the mock; and
+  `http-intake.logs.us5.datadoghq.com` (telemetry). Both name only.
+- **With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`**, it reached only
+  the mock and the origin. A profile can then be exact: the model
+  endpoint and what the work needs.
+
+| | Claude Code |
+|---|---|
+| Runtime, TLS | Bun, BoringSSL linked in |
+| Uprobes see its own TLS | no |
+| Trusts the node CA | yes |
+| Honours `https_proxy`, with credential | yes |
+| Reached besides the model | `api.anthropic.com`, Datadog logs; none with nonessential traffic off |
+
+Not yet: a LangGraph server's sessions; gVisor Runtime Monitoring; Agent
+Substrate.
