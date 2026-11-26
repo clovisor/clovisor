@@ -166,18 +166,21 @@ come back unprofiled.
 
 The node agent writes `<runtime-dir>/envoy.json` and, for terminated hosts,
 leaf certificates in `<runtime-dir>/envoy/tls`. The integration tests pin
-**Envoy 1.34.14**; use that release or check a newer one with
-`make integration ENVOY_IMAGE=…` (see §16) before upgrading.
+**Envoy 1.39.5**; use that release or check a newer one with
+`make integration ENVOY_IMAGE=…` (see §16) before upgrading. The bootstrap
+needs **Envoy 1.39 or later**: it keys connection pools with
+`envoy.hashable_string`, which older releases reject. Upgrade Envoy with
+the node agent, and restart it on the new bootstrap.
 
 ```sh
 # as root, Envoy as uid 101 (the image's user)
 sudo docker run -d --name clovisor-envoy --network host \
-  -v /run/clovisor:/run/clovisor envoyproxy/envoy:v1.34.14 -c /run/clovisor/envoy.json
+  -v /run/clovisor:/run/clovisor envoyproxy/envoy:v1.39.5 -c /run/clovisor/envoy.json
 
 # a user-level node agent: Envoy as the same user
 docker run -d --name clovisor-envoy --network host --user "$(id -u):$(id -g)" \
   -v "$XDG_RUNTIME_DIR/clovisor:$XDG_RUNTIME_DIR/clovisor" \
-  envoyproxy/envoy:v1.34.14 -c "$XDG_RUNTIME_DIR/clovisor/envoy.json"
+  envoyproxy/envoy:v1.39.5 -c "$XDG_RUNTIME_DIR/clovisor/envoy.json"
 
 # macOS, Envoy from Homebrew
 envoy -c ~/Library/Application\ Support/Clovisor/run/envoy.json
@@ -838,6 +841,10 @@ relying on it.
 | `bpf_ima_file_hash`, the TAI clock | exec by content (`exec.allow[].hash`) | 5.18, 5.19 |
 | uprobe-multi links with cookies | TLS plaintext (`-uprobes`) | 6.6 |
 
+CI loads every BPF program on 5.15, 6.1, 6.6, 6.12, 6.18 and RHEL 9.7's
+kernel, each in a VM (`kernels` workflow, `TestBPFLoad`), and on 5.10
+below the floor. That tests loading, not attaching or the suites.
+
 **Enabling BPF LSM.** Transparent mode works without it, but socket
 families, foreign sockets, Unix sockets and exec are then not governed. The
 receipt marks those rules "not enforced", and `agentctl status` shows
@@ -1317,6 +1324,9 @@ agentctl events --json <run-id>
 - **Approvals come from outside the run.** The run API refuses decisions
   from inside a run or its descendants, so an agent cannot approve itself.
   With credential identity only root may decide.
+- **Upgrading to Phase 7.2: Envoy 1.39 or later.** 6.6's fix below now
+  uses Envoy's hashable string object, so the bootstrap needs Envoy 1.39
+  or later (§5).
 - **Upgrading to Phase 6.6: restart Envoy.** Before it, while one run had a
   tunnel open to a terminated host, another run's requests inside its own
   tunnels to that host could be taken as the first run's: decided under
@@ -1497,7 +1507,12 @@ ignore the proxy, it checks:
   `CLOVISOR_IT_LOG=1` prints the node agent's log even when the checks
   pass;
 - tunnel identity: while one run holds a tunnel to a terminated host
-  open, another run's requests to it are its own, decided by its profile;
+  open, another run's requests to it are its own, decided by its profile,
+  in transparent mode and through the explicit proxy with credential
+  identity;
+- forged identity: plain HTTP from a run carrying forged identity headers
+  (another client address, another run) is the sending run's, in both
+  modes;
 - agents, with `CLOVISOR_IT_AGENTS=1`: Claude Code (also with its
   nonessential traffic off), Codex, Gemini CLI and OpenCode, at the
   versions `integration/agents` pins, against a scripted model

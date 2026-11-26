@@ -385,8 +385,8 @@ func TestEnvoyBootstrapTermination(t *testing.T) {
 		}
 	}
 	// Each client's tunnels get a connection pool of their own (6.6): the
-	// identity is in the hashed upstream server name, which is not shared
-	// on, where it would be the origin's SNI.
+	// identity is in a hashable string (7.2), shared with the next
+	// connection only.
 	var boot map[string]interface{}
 	json.Unmarshal(b, &boot)
 	var found bool
@@ -394,10 +394,10 @@ func TestEnvoyBootstrapTermination(t *testing.T) {
 	walk = func(v interface{}) {
 		switch x := v.(type) {
 		case map[string]interface{}:
-			if x["object_key"] == "envoy.network.upstream_server_name" {
+			if x["object_key"] == "clovisor.pool" {
 				found = true
-				if _, shared := x["shared_with_upstream"]; shared {
-					t.Error("the pool key is shared with upstream")
+				if x["factory_key"] != "envoy.hashable_string" || x["shared_with_upstream"] != "ONCE" {
+					t.Errorf("the pool key is not a hashable string shared once: %v", x)
 				}
 				if f, _ := json.Marshal(x["format_string"]); !strings.Contains(string(f), "%DOWNSTREAM_REMOTE_ADDRESS%") {
 					t.Errorf("pool key without the client: %s", f)

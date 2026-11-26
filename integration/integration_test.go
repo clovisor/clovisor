@@ -154,6 +154,8 @@ func TestIntegration(t *testing.T) {
 	t.Run("budgets", e.testBudgets)
 	t.Run("ask", e.testAsk)
 	t.Run("sampling-ask", e.testSamplingAsk)
+	t.Run("tunnel-identity", e.testTunnelIdentityExplicit)
+	t.Run("forged-identity", func(t *testing.T) { e.forgedIdentity(t, "it-agents", "") })
 	t.Run("agents", func(t *testing.T) { e.runAgents(t, agentSuite{audit: "it-agents", enforce: "it-agents-enforce"}) }) // before pin-drift restarts the origin
 	t.Run("langgraph", func(t *testing.T) { e.runLangGraph(t, "it-agents", "", true) })
 	t.Run("pin-drift", e.testPinDrift)
@@ -742,6 +744,77 @@ EOS`); err != nil {
 		": remembered by root (uid 0)", ": timed out after 2")
 	out, _, _ = e.sh("/it/bin/agentctl pending --all")
 	expect(t, out, id+"  ", "approved by root (uid 0)", "denied by root (uid 0) (remembered)", "timed out")
+}
+
+// forgedIdentity sends plain HTTP from a run, with the headers Clovisor
+// carries identity in (milestone 7.2) forged: another client address and
+// another run. Envoy overwrites or strips them on every hop, so the
+// request is the sending run's, and recorded in its timeline.
+func (e *env) forgedIdentity(t *testing.T, profile, prefix string) {
+	out, id := e.agentRun(profile, prefix+`curl -s -o /dev/null -w "plain %{http_code}\n" -H "x-clovisor-client: 127.0.0.1:1,127.0.0.1:2" -H "x-clovisor-run: 000000000000" -H "x-clovisor-connect: other.test:443" http://origin.test/allowed`)
+	if !strings.Contains(out, "plain 200") {
+		t.Errorf("plain HTTP with forged identity headers: %s", out)
+	}
+	tl := e.timeline(id)
+	if !strings.Contains(tl, `"/allowed"`) || !strings.Contains(tl, `"port": 80`) {
+		t.Errorf("the request is not in its own run's timeline:\n%s", tl)
+	}
+	log, _, _ := e.sh("cat /var/log/node-agent.log")
+	if strings.Contains(log, "recorded in no run") {
+		t.Errorf("a request was refused as no run's:\n%s", log)
+	}
+}
+
+func (e *env) testTunnelIdentityExplicit(t *testing.T) {
+	// Milestone 7.2: 6.6's tunnel-identity check, through the explicit
+	// proxy with credential identity. Run A (it) holds a terminated tunnel
+	// to origin.test open; run B (it-agents, audit, which allows any path)
+	// requests /secret, which it refuses. B's requests must be B's: had
+	// B's tunnels come from A's pool, they would carry A's credential, be
+	// refused under it, and be recorded as A's.
+	if _, errOut, err := e.sh("rm -f /tmp/tie-*"); err != nil {
+		t.Fatal(errOut)
+	}
+	hold := `import os, time, requests
+s = requests.Session()
+print("A", s.get("https://origin.test/allowed").status_code, flush=True)
+open("/tmp/tie-ready", "w").close()
+while not os.path.exists("/tmp/tie-done"):
+    time.sleep(0.05)
+s.close()
+`
+	if err := os.WriteFile(filepath.Join(e.dir, "bin", "tiehold.py"), []byte(hold), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.run("exec", "-d", e.name("agent"), "sh", "-c", "/it/bin/agentctl run --profile it -- python3 /it/bin/tiehold.py > /tmp/tie-a.out 2>&1")
+	if _, _, err := e.sh("for i in $(seq 100); do [ -f /tmp/tie-ready ] && exit 0; sleep 0.1; done; exit 1"); err != nil {
+		a, _, _ := e.sh("cat /tmp/tie-a.out")
+		t.Fatalf("run A did not hold its tunnel open:\n%s", a)
+	}
+	out, idB := e.agentRun("it-agents", `for i in 1 2 3 4 5 6 7 8; do echo "B$i $(curl -s -m 5 -o /dev/null -w "%{http_code}" https://origin.test/secret)"; done`)
+	e.sh("touch /tmp/tie-done")
+	a := ""
+	for i := 0; i < 50 && !strings.Contains(a, "agentctl: run "); i++ {
+		a, _, _ = e.sh("cat /tmp/tie-a.out")
+		time.Sleep(100 * time.Millisecond)
+	}
+	m := runIDRE.FindStringSubmatch(a)
+	if m == nil {
+		t.Fatalf("run A: %s", a)
+	}
+	for i := 1; i <= 8; i++ {
+		if !strings.Contains(out, fmt.Sprintf("B%d 200", i)) {
+			t.Errorf("run B's requests:\n%s", out)
+			break
+		}
+	}
+	if strings.Count(e.timeline(idB), `"/secret"`) == 0 {
+		t.Errorf("run B's timeline lacks its requests")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if tlA, _, _ := e.sh("cat /var/lib/clovisor/runs/run-" + m[1] + ".json"); strings.Contains(tlA, "/secret") {
+		t.Errorf("run B's requests were recorded, and decided, as run A's")
+	}
 }
 
 func (e *env) testPinDrift(t *testing.T) {

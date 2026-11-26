@@ -1,3 +1,8 @@
+//go:build legacy
+
+// Legacy Clovisor code (before the agent egress design), fenced out of
+// the build (milestone 7.2): it does not build against this module.
+
 package main
 
 import (

@@ -5107,6 +5107,63 @@ Verified:
   `CLOVISOR_IT_AGENTS=1` and `CLOVISOR_IT_PYDEPS`. Without them, the agent
   and LangGraph checks skip, as in CI.
 
+#### 7.2 status (2026-11-26, in progress)
+
+Done so far:
+
+- **Envoy 1.39.5, and a hashable pool key.** The integration tests and
+  the guide pin `envoyproxy/envoy:v1.39.5`, the release Agent Substrate
+  pins, by the same digest. 6.6's pool key moves from the upstream server
+  name to `clovisor.pool`, an `envoy.hashable_string` shared once: it
+  reaches the connection to the terminating listener and no further. The
+  bootstrap now needs Envoy 1.39 or later.
+
+  With the key removed, `tunnel-identity` fails three runs of three on
+  1.39.5, as on 1.34. With it, it passes three of three.
+- **Identity across every hop.** How each hop knows the run, what it
+  trusts, and the check that covers it live:
+
+  | Hop | Identity from | Trusted because | Live check |
+  |---|---|---|---|
+  | Explicit: plain HTTP and CONNECT | The client socket's cgroup (sock_diag), or the run's credential in `Proxy-Authorization` | Envoy's own source and destination attributes; clients' identity headers stripped | `curl`, `git`, `no-credential`, `forged-identity` |
+  | Explicit: inside a terminated tunnel | Filter state from the CONNECT: client address, credential | Set by Envoy, never from client headers; pooled by `clovisor.pool` | `tunnel-identity` (explicit, **new**), `mcp`, `models` |
+  | Transparent: TLS by SNI, TCP | `tcp_proxy`'s tunnel headers on an internal listener | Trusted only where the source is `envoy://` | `status`, `raw-tcp-by-name`, `tunnel-identity` |
+  | Transparent: inside a terminated tunnel | As in explicit | As in explicit | `tunnel-identity` |
+  | Transparent: plain HTTP | Client address written by Envoy, on that route only | Envoy overwrites the header | `forged-identity` (**new**) |
+  | MCP gateway | The gateway's own client socket (sock_diag) | Its own socket | `mcp`, `sampling-ask` |
+  | Resolver | The query's UDP socket (sock_diag) | Its own socket | `dns` |
+  | QUIC relay | The datagram's socket | Its own socket | `quic` |
+  | Run API | `SO_PEERCRED`, and the caller's cgroup | The kernel | `sub-agents`, `restart` |
+
+  Two hops lacked a live check, and have one now:
+  - **Inside a terminated tunnel, through the explicit proxy.** 6.6's fix
+    was covered there, but not tested. The explicit `tunnel-identity`
+    fails three of three without the pool key: explicit mode was
+    vulnerable too, and is fixed.
+  - **Plain HTTP in transparent mode,** where ext_proc trusts a header
+    because Envoy writes it. The test origin serves plain HTTP on port 80
+    now. `forged-identity`, in both suites, sends plain HTTP with forged
+    `x-clovisor-client`, `x-clovisor-run` and `x-clovisor-connect`
+    headers, and finds the request in the sending run's timeline.
+- **The legacy packages fenced out.** `libclovisor/libproto` and
+  `k8s-ctlr` do not build. They carry a `legacy` build tag now, as the
+  `bcc` files already did, so `go build ./...` and `go vet ./...` pass.
+  `make check` vets, builds and tests the whole module, not a list of
+  packages that new ones could be left off.
+- **CI:**
+  - `kernels`: every BPF program loaded on its own, in a VM per kernel
+    (Cilium's little-vm-helper images): 5.10 (below the floor), 5.15, RHEL
+    9.7's kernel, 6.1, 6.6, 6.12 and 6.18. `TestBPFLoad` holds each to
+    the minimum the guide documents: 5.12, 5.19 for exec hashes, 6.6 for
+    the TLS programs. It runs on BPF changes, weekly, and by hand. Locally,
+    on 7.0, all 33 load.
+  - `agents`: the 7.1 checks, weekly and by hand.
+
+Still to do:
+- packaging: a systemd unit, an Envoy setup, a distribution package;
+- the kernel matrix's first results;
+- a full run with BPF LSM on x86.
+
 ---
 
 ## 11. Non-goals and honest limits

@@ -61,7 +61,7 @@ run: node-agent
 # from the bootstrap it writes. Envoy runs as uid 101 in the image.
 PROXY_LISTEN ?= 127.0.0.1:18000
 # The Envoy release the integration tests pin.
-ENVOY_IMAGE ?= envoyproxy/envoy:v1.34.14
+ENVOY_IMAGE ?= envoyproxy/envoy:v1.39.5
 
 run-proxy: node-agent
 	sudo bin/node-agent -bpf $(BPF_OBJ) -proxy-listen $(PROXY_LISTEN)
@@ -85,7 +85,7 @@ format:
 # Check code. Scoped to the Phase 1 packages. Excluded: the root package
 # (legacy, bcc-tagged), libclovisor/libproto (Go plugin sources, built one
 # file at a time) and k8s-ctlr (stale client-go API, does not build).
-GO_PKGS = ./cmd/... ./libclovisor ./libclovisor/policy
+GO_PKGS = ./...
 check: cross
 	$(GO) vet $(GO_PKGS)
 	$(GO) build $(GO_PKGS)

@@ -1,0 +1,59 @@
+# Real coding agents under Clovisor (milestone 7.1), by hand and weekly:
+# the agents pinned in integration/agents, installed by npm ci (each package
+# checked against the lockfile's integrity hash), run in both suites against
+# the scripted model (CLOVISOR_IT_AGENTS=1). Not on every push: the install
+# is about 1.5 GB.
+#
+# Under the audit profiles, what an agent reaches besides its model is
+# recorded as would-deny and let through: from these runners, the agents'
+# own telemetry and update checks reach their vendors.
+name: agents
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agents:
+    name: ${{ matrix.suite }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [integration, integration-transparent]
+        arch: [x86_64, arm64]
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+      - name: Install BPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+      - name: Suite
+        shell: bash
+        env:
+          CLOVISOR_IT_AGENTS: "1"
+        run: make ${{ matrix.suite }} 2>&1 | tee agents.log
+      - name: Results
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.suite }} ($(uname -m))"
+            grep -E -- '--- (PASS|FAIL|SKIP): Test[A-Za-z]+/agents' agents.log | sed 's/^ */    /' || true
+            grep -E 'reached besides its model' agents.log | sed 's/^.*agents_test.go:[0-9]*: /- /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agents-${{ matrix.suite }}-${{ matrix.arch }}.log
+          path: agents.log
+          retention-days: 14

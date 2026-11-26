@@ -36,6 +36,7 @@ var (
 	desc   = flag.String("desc-suffix", "", "appended to tool descriptions, to simulate a server changing its tools")
 	banner = flag.String("banner", "", "also serve raw TCP here that sends a banner first, like SSH")
 	echo   = flag.String("udp-echo", "", "also echo UDP datagrams here (comma-separated)")
+	plain  = flag.String("plain", ":80", "also serve plain HTTP here (empty: not at all)")
 )
 
 func main() {
@@ -105,6 +106,9 @@ func main() {
 			io.WriteString(w, host+" "+r.Method+" "+r.URL.Path+"\n")
 		}
 	})
+	if *plain != "" {
+		go func() { log.Fatal(http.ListenAndServe(*plain, h)) }()
+	}
 	log.Fatal(http.ListenAndServeTLS(*listen, *cert, *key, h))
 }
 

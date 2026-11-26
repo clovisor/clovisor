@@ -145,17 +145,18 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	}
 	// The identity crosses to the terminating listener as filter state
 	// on the upstream connection, set when the connection is made. Envoy
-	// pools connections by the hash of their options, and these string
+	// pools connections by the hash of their options, and plain string
 	// objects have none: while one run's tunnel to a terminated host was
 	// open, another run's tunnels came from its pool, and their requests
 	// were taken as the first run's, decided under its policy (milestone
-	// 6.6). The upstream server name is hashed into the pool key, so it
-	// carries the client too, keeping each tunnel to a pool of its own.
-	// It is not shared further: on the next hop it would be the origin's
-	// SNI.
+	// 6.6). A hashable string holding the client is hashed into the pool
+	// key, so each client's tunnels have a pool of their own (Envoy 1.39;
+	// 6.6 used the upstream server name, before Envoy had one; Agent
+	// Substrate keys its tunnels the same way, 7.0). Shared once, it
+	// reaches the connection to the terminating listener and no further.
 	poolKey := func(client string) obj {
-		return obj{"object_key": "envoy.network.upstream_server_name",
-			"format_string": obj{"text_format_source": obj{"inline_string": "clovisor-" + client}}}
+		return obj{"object_key": "clovisor.pool", "factory_key": "envoy.hashable_string", "shared_with_upstream": "ONCE",
+			"format_string": obj{"text_format_source": obj{"inline_string": client}}}
 	}
 	setState := func(client string) obj {
 		return obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(
