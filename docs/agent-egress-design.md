@@ -125,6 +125,7 @@ place:
 | Visibility report: per run and destination, the best level anything saw it at (requests, plaintext, name, address) and why not better, in the timeline and `agentctl events`; the receipt's TLS posture gains what audit will see. | [6.5 status](#65-status-2026-11-25) |
 | Runs' requests inside terminated tunnels could be taken as another run's while that run had a tunnel to the same host open: Envoy pooled the connections to the terminating listener without the client's identity in the key. Fixed by carrying it in the hashed upstream server name; restart Envoy after upgrading. Restored capturing runs get their running processes probed again; Debian's Node in the tests. Phase 6 complete. | [6.6 status](#66-status-2026-11-25) |
 | Phase 7 planned: validation against the agents people run (Claude Code, Codex, Gemini CLI, OpenCode, a LangGraph server, the OpenAI Agents SDK) and hardening; then Kubernetes through Agent Substrate, with Actor identity and Clovisor as its egress policy point. Kernel constructs for identity beyond cgroups weighed; sandboxes (gVisor has no eBPF; microVMs do, inside the guest) set what the kernel layer can see. | [Phase 7 plan](#phase-7-plan-2026-11-25) |
+| 7.0 spikes: Codex, Gemini CLI, OpenCode and Claude Code work under Clovisor in both modes, termination included, and each reaches hosts besides its model; LangGraph sessions share one run, and credential identity splits but does not nest them; gVisor Runtime Monitoring is a feasible audit source, unable to refuse; Agent Substrate runs, keys tunnels with `envoy.hashable_string`, keeps Actors' UIDs across moves, and has no hook for a second policy point. 7.1 to 7.5 revised. | [7.0 spike results](#70-spike-results-2026-11-26) |
 
 ---
 
@@ -4971,11 +4972,11 @@ there are going: Agent Substrate.
 | # | Milestone | Delivers | Useful alone because |
 |---|---|---|---|
 | **7.0** | Spikes | Each agent in the table, under explicit and transparent mode against the mock model: its TLS stack and trust handling, whether it honours the proxy, MCP children, its own sandbox stacked on Clovisor's. A LangGraph server's sessions: what per-process identity gives, and what a per-session credential needs from the framework. Substrate on a local cluster: replace its egress `ext_proc` with Clovisor's, and read the Actor certificate. gVisor Runtime Monitoring as an event source for exec and connect. The x86 object, run. | Settles what the agents and Substrate allow before code depends on it. |
-| **7.1** | Agent validation | A suite that runs the agents 7.0 says can run in a container (licences, sign-in), with scripted model responses that call tools. Each agent's run must be recorded, governed and learned like the stand-ins. Fixes for what it finds. Each agent's visibility (Phase 6) documented. | The agents people use are known to work, and how. |
-| **7.2** | Hardening | CI on x86 and arm64, and on kernels from the documented floor. A review of identity across every proxy hop, explicit mode included, with a test per hop. The legacy packages removed, or fenced out of the build. Packaging: a systemd unit, Envoy setup, a distribution package. | A node can be installed, upgraded and trusted. |
-| **7.3** | Actor identity | A third identity mode beside cgroup and credential: the Actor, read from Substrate's certificate and checked against its API, as its gateway does. The Actor is the run: its timeline spans suspend, resume and Worker moves. Profiles bound by ActorTemplate and atespace: the `namespace` and `serviceAccount` selectors the compiler rejects today. | Clovisor's records and receipts for Actors. |
-| **7.4** | Substrate egress policy | Clovisor's `ext_proc` as Substrate's egress policy point, in place of `EgressPolicy` or beside it. MCP gateway and tool policy for Actors' remote MCP. The receipt for an ActorTemplate. | Clovisor's policy for agents on Kubernetes, with Substrate's enforcement. |
-| **7.5** | Sandbox audit | If 7.0 finds it fit: exec and connect from gVisor Runtime Monitoring, attributed to Actors, in timelines. The equivalent of Phase 1's kernel audit, for gVisor. | What Actors ran, not only what they sent. |
+| **7.1** | Agent validation | A suite that runs the agents 7.0 says can run in a container (licences, sign-in), with scripted model responses that call tools. Each agent's run must be recorded, governed and learned like the stand-ins. Fixes for what it finds. Each agent's visibility (Phase 6) documented. *Revised after 7.0:* all four CLIs and LangGraph run against the spike's mock (`spikes/phase7/mockmodel`), so 7.1 turns the opt-in `agents` checks into asserted ones. It adds what each agent reaches besides its model, and the settings that stop that (Claude Code's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`), to the operator guide, and lets learn draft them. | The agents people use are known to work, and how. |
+| **7.2** | Hardening | CI on x86 and arm64, and on kernels from the documented floor. A review of identity across every proxy hop, explicit mode included, with a test per hop. The legacy packages removed, or fenced out of the build. Packaging: a systemd unit, Envoy setup, a distribution package. *Revised after 7.0:* CI is running (x86 and arm64, without BPF LSM). Envoy moves to 1.39 or later, and tunnel pools are keyed with `envoy.hashable_string`, as Substrate's are, in place of 6.6's `upstream_server_name`. | A node can be installed, upgraded and trusted. |
+| **7.3** | Actor identity | A third identity mode beside cgroup and credential: the Actor, read from Substrate's certificate and checked against its API, as its gateway does. The Actor is the run: its timeline spans suspend, resume and Worker moves. Profiles bound by ActorTemplate and atespace: the `namespace` and `serviceAccount` selectors the compiler rejects today. *Revised after 7.0:* confirmed that an Actor keeps its UID across suspend, resume and Worker moves. Also **sessions inside a run**: a run API op that mints a session (a nested run with a credential and no process), accepted by the proxy only from a socket in the run's cgroup and decided by the run's and the session's policy together, so that one process's sessions can be told apart and only narrowed. | Clovisor's records and receipts for Actors. |
+| **7.4** | Substrate egress policy | Clovisor's `ext_proc` as Substrate's egress policy point, in place of `EgressPolicy` or beside it. MCP gateway and tool policy for Actors' remote MCP. The receipt for an ActorTemplate. *Revised after 7.0:* beside it. Substrate's Envoy mode has no hook for another policy point, so 7.4 starts by proposing one upstream: a second `ext_proc` on the egress chains, after Substrate's, given the identity Substrate verified. A local patch to Substrate's xDS proves it first. | Clovisor's policy for agents on Kubernetes, with Substrate's enforcement. |
+| **7.5** | Sandbox audit | If 7.0 finds it fit: exec and connect from gVisor Runtime Monitoring, attributed to Actors, in timelines. The equivalent of Phase 1's kernel audit, for gVisor. *Revised after 7.0:* fit, audit only, and needing Substrate to start each Actor's sandbox with a trace session, on restore too, that names the Actor. Optional, after 7.3; it waits on that change. | What Actors ran, not only what they sent. |
 | **7.6** | Tests and docs | Integration tests on a local cluster with Substrate. Operator guide for Kubernetes, and for each validated agent. | Phase 7 ships. |
 
 Order: 7.0 first. 7.1 and 7.2 are independent of Kubernetes, and either
@@ -5002,6 +5003,43 @@ ships with 7.1 and 7.2.
 - **No dependency on Substrate's unsettled protocol.** Integrate through
   its Envoy `ext_proc` and its certificate. Follow its identity and proxy
   protocol work, and contribute to it, rather than build on drafts.
+
+#### 7.0 spike results (2026-11-26)
+
+Spikes in `spikes/phase7/`, run on kernel 7.0 (aarch64) in a VM, with
+details in its README.
+
+| Question | Result |
+|---|---|
+| Real agents under Clovisor | Codex 0.172.0, Gemini CLI 0.71.1, OpenCode 1.19.6 and Claude Code 2.1.332 each ran one scripted turn against a mock model. The mock spoke OpenAI Responses and Chat Completions, Anthropic Messages and Gemini, and had each agent call its shell tool once. All four completed under transparent enforce and under explicit mode with credential identity, and every request was decided. |
+| Termination and the proxy | All four trusted the node CA, Codex's rustls included (it reads `SSL_CERT_FILE`). All four honoured `https_proxy` with the run's credential in the URL. Path, model and content rules apply to all four. |
+| Uprobes | They see Gemini CLI on an official Node, its model calls included. Codex (rustls), OpenCode and Claude Code (Bun) are listed not visible. |
+| What agents reach besides the model | Every one reaches something. Codex: `ab.chatgpt.com`, and a `git ls-remote` of `github.com/openai/plugins.git`. Gemini CLI: `play.googleapis.com/log`. OpenCode: `models.opencode.ai`, and it installs an npm package from `registry.npmjs.org` as it runs. Claude Code: `api.anthropic.com` and Datadog log intake, none of it with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. |
+| Exec | Codex runs its tools through itself (`/proc/self/exe --codex-run-as-process-setup`). Exec rules must allow its binary. |
+| Sessions in one process (LangGraph 1.2.24) | Shared, two sessions are one run: one timeline, one profile. With credential identity, each session can already create a run of its own through the run API and send through its proxy URL. There were two timelines, and session B was decided by its own profile (403). But those runs are not nested in the process's run. Under cgroup identity nothing splits a process. |
+| gVisor Runtime Monitoring (release-20261123.1) | A receiver on gVisor's own packages received: the process tree; each exec's path, argv and SHA-256; each socket and connect with its address and result; uid, cwd and container id. Events arrived 74 µs after the point, median. It cannot refuse: points the receiver cannot take are dropped and counted. A sandbox does not start without its receiver. |
+| Agent Substrate (main, on kind, gVisor only) | Its egress demo ran. The Actor is identified by its mTLS certificate's SPIFFE ID, which Substrate's `ext_proc` verifies on the CONNECT. Inside a tunnel the identity is filter state, its pools keyed with `envoy.hashable_string` (Envoy 1.39.5). An Actor's UID survived suspend, resume and a move to another Worker. Envoy mode has no hook for another policy point. `ateworker-gvisor` starts each Actor's sandbox with no trace-session option, and every sandbox's container id is `_sandbox`. |
+| x86 | CI on GitHub's x86 runners (kernel 7.0, no BPF LSM): the BPF object loads, and the transparent suite passes, the Go amd64 probes included. The BPF LSM programs and the checks that need them have not run on x86. |
+
+Findings that change the plan:
+
+- **The agents work.** None needed a change to Clovisor. 7.1 is
+  validation and documentation, not repair. What each reaches besides its
+  model is for profile authors and learn, and a setting like Claude
+  Code's makes a profile exact.
+- **Sessions are a real gap, with a design.** Credential identity splits
+  a process's sessions today, but does not nest them. 7.3 gains sessions
+  inside a run: minted from inside it, accepted only from its cgroup, and
+  only able to narrow it.
+- **Substrate solved Clovisor's 6.6 bug with the right object.** 7.2 moves
+  Envoy to 1.39 or later and keys pools with `envoy.hashable_string`.
+- **Clovisor's place in Substrate is beside its policy point, not instead
+  of it.** That needs a hook upstream: a second `ext_proc` on the egress
+  chains, given the identity Substrate verified. 7.4 starts with that
+  proposal, and a local patch to prove it.
+- **gVisor audit is feasible, and depends on Substrate.** It needs a trace
+  session per sandbox, on restore too, that names the Actor. 7.5 waits on
+  that.
 
 ---
 
