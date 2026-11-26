@@ -50,9 +50,8 @@ jobs:
       - name: Build the BPF object
         run: make bpf
       - name: gofmt
-        # The legacy packages are not formatted, and not built (Phase 7.2).
         run: |
-          out=$(gofmt -l cmd libclovisor integration | grep -v -e 'libclovisor/clovisor_\(bcc\|cfg\|http_server\|k8s\)\.go' -e libclovisor/libproto/ || true)
+          out=$(gofmt -l cmd libclovisor integration)
           if [ -n "$out" ]; then echo "not gofmt'd:"; echo "$out"; exit 1; fi
       - name: make check
         run: make check

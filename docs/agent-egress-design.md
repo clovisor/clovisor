@@ -1517,6 +1517,9 @@ Phase 1 implementation replaced its data path wholesale. What carries over is
 the architecture, and the experience of attaching control-plane identity to
 kernel objects. Treat this as a new codebase in Clovisor's lineage, not a port.
 
+*Revised 2026-11-26 (7.2):* the legacy tree is removed from the repository.
+The table is history. The legacy code is in commit `6e4a215` and earlier.
+
 | Existing | Becomes | Notes |
 |---|---|---|
 | `libclovisor/clovisor_k8s.go` — pod discovery, informer | Run/workload discovery | Same shape, new objects |
@@ -4963,7 +4966,8 @@ there are going: Agent Substrate.
 6. **Phase 6 left open:**
    - the x86 BPF object has compiled but never run;
    - explicit mode's identity fix was not tested live;
-   - the legacy packages (`libproto`, `k8s-ctlr`) do not build.
+   - the legacy packages (`libproto`, `k8s-ctlr`) do not build (removed
+     in 7.2).
 
    And 6.6 found an identity bug that had been there since 2.7. Identity
    across the proxy's hops deserves a review of its own.
@@ -5145,11 +5149,20 @@ Done so far:
     now. `forged-identity`, in both suites, sends plain HTTP with forged
     `x-clovisor-client`, `x-clovisor-run` and `x-clovisor-connect`
     headers, and finds the request in the sending run's timeline.
-- **The legacy packages fenced out.** `libclovisor/libproto` and
-  `k8s-ctlr` do not build. They carry a `legacy` build tag now, as the
-  `bcc` files already did, so `go build ./...` and `go vet ./...` pass.
-  `make check` vets, builds and tests the whole module, not a list of
-  packages that new ones could be left off.
+- **The legacy code removed.** What was left of the original Clovisor
+  went, at your direction, once nothing in the new code used it:
+  - the bcc-tagged root and `libclovisor/clovisor_*` files;
+  - `libclovisor/libproto`, and its prebuilt plugins in `proto/`;
+  - `k8s-ctlr`;
+  - `correlation/`;
+  - the old Dockerfile and build scripts;
+  - its Kubernetes, Jaeger, Redis and Mongo manifests.
+
+  `go mod tidy` dropped the dependencies only it used (gobpf, gopacket,
+  the Redis, Jaeger and OpenTracing clients, client-go): 46 lines of
+  `go.mod`. `go build ./...` and `go vet ./...` pass. `make check` vets,
+  builds and tests the whole module, not a list of packages that new ones
+  could be left off. The code is in commit `6e4a215` and earlier.
 - **CI:**
   - `kernels`: every BPF program loaded on its own, in a VM per kernel
     (Cilium's little-vm-helper images): 5.10 (below the floor), 5.15, RHEL

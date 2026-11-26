@@ -1,3 +1,0 @@
-docker build -t correlation .
-docker tag correlation s3wong/correlation
-docker push s3wong/correlation

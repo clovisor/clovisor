@@ -1,7 +1,6 @@
 # Build outputs
 /bin/
 *.o
-!/proto/*.so
 
 # Editor / backup files
 *.bak

@@ -82,9 +82,7 @@ doc:
 format:
 	$(GO) fmt ./...
 
-# Check code. Scoped to the Phase 1 packages. Excluded: the root package
-# (legacy, bcc-tagged), libclovisor/libproto (Go plugin sources, built one
-# file at a time) and k8s-ctlr (stale client-go API, does not build).
+# Check code: the whole module (spikes/ are modules of their own).
 GO_PKGS = ./...
 check: cross
 	$(GO) vet $(GO_PKGS)
