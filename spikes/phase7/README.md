@@ -6,6 +6,7 @@ section when the spikes are done.
 | Path | What |
 |---|---|
 | `mockmodel/` | A scripted model speaking OpenAI Responses and Chat Completions, Anthropic Messages and Gemini `generateContent`, streaming or not. Its first answer calls the agent's shell tool (found by name, its arguments shaped by the tool's schema); once a tool result comes back, it answers `mock: done`. A module of its own. |
+| `gvmon/` | A receiver for gVisor Runtime Monitoring's remote sink (section 3). |
 | `langgraph/server.py` | One LangGraph process, several concurrent sessions, shared or each with a run of its own (section 2). |
 | `../../integration/*` `agents` checks | With `CLOVISOR_IT_AGENTS` naming an npm install of the agents (and `CLOVISOR_IT_NODE` an official Node, for Gemini CLI): each agent runs under `tp-agents` (transparent) or `it-agents` (explicit), audit with default deny, against the mock on `origin.test:8443`. The mock asks for `curl https://origin.test/allowed`. Timelines are logged, not asserted. |
 
@@ -152,4 +153,45 @@ Findings:
   This is a 7.x design item. The adapter on the framework's side is
   unchanged from the credential case.
 
-Not yet: gVisor Runtime Monitoring; Agent Substrate.
+## 3. gVisor Runtime Monitoring (2026-11-26)
+
+gVisor release-20261123.1 (`runsc`, from the release tarball, SHA-512
+checked). `gvmon/` is the remote sink's server end, on gVisor's own
+`wire` and `points` packages: it answers each sandbox's handshake and
+prints each point as JSON. It is a module of its own, needing Go 1.27
+for gVisor's. Sandboxes ran with `sudo runsc --pod-init-config=session.json
+--network=none do -- …`, without changing Docker's configuration. The
+session enabled `container/start`, `sentry/clone`, `sentry/execve` (with
+`binary_info` and `binary_sha256`), `sentry/task_exit`, `syscall/socket`
+and `syscall/connect` (enter and exit), each with the context fields
+time, thread and group ids, `container_id`, credentials, cwd, process
+name and parent.
+
+| Question | Result |
+|---|---|
+| What arrives | Everything Phase 1's kernel audit records, from inside the sandbox. The process tree (start, clone, exec, exit, with pid and parent pid). Each exec's resolved binary path, full argv and SHA-256. Each socket and connect, the raw sockaddr (e.g. AF_INET `10.1.2.3:443`), and the result at exit (`ENETUNREACH`, `EINPROGRESS`). Uid, cwd and process name on every event. 1,040 points in all. |
+| Attribution | Every event names the sandbox's container id. One receiver serves many sandboxes, a connection each. |
+| Latency | 16 to 407 µs from the point to the receiver, 74 µs median, in a VM. |
+| Can it refuse anything | **No.** The sink's socket is non-blocking. A point the receiver cannot take in time is retried, then dropped and counted (`DroppedCount` in the next header). It observes; it cannot decide. |
+| Without a receiver | **The sandbox does not start** (`cannot init config: connect(…): connection refused`). Monitoring is fail-closed at start, and fail-open after: a receiver that dies leaves sandboxes running, their points dropped. |
+
+Findings:
+
+- **It is the kernel audit for gVisor.** It covers what Clovisor's BPF
+  audit sees on a node: execs with paths, argv and hashes; connects; the
+  tree. It does so inside a sandbox that BPF cannot see into. A 7.5 audit
+  source is feasible: points mapped to timeline events, attributed by
+  container id.
+- **It is audit only.** Exec gating, socket-family and Unix-socket rules,
+  the things Clovisor's BPF LSM enforces, cannot be enforced through it.
+  In a gVisor sandbox, enforcement stays with gVisor's own configuration
+  and Substrate's egress.
+- **Container id to Actor is the open question.** Substrate's Worker Pods
+  run the sandboxes, so the mapping from a sandbox's container id to an
+  Actor, and whether a trace session survives an Actor's checkpoint and
+  restore on another Worker, are for the Substrate spike.
+- **A receiver must be up before any sandbox starts,** since the sandbox
+  refuses otherwise. On Kubernetes that is a node-level service, like the
+  node agent.
+
+Not yet: Agent Substrate.
