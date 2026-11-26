@@ -1,0 +1,21 @@
+# Milestone 7.1: real agents under an enforcing profile. The model and the
+# origin's /allowed are allowed; /secret is refused with a narration the
+# agent's tool passes back to its model; everything else, the agents'
+# own phoning home included, is refused.
+kind: AgentProfile
+metadata: { name: tp-agents-enforce }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - { name: mock-model, to: { fqdn: ["origin.test"], ports: [8443] }, action: allow }
+      - name: origin-read
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed"] }
+        action: allow
+      - name: no-secret
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "Agents under test may not read the secret endpoint."

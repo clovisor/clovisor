@@ -506,23 +506,28 @@ func checkL7(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) []Dest
 // whose requests the proxy did not see itself: tunnels it did not
 // terminate. Those it terminated are the path replay's.
 func checkTLS(cp *policy.CompiledProfile, tl *RunTimeline, add addFinding) {
+	// By host and port: a TLS record's host carries its port unless it is
+	// 443 (milestone 7.1: a model on :8443 was replayed as host
+	// "origin.test:8443" on 443).
 	terminated := map[string]bool{}
 	for _, p := range tl.Summary.Proxied {
 		if len(p.Paths) > 0 || p.PathsDropped > 0 {
-			terminated[p.Host] = true
+			terminated[hostPortKey(p.Host, p.Port)] = true
 		}
 	}
 	for _, u := range tl.Summary.TLS {
-		if terminated[u.Host] || u.Host == "" {
+		if u.Host == "" || terminated[hostPortKey(u.Host, 443)] {
 			continue
 		}
-		r := policy.Request{Port: 443, Method: u.Method, Path: u.Path, Phase: policy.PhaseRequest}
-		if ip, err := netip.ParseAddr(u.Host); err == nil {
+		host, port := splitHostPort(u.Host, 443)
+		r := policy.Request{Port: port, Method: u.Method, Path: u.Path, Phase: policy.PhaseRequest}
+		if ip, err := netip.ParseAddr(host); err == nil {
 			r.IP = ip
 		} else {
-			r.Host = u.Host
+			r.Host = host
 		}
-		egressFinding(add, "http", u.Method+" "+u.Host+":443"+u.Path+" (seen in the process)", cp.Decide(r), tl.RunID, u.Requests)
+		what := u.Method + " " + net.JoinHostPort(host, strconv.Itoa(int(port))) + u.Path + " (seen in the process)"
+		egressFinding(add, "http", what, cp.Decide(r), tl.RunID, u.Requests)
 	}
 	if tl.Summary.TLSDropped > 0 {
 		add("unverifiable", "requests seen in TLS plaintext past the per-run cap", CheckFinding{Decision: "unrecorded"}, tl.RunID, tl.Summary.TLSDropped)

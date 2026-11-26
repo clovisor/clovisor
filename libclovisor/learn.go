@@ -357,16 +357,22 @@ func LearnProfile(name string, runs []*RunTimeline) *Draft {
 			if u.Host == "" {
 				continue
 			}
-			if d.tlsSeen[u.Host] == nil {
-				d.tlsSeen[u.Host] = map[string]bool{}
+			// By name: rules are drafted per host, and a record's host
+			// carries its port unless it is 443.
+			host, port := splitHostPort(u.Host, 443)
+			if d.tlsSeen[host] == nil {
+				d.tlsSeen[host] = map[string]bool{}
 			}
 			k := u.Method + " " + u.Path
+			if port != 443 {
+				k = u.Method + " :" + strconv.Itoa(int(port)) + u.Path
+			}
 			if u.Tool != "" {
 				k += " (MCP tools/call " + u.Tool + ")"
 			} else if u.MCPMethod != "" {
 				k += " (MCP " + u.MCPMethod + ")"
 			}
-			d.tlsSeen[u.Host][k] = true
+			d.tlsSeen[host][k] = true
 		}
 	}
 	d.learnModels(runs)

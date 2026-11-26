@@ -26,7 +26,6 @@ package integration
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -85,7 +84,8 @@ func TestTransparent(t *testing.T) {
 	t.Run("tls-plaintext", e.testTLSPlaintext)
 	t.Run("tunnel-identity", e.testTunnelIdentity)
 	t.Run("agents", func(t *testing.T) {
-		e.runAgents(t, "tp-agents", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; ")
+		e.runAgents(t, agentSuite{audit: "tp-agents", enforce: "tp-agents-enforce", transparent: true,
+			prefix: "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; "})
 	})
 	t.Run("langgraph", func(t *testing.T) {
 		e.runLangGraph(t, "tp-agents", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; ", false)
@@ -728,152 +728,6 @@ c.close()
 	time.Sleep(500 * time.Millisecond)
 	if tlA, _, _ := e.sh("cat /var/lib/clovisor/runs/run-" + m[1] + ".json"); strings.Contains(tlA, "/from-b") {
 		t.Errorf("run B's requests were recorded, and decided, as run A's")
-	}
-}
-
-// agentScripts run each agent against the mock model (Phase 7.0 spike):
-// its config in a home of its own, the model at origin.test:8443, and one
-// prompt the mock answers with a call to the agent's shell tool.
-var agentScripts = map[string]string{
-	"codex": `mkdir -p $HOME/.codex && cat > $HOME/.codex/config.toml <<T
-model = "mock"
-model_provider = "mock"
-[model_providers.mock]
-name = "mock"
-base_url = "https://origin.test:8443/v1"
-wire_api = "responses"
-env_key = "MOCK_KEY"
-T
-cd $HOME && MOCK_KEY=x timeout 120 $(ls /it/agents/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex) exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "run the command"`,
-	"gemini": `mkdir -p $HOME/.gemini && echo '{"security": {"auth": {"selectedType": "gemini-api-key"}, "folderTrust": {"enabled": false}}}' > $HOME/.gemini/settings.json
-M=/it/agents/@google/gemini-cli
-cd $HOME && GEMINI_API_KEY=x GOOGLE_GEMINI_BASE_URL=https://origin.test:8443 timeout 120 /it/bin/node-official $M/$(/it/bin/node-official -p "Object.values(require('$M/package.json').bin)[0]") -m mock --yolo -p "run the command"`,
-	"claude-quiet": `cd $HOME && CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ANTHROPIC_BASE_URL=https://origin.test:8443 ANTHROPIC_API_KEY=x timeout 120 /it/agents/@anthropic-ai/claude-code/bin/claude.exe -p "run the command" --model mock --allowedTools Bash`,
-	"claude":       `cd $HOME && ANTHROPIC_BASE_URL=https://origin.test:8443 ANTHROPIC_API_KEY=x timeout 120 /it/agents/@anthropic-ai/claude-code/bin/claude.exe -p "run the command" --model mock --allowedTools Bash`,
-	"opencode": `mkdir -p $HOME/.config/opencode && cat > $HOME/.config/opencode/opencode.json <<T
-{"provider": {"mock": {"npm": "@ai-sdk/openai-compatible", "name": "mock",
-   "options": {"baseURL": "https://origin.test:8443/v1", "apiKey": "x"}, "models": {"mock": {"name": "mock"}}}},
- "model": "mock/mock", "permission": {"bash": "allow", "edit": "allow"}}
-T
-cd $HOME && timeout 180 $(ls /it/agents/opencode-ai/node_modules/opencode-linux-*/bin/opencode) run "run the command"`,
-}
-
-// withAgents mounts the agents and starts the scripted model on the
-// origin's port 8443, where CLOVISOR_IT_AGENTS names an npm install of
-// them (Phase 7.0 spike).
-// CLOVISOR_IT_PYDEPS names a Docker volume of Python packages (LangGraph)
-// for the LangGraph spike, which needs the scripted model too.
-func (e *env) withAgents(agentArgs []string) []string {
-	a, py := os.Getenv("CLOVISOR_IT_AGENTS"), os.Getenv("CLOVISOR_IT_PYDEPS")
-	if a == "" && py == "" {
-		return agentArgs
-	}
-	e.run("exec", "-d", e.name("origin"), "sh", "-c",
-		"/it/bin/mockmodel -listen :8443 -cert /origin/tls.crt -key /origin/tls.key > /tmp/mock.log 2>&1")
-	if a != "" {
-		agentArgs = append(agentArgs, "-v", a+":/it/agents:ro")
-	}
-	if py != "" {
-		agentArgs = append(agentArgs, "-v", py+":/it/pydeps:ro")
-	}
-	return agentArgs
-}
-
-// runLangGraph runs one LangGraph process with two concurrent sessions
-// (Phase 7.0 spike): A fetches /allowed, B /secret. Shared, both use the
-// process's run. Per session, each creates a run of its own through the
-// run API (credential identity), B asking for it-session, which refuses
-// /secret. Findings are logged; what each mode must show is asserted.
-func (e *env) runLangGraph(t *testing.T, profile, prefix string, perSession bool) {
-	if os.Getenv("CLOVISOR_IT_PYDEPS") == "" {
-		t.Skip("CLOVISOR_IT_PYDEPS unset: LangGraph not run")
-	}
-	server := "PYTHONPATH=/it/pydeps python3 /it/bin/langgraph-server.py"
-	modes := []string{"shared", "default-client"}
-	if perSession {
-		modes = append(modes, "per-session")
-	}
-	for _, mode := range modes {
-		t.Run(mode, func(t *testing.T) {
-			// The origin's own CA too, for a client that goes around the
-			// proxy (default-client): whether it does is the question.
-			trust := `cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/lg-trust.pem; SSL_CERT_FILE=/tmp/lg-trust.pem `
-			out, id := e.agentRun(profile, prefix+trust+server+" "+mode+" "+profile+" A=allowed B=secret=it-session 2>&1")
-			t.Logf("%s output:\n%s", mode, out)
-			shown, _, _ := e.sh("/it/bin/agentctl events " + id)
-			t.Logf("the process's run %s:\n%s", id, shown)
-			sessions := regexp.MustCompile(`session ([AB]): (\{.*\})`).FindAllStringSubmatch(out, -1)
-			if len(sessions) != 2 {
-				t.Fatalf("sessions did not finish:\n%s", out)
-			}
-			for _, m := range sessions {
-				var r struct {
-					Run  string
-					Tool []string
-				}
-				json.Unmarshal([]byte(m[2]), &r)
-				if mode != "per-session" {
-					continue
-				}
-				e.timeline(r.Run)
-				s, _, _ := e.sh("/it/bin/agentctl events " + r.Run)
-				t.Logf("session %s's run %s:\n%s", m[1], r.Run, s)
-				want, other := "/allowed", "/secret"
-				if m[1] == "B" {
-					want, other = other, want
-				}
-				if !strings.Contains(s, want) || strings.Contains(s, other) {
-					t.Errorf("session %s's run does not hold its own requests, and only those", m[1])
-				}
-				if m[1] == "B" && !strings.Contains(strings.Join(r.Tool, " "), "403") {
-					t.Errorf("session B was not decided by its own profile: %v", r.Tool)
-				}
-			}
-			if mode == "default-client" {
-				t.Logf("default client: model calls through the proxy: %d", strings.Count(shown, "/v1/chat/completions"))
-				return
-			}
-			if mode == "shared" && !(strings.Contains(shown, "/allowed") && strings.Contains(shown, "/secret")) {
-				t.Errorf("the process's run does not hold both sessions' requests")
-			}
-		})
-	}
-}
-
-// runAgents runs each agent under profile against the mock, which asks
-// it to run curl to the origin through its shell tool (Phase 7.0 spike).
-// Findings are logged for the spike's notes; only finishing the turn is
-// asserted. prefix runs first: transparent mode drops the proxy variables.
-func (e *env) runAgents(t *testing.T, profile, prefix string) {
-	if os.Getenv("CLOVISOR_IT_AGENTS") == "" {
-		t.Skip("CLOVISOR_IT_AGENTS unset: real agents not run")
-	}
-	for _, name := range []string{"codex", "gemini", "opencode", "claude", "claude-quiet"} {
-		t.Run(name, func(t *testing.T) {
-			if name == "gemini" && os.Getenv("CLOVISOR_IT_NODE") == "" {
-				t.Skip("Gemini CLI needs Node 20 or later: set CLOVISOR_IT_NODE")
-			}
-			// Trust the node CA (agentctl's bundle) and the origin's own
-			// CA, for whatever the proxy does not terminate.
-			script := `export HOME=/tmp/agent-` + name + `; rm -rf $HOME; mkdir -p $HOME
-cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/trust-` + name + `.pem
-export SSL_CERT_FILE=/tmp/trust-` + name + `.pem NODE_EXTRA_CA_CERTS=/tmp/trust-` + name + `.pem
-env | grep -i -E "^(https?|all|no)_proxy=" | sed "s/:[^:@/]*@/:***@/"
-` + agentScripts[name] + `
-echo "agent exit $?"`
-			out, id := e.agentRun(profile, prefix+e.script("agent-"+name, script))
-			t.Logf("%s output:\n%s", name, out)
-			if id != "" {
-				e.timeline(id)
-				shown, _, _ := e.sh("/it/bin/agentctl events " + id)
-				t.Logf("%s events:\n%s", name, shown)
-			}
-			mock, _ := e.dockerCmd("exec", e.name("origin"), "cat", "/tmp/mock.log").CombinedOutput()
-			t.Logf("mock log so far:\n%s", mock)
-			if !strings.Contains(out, "mock: done") {
-				t.Errorf("%s did not finish its turn", name)
-			}
-		})
 	}
 }
 

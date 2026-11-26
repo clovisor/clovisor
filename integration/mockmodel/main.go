@@ -5,12 +5,13 @@
 // which accompanies this distribution, and is available at
 // http://www.apache.org/licenses/LICENSE-2.0
 
-// Command mockmodel is the Phase 7 spike's scripted model (milestone
-// 7.0): it speaks enough of the OpenAI Chat Completions, Anthropic
+// Command mockmodel is the integration tests' scripted model (milestones
+// 7.0, 7.1): it speaks enough of the OpenAI Chat Completions, Anthropic
 // Messages and Gemini APIs, streaming or not, for a coding agent to run
 // one scripted turn. Its first answer calls the agent's shell tool with
-// -cmd; once a tool result comes back, it answers -done. Every request is
-// logged: method, path, model, and the tools offered.
+// -cmd, or the command a prompt asks for ("MOCK-RUN: <command>"); once a tool
+// result comes back, it answers -done. Every request is logged: path,
+// model, the tools offered, and the tool results the agent sent back.
 //
 //	mockmodel -listen :8080 [-cert c -key k] -cmd 'curl -s https://origin.test/allowed'
 package main
@@ -77,7 +78,56 @@ func route(w http.ResponseWriter, r *http.Request) {
 
 func logReq(path string, req map[string]any, what string) {
 	model, _ := req["model"].(string)
-	log.Printf("%s model=%q tools=%v stream=%v -> %s", path, model, toolNames(req), req["stream"], what)
+	line := fmt.Sprintf("%s model=%q tools=%v stream=%v -> %s", path, model, toolNames(req), req["stream"], what)
+	if r := toolResults(req); len(r) > 0 {
+		b, _ := json.Marshal(r)
+		line += " tool-results=" + string(b)
+	}
+	log.Print(line)
+}
+
+// toolResults collects what the agent sent back from its tools, in any of
+// the four APIs' shapes: what the agent saw, narrated denials included.
+func toolResults(req map[string]any) []string {
+	var out []string
+	var walk func(v any, parentRole string)
+	walk = func(v any, parentRole string) {
+		switch x := v.(type) {
+		case map[string]any:
+			role, _ := x["role"].(string)
+			switch {
+			case x["type"] == "function_call_output": // OpenAI Responses
+				out = append(out, flat(x["output"]))
+			case x["type"] == "tool_result": // Anthropic
+				out = append(out, flat(x["content"]))
+			case role == "tool": // OpenAI Chat Completions
+				out = append(out, flat(x["content"]))
+			case x["functionResponse"] != nil: // Gemini
+				out = append(out, flat(x["functionResponse"]))
+			default:
+				for _, e := range x {
+					walk(e, role)
+				}
+			}
+		case []any:
+			for _, e := range x {
+				walk(e, parentRole)
+			}
+		}
+	}
+	for _, k := range []string{"messages", "input", "contents"} {
+		walk(req[k], "")
+	}
+	return out
+}
+
+// flat renders a tool result's content as text, whatever its shape.
+func flat(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // toolNames lists the tools a request offers, in any of the three shapes.
@@ -102,9 +152,10 @@ func toolNames(req map[string]any) []string {
 
 func str(v any) string { s, _ := v.(string); return s }
 
-// promptCmd is a command a prompt asks for ("run: <command>"), so that
-// one mock can script several sessions differently.
-var promptCmd = regexp.MustCompile(`run: ([^"\\]+)`)
+// promptCmd is a command a prompt asks for ("MOCK-RUN: <command>"), so
+// that one mock can script several sessions differently. The marker is one
+// no agent's own system prompt contains: "run: " is in Claude Code's.
+var promptCmd = regexp.MustCompile(`MOCK-RUN: ([^"\\]+)`)
 
 // pickShell finds the shell tool and the arguments to call it with: the
 // command as a string, or as an argv when the schema wants an array.

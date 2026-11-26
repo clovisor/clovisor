@@ -95,7 +95,7 @@ def session(name, path, mode, profile, out):
     else:
         model = ChatOpenAI(model="mock", base_url=MODEL, api_key="x", http_client=client)
     agent = create_react_agent(model, [bash])
-    res = agent.invoke({"messages": [("user", "run: fetch https://origin.test/%s" % path)]})
+    res = agent.invoke({"messages": [("user", "MOCK-RUN: fetch https://origin.test/%s" % path)]})
     tools = [m.content for m in res["messages"] if m.type == "tool"]
     out[name] = {"run": run.run_id if run else None, "tool": tools, "final": res["messages"][-1].content}
     if run:

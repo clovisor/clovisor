@@ -189,3 +189,42 @@ func TestTLSProgramTimeline(t *testing.T) {
 		t.Errorf("notes: %q", notes)
 	}
 }
+
+// A TLS record's host carries its port unless it is 443 (milestone 7.1):
+// check replays it on that port, and skips it where the proxy saw the
+// same host and port by path.
+func TestTLSCheckPort(t *testing.T) {
+	run := &RunTimeline{RunID: "r2", Complete: true, StartedAt: t0, Command: []string{"agent"},
+		Summary: RunSummary{
+			Proxied: []ProxiedDest{{Host: "model.example.com", Port: 8443, Requests: 2, Connects: 1,
+				Paths: []PathUse{{Method: "POST", Path: "/v1/messages", Requests: 1}}}},
+			TLS: []TLSUse{
+				{Host: "model.example.com:8443", Method: "POST", Path: "/v1/messages", Proto: "HTTP/1.1", Requests: 1, Lib: "libssl"},
+				{Host: "api.example.com:8443", Method: "GET", Path: "/x", Proto: "HTTP/2", Requests: 1, Lib: "libssl"},
+			}}}
+	cp := compileOne(t, `kind: AgentProfile
+metadata: { name: p }
+spec:
+  mode: audit
+  egress:
+    default: deny
+    rules:
+      - { name: api, to: { fqdn: ["api.example.com"], ports: [8443] }, action: allow }
+`)
+	rep := CheckRuns(cp, []*RunTimeline{run})
+	var allowed bool
+	for _, f := range rep.Allowed {
+		allowed = allowed || f.What == "GET api.example.com:8443/x (seen in the process)"
+	}
+	for _, f := range append(rep.Violations, rep.Allowed...) {
+		if strings.Contains(f.What, "model.example.com") && strings.Contains(f.What, "seen in the process") {
+			t.Errorf("replayed a host the proxy saw by path: %+v", f)
+		}
+		if strings.Contains(f.What, ":8443:443") {
+			t.Errorf("port appended twice: %+v", f)
+		}
+	}
+	if !allowed {
+		t.Errorf("not replayed on its own port:\n%+v\n%+v", rep.Allowed, rep.Violations)
+	}
+}

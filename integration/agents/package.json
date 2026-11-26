@@ -1,0 +1,11 @@
+{
+  "name": "clovisor-it-agents",
+  "private": true,
+  "description": "The coding agents Clovisor's integration tests run (milestone 7.1), pinned. npm ci installs them as the lockfile records, each package checked against its integrity hash.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.332",
+    "@google/gemini-cli": "0.71.1",
+    "@openai/codex": "0.172.0",
+    "opencode-ai": "1.19.6"
+  }
+}

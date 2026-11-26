@@ -594,6 +594,58 @@ dumb HTTP; git authenticates to the proxy after a `407` challenge). Node's
 built-in `fetch` does not read proxy variables by default. Configure the
 harness's own proxy setting, or use a sandbox that forces the route.
 
+### Coding agents
+
+These agents are tested under Clovisor, in transparent enforce and in
+explicit mode with credential identity, at the versions
+`integration/agents` pins. In both modes each finished its turn, and its
+model calls and its tools' requests were decided one by one.
+
+| Agent (tested) | Runtime, TLS | Trusts the node CA | Proxy, with the run's credential | TLS plaintext (§11) |
+|---|---|---|---|---|
+| Claude Code 2.1.332 | Bun, BoringSSL linked in | yes | yes | not visible |
+| Codex 0.172.0 | Rust, rustls | yes (reads `SSL_CERT_FILE`) | yes | not visible |
+| Gemini CLI 0.71.1 | JavaScript; needs Node 20 or later | yes | yes | visible on an official Node build |
+| OpenCode 1.19.6 | Bun, BoringSSL linked in | yes | yes | not visible |
+
+So termination works for all four: path, model and content rules apply to
+their model calls. Where a host is not terminated, the timeline has only
+its name, except for Gemini CLI on an official Node.
+
+**What each reaches besides its model.** A default-deny profile refuses
+these. Each agent still finished its turn with them refused.
+
+| Agent | Hosts | To quiet it |
+|---|---|---|
+| Claude Code | `api.anthropic.com` (even with `ANTHROPIC_BASE_URL` set), `http-intake.logs.us5.datadoghq.com` | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`: it then reaches only its model |
+| Codex | `ab.chatgpt.com`; `github.com`, from a `git ls-remote` of `openai/plugins.git` it starts | |
+| Gemini CLI | `play.googleapis.com` (telemetry) | |
+| OpenCode | `models.opencode.ai` (its model catalogue); `registry.npmjs.org`, to install a provider package as it runs | It works without both. |
+
+Learn drafts them like any other destination, and the draft lists them
+under their own rules, so you can keep or drop each.
+
+**Also:**
+- **Codex runs its tools through itself:** each tool command is exec'd as
+  `/proc/self/exe --codex-run-as-process-setup …`, then `bash -c`. An
+  `exec.allow` list must allow Codex's own binary. Its first command
+  sources the run's `~/.bashrc` (`bash -lc`).
+- **OpenCode installs npm packages while it runs.** Decide deliberately
+  whether `registry.npmjs.org` is allowed: it is a supply-chain path.
+- **Refusals reach the model.** A tool's request refused by a rule
+  returns the narrated `403`. The agent's tool hands that back to the
+  model, which sees the rule's `message`.
+
+**Many sessions in one process.** A server that runs several agent
+sessions in one process, a LangGraph server for instance, is one run:
+one policy and one timeline for all of them (design §5.8). With credential
+identity, each session can have a run of its own. The session opens a run
+API connection, `create`s a run with the profile it asks for, sends
+through the run's proxy URL (for example httpx's `proxy=`), and `end`s
+the run when done. `spikes/phase7/langgraph/server.py` shows it in about
+thirty lines (`SessionRun`). Those runs are not nested in the process's
+run, so a session can ask for any profile its user's ceiling allows.
+
 ## 8. From observation to enforcement
 
 The adoption path, per agent workload (design §7.10):
@@ -1446,6 +1498,23 @@ ignore the proxy, it checks:
   pass;
 - tunnel identity: while one run holds a tunnel to a terminated host
   open, another run's requests to it are its own, decided by its profile;
+- agents, with `CLOVISOR_IT_AGENTS=1`: Claude Code (also with its
+  nonessential traffic off), Codex, Gemini CLI and OpenCode, at the
+  versions `integration/agents` pins, against a scripted model
+  (`integration/mockmodel`). The pins are installed once by `npm ci`, each
+  package checked against the lockfile's integrity hash, into a Docker
+  volume named by the lockfile's hash. Each agent runs twice:
+  - under an audit profile: it finishes its turn, its model calls and its
+    tool's request are decided one by one, anything else is recorded as
+    would-deny, and learn drafts a profile check finds the run within;
+  - under an enforcing one: its tool's request to a refused path gets the
+    narrated `403`, the narration reaches the model, and the agent
+    finishes with its phoning home refused too.
+
+  In transparent mode, each agent's own TLS stack is listed as expected
+  (§11 TLS plaintext). With `CLOVISOR_IT_PYDEPS` naming a Docker volume
+  of LangGraph's packages, a LangGraph server's sessions run shared, and
+  in explicit mode each with a run of its own;
 - restart, capturing: a Python process in a run that captures TLS
   plaintext made a request before the restart and one after; both were
   recorded, the new node agent having probed the running process again;

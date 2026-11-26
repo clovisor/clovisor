@@ -126,6 +126,7 @@ place:
 | Runs' requests inside terminated tunnels could be taken as another run's while that run had a tunnel to the same host open: Envoy pooled the connections to the terminating listener without the client's identity in the key. Fixed by carrying it in the hashed upstream server name; restart Envoy after upgrading. Restored capturing runs get their running processes probed again; Debian's Node in the tests. Phase 6 complete. | [6.6 status](#66-status-2026-11-25) |
 | Phase 7 planned: validation against the agents people run (Claude Code, Codex, Gemini CLI, OpenCode, a LangGraph server, the OpenAI Agents SDK) and hardening; then Kubernetes through Agent Substrate, with Actor identity and Clovisor as its egress policy point. Kernel constructs for identity beyond cgroups weighed; sandboxes (gVisor has no eBPF; microVMs do, inside the guest) set what the kernel layer can see. | [Phase 7 plan](#phase-7-plan-2026-11-25) |
 | 7.0 spikes: Codex, Gemini CLI, OpenCode and Claude Code work under Clovisor in both modes, termination included, and each reaches hosts besides its model; LangGraph sessions share one run, and credential identity splits but does not nest them; gVisor Runtime Monitoring is a feasible audit source, unable to refuse; Agent Substrate runs, keys tunnels with `envoy.hashable_string`, keeps Actors' UIDs across moves, and has no hook for a second policy point. 7.1 to 7.5 revised. | [7.0 spike results](#70-spike-results-2026-11-26) |
+| 7.1 agent validation: four agents pinned by a lockfile and installed by `npm ci` into a cached volume; asserted audit, learn and check, enforce and narration checks in both suites; operator guide on coding agents. Found: check replayed TLS plaintext on 443 whatever its port. | [7.1 status](#71-status-2026-11-26) |
 
 ---
 
@@ -5040,6 +5041,71 @@ Findings that change the plan:
 - **gVisor audit is feasible, and depends on Substrate.** It needs a trace
   session per sandbox, on restore too, that names the Actor. 7.5 waits on
   that.
+
+#### 7.1 status (2026-11-26)
+
+Implemented:
+
+- **Pinned agents.** `integration/agents` pins Claude Code 2.1.332,
+  Codex 0.172.0, Gemini CLI 0.71.1 and OpenCode 1.19.6 in a
+  `package-lock.json`, with every package's integrity hash and each
+  architecture's binaries.
+  - With `CLOVISOR_IT_AGENTS=1`, both suites install them with `npm ci`
+    in `node:22.23.5-bookworm`, which checks each package against its
+    hash, into a Docker volume named by the lockfile's hash.
+  - The same image's Node, an official build, runs Gemini CLI.
+  - They are installed again only when the lockfile changes.
+- **The scripted model** moved from the spikes to `integration/mockmodel`.
+  It logs the tool results each agent sends back, so a test can see what
+  the agent's model was told.
+- **Asserted checks**, per agent (Claude Code also with its nonessential
+  traffic off), in both suites:
+  - under `tp-agents` / `it-agents` (audit, default deny): it finishes its
+    turn; its model calls are decided per request (terminated); its
+    tool's request is recorded in the run; nothing is refused; anything
+    else is recorded as would-deny. Learn drafts a profile, and `check`
+    (with `--transparent` in that suite) finds the run within it.
+    Claude Code with nonessential traffic off reaches nothing else.
+  - under `tp-agents-enforce` / `it-agents-enforce`: the tool's request to
+    `/secret` is refused, the refusal's narration reaches the model in
+    the tool result, and the agent finishes its turn with its phoning
+    home refused.
+  - in transparent mode: its own TLS stack listed as 6.3 and 6.4 say:
+    probed for Gemini CLI on the official Node, rustls not visible for
+    Codex, Bun's BoringSSL not visible for Claude Code and OpenCode.
+- **Operator guide:** §7 gains a section on coding agents. It covers each
+  one's runtime and visibility, what it reaches besides its model, the
+  setting that quiets Claude Code, Codex's exec through itself, OpenCode's
+  npm fetches, and per-session runs for servers.
+
+Found on the way:
+
+- **check replayed TLS plaintext on the wrong port.** A plaintext record's
+  host carries its port unless it is 443 (`origin.test:8443`), and 6.2's
+  replay added `:443` to it. A model call the proxy had allowed was
+  reported as a would-deny, `origin.test:8443:443`, and the host was not
+  skipped as one the proxy saw by path. Gemini CLI on an official Node,
+  the one agent whose own TLS is probed, showed it. Check now replays on
+  the record's port and keys by host and port. Learn files such records
+  under the host's name, with the port in the comment.
+- **The mock's prompt marker was in Claude Code's system prompt.** The
+  mock took its command from `run: …` anywhere in the request, and Claude
+  Code's system prompt contains that, so it was handed a fragment. The
+  marker is now `MOCK-RUN: `.
+- **Every agent copes with its phoning home refused.** Under enforce, each
+  finished its turn. Transparent mode refuses their names at the
+  resolver. OpenCode then works without its model catalogue and its npm
+  provider package.
+
+No change to Clovisor was needed for any agent to run.
+
+Verified:
+
+- Unit tests for check's and learn's handling of a TLS record's port.
+- `make check`.
+- `make integration` and `make integration-transparent`, with and without
+  `CLOVISOR_IT_AGENTS=1` and `CLOVISOR_IT_PYDEPS`. Without them, the agent
+  and LangGraph checks skip, as in CI.
 
 ---
 

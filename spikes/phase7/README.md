@@ -1,11 +1,14 @@
 # Phase 7.0 spikes
 
 Not production code. Results are folded into the design doc's Phase 7
-section when the spikes are done.
+section when the spikes are done. Since 7.1, the scripted model is
+`integration/mockmodel`, and `CLOVISOR_IT_AGENTS=1` installs the agents
+`integration/agents` pins. The commands below are as the spikes ran
+them, with an npm install directory.
 
 | Path | What |
 |---|---|
-| `mockmodel/` | A scripted model speaking OpenAI Responses and Chat Completions, Anthropic Messages and Gemini `generateContent`, streaming or not. Its first answer calls the agent's shell tool (found by name, its arguments shaped by the tool's schema); once a tool result comes back, it answers `mock: done`. A module of its own. |
+| `mockmodel/` (now `integration/mockmodel`) | A scripted model speaking OpenAI Responses and Chat Completions, Anthropic Messages and Gemini `generateContent`, streaming or not. Its first answer calls the agent's shell tool (found by name, its arguments shaped by the tool's schema); once a tool result comes back, it answers `mock: done`. A module of its own. |
 | `gvmon/` | A receiver for gVisor Runtime Monitoring's remote sink (section 3). |
 | `langgraph/server.py` | One LangGraph process, several concurrent sessions, shared or each with a run of its own (section 2). |
 | `../../integration/*` `agents` checks | With `CLOVISOR_IT_AGENTS` naming an npm install of the agents (and `CLOVISOR_IT_NODE` an official Node, for Gemini CLI): each agent runs under `tp-agents` (transparent) or `it-agents` (explicit), audit with default deny, against the mock on `origin.test:8443`. The mock asks for `curl https://origin.test/allowed`. Timelines are logged, not asserted. |
