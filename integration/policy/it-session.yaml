@@ -1,0 +1,15 @@
+# Phase 7.0 spike: a narrower profile one LangGraph session asks for, so
+# that a session decided by its own profile shows (CLOVISOR_IT_PYDEPS).
+kind: AgentProfile
+metadata: { name: it-session }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: no-secret
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "This session may not read the secret endpoint."
+      - { name: mock-model, to: { fqdn: ["origin.test"], ports: [443, 8443] }, action: allow }

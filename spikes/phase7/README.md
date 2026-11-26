@@ -6,6 +6,7 @@ section when the spikes are done.
 | Path | What |
 |---|---|
 | `mockmodel/` | A scripted model speaking OpenAI Responses and Chat Completions, Anthropic Messages and Gemini `generateContent`, streaming or not. Its first answer calls the agent's shell tool (found by name, its arguments shaped by the tool's schema); once a tool result comes back, it answers `mock: done`. A module of its own. |
+| `langgraph/server.py` | One LangGraph process, several concurrent sessions, shared or each with a run of its own (section 2). |
 | `../../integration/*` `agents` checks | With `CLOVISOR_IT_AGENTS` naming an npm install of the agents (and `CLOVISOR_IT_NODE` an official Node, for Gemini CLI): each agent runs under `tp-agents` (transparent) or `it-agents` (explicit), audit with default deny, against the mock on `origin.test:8443`. The mock asks for `curl https://origin.test/allowed`. Timelines are logged, not asserted. |
 
 ```sh
@@ -102,5 +103,53 @@ from), 368 MB each. The spike keeps one.
 | Honours `https_proxy`, with credential | yes |
 | Reached besides the model | `api.anthropic.com`, Datadog logs; none with nonessential traffic off |
 
-Not yet: a LangGraph server's sessions; gVisor Runtime Monitoring; Agent
-Substrate.
+## 2. Many sessions in one process: LangGraph (2026-11-26)
+
+`langgraph/server.py`: one process, two sessions in threads, each a
+prebuilt ReAct agent (LangGraph 1.2.24, langchain-openai 1.8.5, httpx
+0.28.1) whose tool works in-process. Session A fetches `/allowed`; B
+fetches `/secret`, and in per-session mode asks for `it-session`, which
+refuses `/secret`. The Python packages are in a Docker volume
+(`CLOVISOR_IT_PYDEPS`), not in the test image.
+
+| Mode | What Clovisor saw |
+|---|---|
+| **shared**, transparent (cgroup identity) | One run, one process (one pid) for both sessions: their model calls and fetches in one timeline, under one profile, told apart only by path. Python's libssl is probed, so plaintext shows the requests too, but not whose they are. |
+| **shared**, explicit (one credential) | The same: one run for both. |
+| **default-client**, explicit | langchain-openai warns that its HTTP transport "disables httpx's proxy auto-detection". Here it did not: the model calls went through the proxy and were decided. The warning is not a bypass in this version. |
+| **per-session**, explicit (credential identity) | **Works today, without new code.** Each session opens a run API connection, `create`s a run with the profile it asks for, and sends through that run's proxy URL (httpx `proxy=`). It `end`s the run when done. Two timelines, each with only its session's requests. B's `/secret` was refused under `it-session` (403), while A's `/allowed` passed under `it-agents`. |
+
+Findings:
+
+- **Per-process identity gives a server one run.** That is what §5.8 says.
+  Sessions share the policy, the timeline and the budgets. A run's
+  records can say what the process did, not which session did it.
+- **Credential identity already splits sessions**, for a framework that
+  lets each session set its proxy. That is an HTTP client per session
+  (langchain-openai's `http_client`, httpx `proxy=`), and a run API
+  connection held for the session's life. The adapter is about thirty
+  lines, `SessionRun` in the spike.
+- **But the sessions' runs are not nested in the process's run.** With
+  credential identity there is no cgroup to nest by, so a session can ask
+  for any profile its user's ceiling allows, escaping the process's own
+  clamps. The receipt already says credential identity is a claim. For
+  sessions that is the gap.
+- **Under cgroup identity (transparent mode) nothing splits a process.**
+  Sessions need a label the proxy can trust within the run. The shape
+  that fits is **sessions as nested runs known by credential inside a
+  cgroup run**:
+  1. A run API op, from inside a run, mints a session: a nested run with
+     no process of its own, and a credential.
+  2. The session sends through the explicit proxy with that credential.
+     Transparent mode still sends everything else to the proxy, so
+     nothing goes around it.
+  3. The proxy knows the cgroup run first. It accepts a session's
+     credential only from a socket in that run's cgroup. It decides by the
+     session's effective policy, which is the run's and the session's
+     together, and so can only narrow.
+  4. Without the credential, a request is the run's, as today.
+
+  This is a 7.x design item. The adapter on the framework's side is
+  unchanged from the credential case.
+
+Not yet: gVisor Runtime Monitoring; Agent Substrate.

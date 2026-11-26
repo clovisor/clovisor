@@ -102,9 +102,20 @@ func toolNames(req map[string]any) []string {
 
 func str(v any) string { s, _ := v.(string); return s }
 
+// promptCmd is a command a prompt asks for ("run: <command>"), so that
+// one mock can script several sessions differently.
+var promptCmd = regexp.MustCompile(`run: ([^"\\]+)`)
+
 // pickShell finds the shell tool and the arguments to call it with: the
 // command as a string, or as an argv when the schema wants an array.
 func pickShell(req map[string]any) (name string, args map[string]any) {
+	cmd := cmd
+	if b, err := json.Marshal(req); err == nil {
+		if m := promptCmd.FindSubmatch(b); m != nil {
+			c := strings.TrimSpace(string(m[1]))
+			cmd = &c
+		}
+	}
 	tools, _ := req["tools"].([]any)
 	try := func(n string, params map[string]any) bool {
 		if !shellTool.MatchString(n) {

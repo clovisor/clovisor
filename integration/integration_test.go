@@ -155,6 +155,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("ask", e.testAsk)
 	t.Run("sampling-ask", e.testSamplingAsk)
 	t.Run("agents", func(t *testing.T) { e.runAgents(t, "it-agents", "") }) // before pin-drift restarts the origin
+	t.Run("langgraph", func(t *testing.T) { e.runLangGraph(t, "it-agents", "", true) })
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -205,7 +206,14 @@ func (e *env) build() {
 	}
 	// The Phase 7.0 spike's scripted model, for real agents
 	// (CLOVISOR_IT_AGENTS): a module of its own.
-	if os.Getenv("CLOVISOR_IT_AGENTS") != "" {
+	if os.Getenv("CLOVISOR_IT_AGENTS") != "" || os.Getenv("CLOVISOR_IT_PYDEPS") != "" {
+		src, err := os.ReadFile(filepath.Join(root, "spikes", "phase7", "langgraph", "server.py"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, "langgraph-server.py"), src, 0o644); err != nil {
+			t.Fatal(err)
+		}
 		cmd := exec.Command("go", "build", "-o", filepath.Join(bin, "mockmodel"), ".")
 		cmd.Dir = filepath.Join(root, "spikes", "phase7", "mockmodel")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
