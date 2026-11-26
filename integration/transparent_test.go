@@ -83,6 +83,9 @@ func TestTransparent(t *testing.T) {
 	t.Run("exec-hash", e.testExecHash)
 	t.Run("tls-plaintext", e.testTLSPlaintext)
 	t.Run("tunnel-identity", e.testTunnelIdentity)
+	t.Run("agents", func(t *testing.T) {
+		e.runAgents(t, "tp-agents", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; ")
+	})
 	t.Run("tool-calls", e.testToolCalls)
 	t.Run("sub-agents", e.testSubAgents)
 	t.Run("run-udp-icmp", e.testRunNet)
@@ -166,10 +169,12 @@ func (e *env) startTransparent() {
 	if e.originIP == "" {
 		t.Fatal("no origin address")
 	}
-	e.run("run", "-d", "--name", e.name("agent"), "--network", e.name("net"),
+	agentArgs := []string{"run", "-d", "--name", e.name("agent"), "--network", e.name("net"),
 		"--privileged", "--cgroupns", "host", "--pid", "host",
-		"-v", filepath.Join(e.dir, "bin")+":/it/bin:ro", "-v", filepath.Join(e.dir, "origin", "ca.crt")+":/it/test-ca.crt:ro",
-		"-v", e.name("run")+":/run/clovisor", agentImage, "sleep", "infinity")
+		"-v", filepath.Join(e.dir, "bin") + ":/it/bin:ro", "-v", filepath.Join(e.dir, "origin", "ca.crt") + ":/it/test-ca.crt:ro",
+		"-v", e.name("run") + ":/run/clovisor"}
+	agentArgs = e.withAgents(agentArgs)
+	e.run(append(agentArgs, agentImage, "sleep", "infinity")...)
 	// Runs' cgroups go as runs end; the agents cgroup itself is removed
 	// here, before the container goes (cleanups run last-in first-out).
 	t.Cleanup(func() {
@@ -719,6 +724,81 @@ c.close()
 	time.Sleep(500 * time.Millisecond)
 	if tlA, _, _ := e.sh("cat /var/lib/clovisor/runs/run-" + m[1] + ".json"); strings.Contains(tlA, "/from-b") {
 		t.Errorf("run B's requests were recorded, and decided, as run A's")
+	}
+}
+
+// agentScripts run each agent against the mock model (Phase 7.0 spike):
+// its config in a home of its own, the model at origin.test:8443, and one
+// prompt the mock answers with a call to the agent's shell tool.
+var agentScripts = map[string]string{
+	"codex": `mkdir -p $HOME/.codex && cat > $HOME/.codex/config.toml <<T
+model = "mock"
+model_provider = "mock"
+[model_providers.mock]
+name = "mock"
+base_url = "https://origin.test:8443/v1"
+wire_api = "responses"
+env_key = "MOCK_KEY"
+T
+cd $HOME && MOCK_KEY=x timeout 120 $(ls /it/agents/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex) exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "run the command"`,
+	"gemini": `mkdir -p $HOME/.gemini && echo '{"security": {"auth": {"selectedType": "gemini-api-key"}, "folderTrust": {"enabled": false}}}' > $HOME/.gemini/settings.json
+M=/it/agents/@google/gemini-cli
+cd $HOME && GEMINI_API_KEY=x GOOGLE_GEMINI_BASE_URL=https://origin.test:8443 timeout 120 /it/bin/node-official $M/$(/it/bin/node-official -p "Object.values(require('$M/package.json').bin)[0]") -m mock --yolo -p "run the command"`,
+	"opencode": `mkdir -p $HOME/.config/opencode && cat > $HOME/.config/opencode/opencode.json <<T
+{"provider": {"mock": {"npm": "@ai-sdk/openai-compatible", "name": "mock",
+   "options": {"baseURL": "https://origin.test:8443/v1", "apiKey": "x"}, "models": {"mock": {"name": "mock"}}}},
+ "model": "mock/mock", "permission": {"bash": "allow", "edit": "allow"}}
+T
+cd $HOME && timeout 180 $(ls /it/agents/opencode-ai/node_modules/opencode-linux-*/bin/opencode) run "run the command"`,
+}
+
+// withAgents mounts the agents and starts the scripted model on the
+// origin's port 8443, where CLOVISOR_IT_AGENTS names an npm install of
+// them (Phase 7.0 spike).
+func (e *env) withAgents(agentArgs []string) []string {
+	a := os.Getenv("CLOVISOR_IT_AGENTS")
+	if a == "" {
+		return agentArgs
+	}
+	e.run("exec", "-d", e.name("origin"), "sh", "-c",
+		"/it/bin/mockmodel -listen :8443 -cert /origin/tls.crt -key /origin/tls.key > /tmp/mock.log 2>&1")
+	return append(agentArgs, "-v", a+":/it/agents:ro")
+}
+
+// runAgents runs each agent under profile against the mock, which asks
+// it to run curl to the origin through its shell tool (Phase 7.0 spike).
+// Findings are logged for the spike's notes; only finishing the turn is
+// asserted. prefix runs first: transparent mode drops the proxy variables.
+func (e *env) runAgents(t *testing.T, profile, prefix string) {
+	if os.Getenv("CLOVISOR_IT_AGENTS") == "" {
+		t.Skip("CLOVISOR_IT_AGENTS unset: real agents not run")
+	}
+	for _, name := range []string{"codex", "gemini", "opencode"} {
+		t.Run(name, func(t *testing.T) {
+			if name == "gemini" && os.Getenv("CLOVISOR_IT_NODE") == "" {
+				t.Skip("Gemini CLI needs Node 20 or later: set CLOVISOR_IT_NODE")
+			}
+			// Trust the node CA (agentctl's bundle) and the origin's own
+			// CA, for whatever the proxy does not terminate.
+			script := `export HOME=/tmp/agent-` + name + `; rm -rf $HOME; mkdir -p $HOME
+cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/trust-` + name + `.pem
+export SSL_CERT_FILE=/tmp/trust-` + name + `.pem NODE_EXTRA_CA_CERTS=/tmp/trust-` + name + `.pem
+env | grep -i -E "^(https?|all|no)_proxy=" | sed "s/:[^:@/]*@/:***@/"
+` + agentScripts[name] + `
+echo "agent exit $?"`
+			out, id := e.agentRun(profile, prefix+e.script("agent-"+name, script))
+			t.Logf("%s output:\n%s", name, out)
+			if id != "" {
+				e.timeline(id)
+				shown, _, _ := e.sh("/it/bin/agentctl events " + id)
+				t.Logf("%s events:\n%s", name, shown)
+			}
+			mock, _ := e.dockerCmd("exec", e.name("origin"), "cat", "/tmp/mock.log").CombinedOutput()
+			t.Logf("mock log so far:\n%s", mock)
+			if !strings.Contains(out, "mock: done") {
+				t.Errorf("%s did not finish its turn", name)
+			}
+		})
 	}
 }
 

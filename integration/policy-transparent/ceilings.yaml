@@ -2,7 +2,7 @@ kind: ProfileCeiling
 metadata: { name: everyone }
 spec:
   appliesTo: { any: true }
-  allow: [tp, tp-sub, tp-limits, tp-brief, tp-models, tp-budget, tp-ask, tp-quic, tp-hash, tp-content, tp-observe]
+  allow: [tp, tp-sub, tp-limits, tp-brief, tp-models, tp-budget, tp-ask, tp-quic, tp-hash, tp-content, tp-observe, tp-agents]
   default: tp
   udp: { allow: ["ORIGIN_IP:5002"] }
   icmp: { allow: ["ORIGIN_IP/32"] }

@@ -1,0 +1,12 @@
+# Phase 7.0 spike: real agents against the mock model (CLOVISOR_IT_AGENTS).
+# Audit, default deny: nothing is blocked, and everything an agent reaches
+# besides the mock model and the origin is recorded as would-deny.
+kind: AgentProfile
+metadata: { name: tp-agents }
+spec:
+  mode: audit
+  egress:
+    default: deny
+    rules:
+      - { name: mock-model, to: { fqdn: ["origin.test"], ports: [443, 8443] }, action: allow }
+  observe: { tls_plaintext: true }

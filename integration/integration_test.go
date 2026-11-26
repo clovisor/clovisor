@@ -154,6 +154,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("budgets", e.testBudgets)
 	t.Run("ask", e.testAsk)
 	t.Run("sampling-ask", e.testSamplingAsk)
+	t.Run("agents", func(t *testing.T) { e.runAgents(t, "it-agents", "") }) // before pin-drift restarts the origin
 	t.Run("pin-drift", e.testPinDrift)
 	if t.Failed() {
 		out, _, _ := e.sh("cat /var/log/node-agent.log")
@@ -200,6 +201,16 @@ func (e *env) build() {
 		}
 		if err := os.WriteFile(filepath.Join(bin, name), data, 0o755); err != nil {
 			t.Fatal(err)
+		}
+	}
+	// The Phase 7.0 spike's scripted model, for real agents
+	// (CLOVISOR_IT_AGENTS): a module of its own.
+	if os.Getenv("CLOVISOR_IT_AGENTS") != "" {
+		cmd := exec.Command("go", "build", "-o", filepath.Join(bin, "mockmodel"), ".")
+		cmd.Dir = filepath.Join(root, "spikes", "phase7", "mockmodel")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build mockmodel: %v\n%s", err, out)
 		}
 	}
 	// The QUIC client and server (milestone 5.6): a module of their own.
@@ -318,9 +329,11 @@ func (e *env) start() {
 	e.run("network", "create", e.name("net"))
 	e.run("volume", "create", e.name("run"))
 	e.startOrigin()
-	e.run("run", "-d", "--name", e.name("agent"), "--network", e.name("net"),
-		"-v", filepath.Join(e.dir, "bin")+":/it/bin:ro", "-v", filepath.Join(e.dir, "origin", "ca.crt")+":/it/test-ca.crt:ro",
-		"-v", e.name("run")+":/run/clovisor", agentImage, "sleep", "infinity")
+	agentArgs := []string{"run", "-d", "--name", e.name("agent"), "--network", e.name("net"),
+		"-v", filepath.Join(e.dir, "bin") + ":/it/bin:ro", "-v", filepath.Join(e.dir, "origin", "ca.crt") + ":/it/test-ca.crt:ro",
+		"-v", e.name("run") + ":/run/clovisor"}
+	agentArgs = e.withAgents(agentArgs)
+	e.run(append(agentArgs, agentImage, "sleep", "infinity")...)
 	// A root node agent requires root-owned policy that no one else can
 	// write.
 	if _, errOut, err := e.sh("mkdir -p /etc/clovisor"); err != nil {
