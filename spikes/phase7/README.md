@@ -194,4 +194,84 @@ Findings:
   refuses otherwise. On Kubernetes that is a node-level service, like the
   node agent.
 
-Not yet: Agent Substrate.
+## 4. Agent Substrate (2026-11-26)
+
+Substrate at `7319f1af` (main, shallow clone), on kind (Kubernetes
+v1.37.0), arm64, no `/dev/kvm`, so gVisor only. It was set up as its
+README says (`hack/create-kind-cluster.sh`, `ate-setup deploy ate-system`,
+`ate-setup deploy demo egress`), in `~/clovisor-p7-work`, with three
+adjustments for this host:
+- a `docker` shim that runs `sudo docker`, since this user is not in the
+  `docker` group;
+- the buildx plugin in a private Docker config directory, since Ubuntu's
+  Docker 29.1.3 has none and the installer builds with
+  `docker buildx build --push`;
+- `TMPDIR` and `GOTMPDIR` off `/tmp`, for its quota.
+
+Thirteen components came up on one node in about 2.6 GB: API server,
+controller, identity provider, `atelet`, router, `atenet-egress`,
+Postgres, object storage, and an OpenTelemetry stack.
+
+**Egress, as the demo runs it.** An Actor's fetch of an in-cluster target
+returned 200. nftables in the Worker sends the Actor's connects to
+atunnel, which opens mTLS to the egress gateway with the Actor's
+certificate (`spiffe://substrate-actor.local/worker-for-actor/<atespace>/<actor>`)
+and sends a CONNECT. The gateway is one Deployment for the cluster: the
+target saw the gateway Pod's address. Its Envoy (1.39.5) calls Substrate's
+`ext_proc` (`cmd/atenet/internal/router/egress`) on three filter chains:
+- `egress`, the CONNECT. The certificate chain arrives in
+  `x-forwarded-client-cert`. The `ext_proc` verifies it again against the
+  actor-identity CA, reads the Actor from the SPIFFE URI, checks the
+  Actor's UID is running, and answers with dynamic metadata (SNI rules,
+  the dialed port) that the rest of the Envoy config uses.
+- `egress-tls-mitm`, requests inside a tunnel the gateway terminates.
+- `egress-cleartext`, plain HTTP.
+
+Inside a tunnel, the Actor is read from filter state
+(`dev.ate.actor.identity`). Nothing the Actor writes counts toward its
+identity.
+
+Findings:
+
+- **Substrate solved Clovisor's 6.6 identity bug the same way, with the
+  right object.** Its tunnels carry identity as filter state too. Its
+  xDS notes that the tunnel key "is the only hashable value and Envoy
+  pools tunnels by it, so a tunnel only carries one actor and port". It is
+  set with `envoy.hashable_string`, which Envoy 1.34 (Clovisor's) lacks
+  and 1.39 has. 7.2 should move Clovisor to Envoy 1.39 or later, and key
+  its pools with that object instead of `upstream_server_name`.
+- **An Actor is a run.** Its UID stays the same across suspend, resume and
+  a move to another Worker Pod: the demo Actor came back on
+  `…-bzw45` after `…-vjtq7`. Its sandbox's state path
+  (`/var/lib/ate/actors/<uid>/`) moves with it. A Clovisor timeline keyed
+  by the Actor spans all of that, with nothing kernel-side to restore
+  (7.3).
+- **There is no hook for another policy point in Envoy mode.** The egress
+  chains' `ext_proc` filter is Substrate's own, and its answers carry
+  metadata the rest of the config depends on. The ways in:
+  1. **A second `ext_proc` on the egress chains**, after Substrate's,
+     reading the identity Substrate has verified (the SPIFFE URI on the
+     CONNECT, the filter state inside). Clovisor's `ext_proc` would add
+     its decisions, narration and records. That needs a change to
+     Substrate's xDS (`cmd/atenet/internal/router/xds.go`): an upstream
+     proposal, or a local patch for the next spike.
+  2. **Replacing Substrate's `ext_proc`**: Clovisor would have to
+     reproduce its identity checks, policy metadata and credential
+     injection. Not worth it.
+  3. **agentgateway mode**, with its built-in `substrateEgress` policy:
+     the same question there.
+  4. **Substrate's forwarding protocol** (their #124 and #338), once
+     settled.
+
+  Option 1 fits the plan's decision not to depend on unsettled protocol:
+  it touches only Envoy's `ext_proc`, which Clovisor already speaks.
+- **Runtime Monitoring needs Substrate's help.** `ateworker-gvisor`, in
+  each Worker Pod, starts one `runsc-sandbox` per Actor. It has no option
+  for a trace session (`--pod-init-config`). Every sandbox's container id
+  is the generic `_sandbox`, so the Actor would be told by its UID in the
+  sandbox's root path, or by a socket per Actor. A sandbox restored from
+  a snapshot would need the session again on restore. 7.5 needs an
+  upstream change.
+
+The cluster, its registry and the demo are still running. They are torn
+down with `ate-setup delete all` and `hack/delete-kind-cluster.sh`.
