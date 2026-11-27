@@ -1798,14 +1798,18 @@ static __always_inline int lsm_prev(long ret)
     return ret < 0 && ret >= -4095 ? (int)ret : -EPERM_;
 }
 
-/* -EPERM where deny, else 0, as an LSM program must return it. Computed
- * in 64 bits and kept there: with -mcpu=v3's 32-bit arithmetic, "deny ?
- * -EPERM_ : 0" could reach exit as 0xffffffff, which 6.12 and RHEL 9.7
- * refuse as outside [-4095, 0] (7.2). */
+/* -EPERM where deny, else 0, as an LSM program must return it: one of two
+ * constants, chosen by a branch. Compiled from C, the choice became
+ * "-(deny & 1)", whose value 6.12 and RHEL 9.7's verifiers cannot bound,
+ * and refused as outside [-4095, 0] (7.2). Written as assembly, the
+ * verifier sees 0 on one path and -EPERM on the other. */
 static __always_inline int lsm_refuse(int deny)
 {
-    long r = deny ? -EPERM_ : 0;
-    barrier_var(r);
+    long r = 0;
+    long d = deny;
+    asm volatile("if %[d] == 0 goto +1\n\t%[r] = %[e]"
+                 : [r] "+r"(r)
+                 : [d] "r"(d), [e] "i"(-EPERM_));
     return r;
 }
 

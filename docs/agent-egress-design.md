@@ -5200,7 +5200,7 @@ Done so far:
   | 6.6, 6.12, 6.18, RHEL 9.7 (5.15 too) | `on_ingress` (DNS replies) | a possibly zero-sized read: `len & (MAX_DNS_LEN - 1) ?: MAX_DNS_LEN` reached it as [0, 1023] | `((len - 1) & (MAX_DNS_LEN - 1)) + 1`, the same length, never zero |
   | 6.6 and later; 5.15 never finished verifying it | `on_lsm_exec` | two frames' stack, 544 bytes, over 512 (7.0 counts 496) | the exec-path report in a function of its own: 224+200 |
   | 6.1 | `on_lsm_exec_hash` | a CO-RE field missing on both branches | the change time read from `i_ctime` before 6.6, `__i_ctime` to 6.10, `i_ctime_sec` from 6.11 |
-  | 6.12, RHEL 9.7 | `on_lsm_unix_may_send`, `on_lsm_unix_stream_connect` | the return value outside [-4095, 0] | `lsm_refuse`: computed in 64 bits. With 7.2's `-mcpu=v3`, "deny ? -EPERM : 0" could leave as 0xffffffff, which those kernels check in 64 bits |
+  | 6.12, RHEL 9.7 | `on_lsm_unix_may_send`, `on_lsm_unix_stream_connect` | the return value outside [-4095, 0] | `lsm_refuse`: one of two constants, chosen by a branch in inline assembly. Compiled from C, "deny ? -EPERM : 0" became `-(deny & 1)`, which those verifiers cannot bound. A 64-bit version of the same arithmetic did not help: the bound, not the width, was the problem |
   | 5.15 | `on_getsockopt` (transparent mode) | `bpf_get_current_ancestor_cgroup_id` not allowed there | documented: transparent mode needs 6.1 |
 
   Kernels 6.6 and 6.18 passed after the first two fixes. The rest is in
