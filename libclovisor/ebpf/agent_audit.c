@@ -894,7 +894,11 @@ int on_ingress(struct __sk_buff *skb)
     __builtin_memcpy(e->saddr, saddr, sizeof(saddr));
 
     __u32 len = dnslen > MAX_DNS_LEN ? MAX_DNS_LEN : dnslen;
-    if (bpf_skb_load_bytes(skb, l4off + 8, e->payload, len & (MAX_DNS_LEN - 1) ?: MAX_DNS_LEN) < 0) {
+    /* 1 to MAX_DNS_LEN, in a form older verifiers can see is never zero
+     * (7.2: 6.6 refused "len & (MAX_DNS_LEN - 1) ?: MAX_DNS_LEN" as a
+     * possibly zero-sized read). The same length for every len. */
+    __u32 n = ((len - 1) & (MAX_DNS_LEN - 1)) + 1;
+    if (bpf_skb_load_bytes(skb, l4off + 8, e->payload, n) < 0) {
         bpf_ringbuf_discard(e, 0);
         return 1;
     }
@@ -2247,6 +2251,47 @@ __attribute__((noinline)) int exec_layer_ok(struct exec_policy *pol, struct exec
     return l->default_allow != 0;
 }
 
+/* Report an exec's resolved path, once per run, verdict and content
+ * (where it was hashed), and once more when the cache first answers for
+ * it: what learn and check need, without an event per exec of a hot
+ * binary. A global function, so its locals are not on exec_check's frame
+ * with exec_layer_ok's: kernels before 7.0 counted the two over 512
+ * bytes (7.2). */
+__attribute__((noinline)) int exec_report(struct exec_task *t, __u64 run, __u32 verdict)
+{
+    if (!t)
+        return 0;
+    __u64 seen = t->h;
+    if (t->flags & EXEC_HASHED) {
+        __u64 x;
+        __builtin_memcpy(&x, t->sum.sha, sizeof(x));
+        seen ^= x ^ (t->flags & EXEC_CACHED);
+    }
+    struct exec_key sk = {.run = run, .layer = verdict, .hash = seen};
+    __u8 one = 1;
+    if (bpf_map_update_elem(&exec_seen, &sk, &one, BPF_NOEXIST) != 0)
+        return 0;
+    struct exec_path_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        struct event_hdr hdr = {};
+        if (fill_hdr(&hdr, EVENT_EXEC_PATH))
+            note_lost(hdr.run_cgroup_id);
+        return 0;
+    }
+    if (!fill_hdr(&e->hdr, EVENT_EXEC_PATH) || !within_budget(e->hdr.run_cgroup_id, sizeof(*e))) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
+    __builtin_memcpy(e->path, t->p.b, EXEC_PATH);
+    e->len = t->len;
+    e->verdict = verdict;
+    e->trusted = t->trusted;
+    e->flags = t->flags;
+    __builtin_memcpy(e->sha, t->sum.sha, SHA256_LEN);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 /* The exec decision for both programs below; hashing is a constant. */
 static __always_inline int exec_check(struct linux_binprm *bprm, int ret, const int hashing)
 {
@@ -2306,35 +2351,7 @@ static __always_inline int exec_check(struct linux_binprm *bprm, int ret, const 
     refuse = refuse && cfg->mode == MODE_ENFORCE;
     __u32 verdict = refuse ? V_EXEC_DENY : (deny ? V_AUDIT_EXEC : V_EXEC_OK);
 
-    /* Each resolved path once per run, verdict and content (where it was
-     * hashed), and once more when the cache first answers for it: what
-     * learn and check need, without an event per exec of a hot binary. */
-    __u64 seen = h;
-    if (t->flags & EXEC_HASHED) {
-        __u64 x;
-        __builtin_memcpy(&x, t->sum.sha, sizeof(x));
-        seen ^= x ^ (t->flags & EXEC_CACHED);
-    }
-    struct exec_key sk = {.run = run, .layer = verdict, .hash = seen};
-    __u8 one = 1;
-    if (bpf_map_update_elem(&exec_seen, &sk, &one, BPF_NOEXIST) == 0) {
-        struct event_hdr hdr = {};
-        if (fill_hdr(&hdr, EVENT_EXEC_PATH) && within_budget(hdr.run_cgroup_id, sizeof(struct exec_path_event))) {
-            struct exec_path_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-            if (e) {
-                e->hdr = hdr;
-                __builtin_memcpy(e->path, p->b, EXEC_PATH);
-                e->len = len;
-                e->verdict = verdict;
-                e->trusted = trusted;
-                e->flags = t->flags;
-                __builtin_memcpy(e->sha, t->sum.sha, SHA256_LEN);
-                bpf_ringbuf_submit(e, 0);
-            } else {
-                note_lost(hdr.run_cgroup_id);
-            }
-        }
-    }
+    exec_report(t, run, verdict);
     return refuse ? -EPERM_ : 0;
 }
 
