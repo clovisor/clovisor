@@ -68,10 +68,12 @@ func TestBPFLoad(t *testing.T) {
 			t.Logf("ok      %-26s %s", n, ps.SectionName)
 			continue
 		}
+		// The verifier's last lines say why: its very last is statistics.
 		var ve *ebpf.VerifierError
 		msg := err.Error()
 		if errors.As(err, &ve) && len(ve.Log) > 0 {
-			msg = ve.Log[len(ve.Log)-1]
+			tail := ve.Log[max(0, len(ve.Log)-20):]
+			msg = ve.Cause.Error() + "\n\t" + strings.Join(tail, "\n\t")
 		}
 		if have < need {
 			below = append(below, n)
