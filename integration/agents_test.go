@@ -227,23 +227,29 @@ func (e *env) runAgents(t *testing.T, s agentSuite) {
 // runLangGraph runs one LangGraph process with two concurrent sessions
 // (milestone 7.0): A fetches /allowed, B /secret. Shared, both use the
 // process's run. Per session, each creates a run of its own through the
-// run API (credential identity), B asking for it-session, which refuses
-// /secret. Findings are logged; what each mode must show is asserted.
+// run API (credential identity), B asking for a profile that refuses
+// /secret. As sessions (7.3), each mints a session inside the process's
+// run, with either identity, and is nested in it. Findings are logged;
+// what each mode must show is asserted.
 func (e *env) runLangGraph(t *testing.T, profile, prefix string, perSession bool) {
 	if os.Getenv("CLOVISOR_IT_PYDEPS") == "" {
 		t.Skip("CLOVISOR_IT_PYDEPS unset: LangGraph not run")
 	}
 	server := "PYTHONPATH=/it/pydeps python3 /it/bin/langgraph-server.py"
-	modes := []string{"shared", "default-client"}
+	modes := []string{"shared", "default-client", "sessions"}
 	if perSession {
 		modes = append(modes, "per-session")
+	}
+	narrow := "it-session"
+	if strings.HasPrefix(profile, "tp-") {
+		narrow = "tp-session"
 	}
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			// The origin's own CA too, for a client that goes around the
 			// proxy (default-client): whether it does is the question.
 			trust := `cat "$SSL_CERT_FILE" /it/test-ca.crt > /tmp/lg-trust.pem; SSL_CERT_FILE=/tmp/lg-trust.pem `
-			out, id := e.agentRun(profile, prefix+trust+server+" "+mode+" "+profile+" A=allowed B=secret=it-session 2>&1")
+			out, id := e.agentRun(profile, prefix+trust+server+" "+mode+" "+profile+" A=allowed B=secret="+narrow+" 2>&1")
 			t.Logf("%s output:\n%s", mode, out)
 			shown, _, _ := e.sh("/it/bin/agentctl events " + id)
 			t.Logf("the process's run %s:\n%s", id, shown)
@@ -257,10 +263,12 @@ func (e *env) runLangGraph(t *testing.T, profile, prefix string, perSession bool
 					Tool []string
 				}
 				json.Unmarshal([]byte(m[2]), &r)
-				if mode != "per-session" {
+				if mode != "per-session" && mode != "sessions" {
 					continue
 				}
-				e.timeline(r.Run)
+				if tl := e.timeline(r.Run); mode == "sessions" {
+					expect(t, tl, `"session": true`, `"parent": "`+id+`"`)
+				}
 				s, _, _ := e.sh("/it/bin/agentctl events " + r.Run)
 				t.Logf("session %s's run %s:\n%s", m[1], r.Run, s)
 				want, other := "/allowed", "/secret"

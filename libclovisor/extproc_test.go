@@ -401,6 +401,8 @@ func TestEnvoyBootstrapTermination(t *testing.T) {
 				}
 				if f, _ := json.Marshal(x["format_string"]); !strings.Contains(string(f), "%DOWNSTREAM_REMOTE_ADDRESS%") {
 					t.Errorf("pool key without the client: %s", f)
+				} else if !strings.Contains(string(f), "%REQ(PROXY-AUTHORIZATION)%") {
+					t.Errorf("pool key without the credential (7.3): %s", f)
 				}
 			}
 			for _, e := range x {

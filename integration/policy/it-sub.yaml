@@ -1,0 +1,14 @@
+# What a session asks for (milestone 7.3): more than it in one way
+# (/secret), less in another (/headers). Inside an it run it gets only
+# what both allow: /allowed.
+kind: AgentProfile
+metadata: { name: it-sub }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-some
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed", "/secret"] }
+        action: allow

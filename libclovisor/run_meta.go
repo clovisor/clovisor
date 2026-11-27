@@ -36,6 +36,9 @@ type RunMeta struct {
 	// run (milestone 4.6); Children are the runs started from inside it.
 	Parent   string   `json:"parent,omitempty"`
 	Children []string `json:"children,omitempty"`
+	// Session marks a session inside its parent run (milestone 7.3): a
+	// proxy credential with no process or cgroup of its own.
+	Session bool `json:"session,omitempty"`
 	// EndReason says why the node agent ended the run, when it did
 	// (milestone 5.2: a duration limit, or its parent's).
 	EndReason string `json:"end_reason,omitempty"`

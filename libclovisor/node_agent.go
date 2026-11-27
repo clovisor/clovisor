@@ -306,9 +306,10 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		closeAudit()
 		return nil, err
 	}
-	if credential {
-		api.Events = httpEvents
-	} else {
+	// With cgroup identity only sessions, which have no cgroup, report
+	// their start and end this way.
+	api.Events = httpEvents
+	if !credential {
 		api.GrantsPath = d.Grants()
 	}
 	api.Transparent = opts.Transparent.Mode

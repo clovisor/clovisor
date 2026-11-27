@@ -5219,6 +5219,70 @@ Still to do:
 - a `LICENSE` file: the sources' headers name Apache 2.0, "which
   accompanies this distribution", and none does.
 
+#### 7.3 status (2026-11-27, in progress)
+
+Sessions inside a run come first: they can be built and tested here.
+Actor identity needs Agent Substrate on kind.
+
+Done so far:
+
+- **Sessions inside a run.** Run API op `session` mints a session: a
+  nested run with a proxy credential and no process or cgroup.
+  - Its requests are decided by the run's layers and its own, as a
+    nested run's are (`policy.Nested`), so a session can only narrow. It
+    shares its run's budgets and clamps through the same parent chain.
+  - With cgroup identity, only a process in the run can mint one, and
+    the proxy accepts its credential only on a connection from the run's
+    own cgroup. A `run-` credential naming no live session, or a session
+    of another run, is refused (`bad session credential`) rather than
+    decided as the run. Other proxy credentials are ignored, as before.
+  - With credential identity, the run's token proves the caller is in the
+    run. Sessions there are nested, which 7.0's per-session runs were not.
+  - A session nests in a session by that session's token, within the
+    3-deep limit.
+  - A session's timeline is its own, filed with `session: true` and
+    `parent`, from start and end events the run API sends (cgroup
+    identity included, since no rmdir reports a session's end), and its
+    run's lists it among its `children`. A session lasts as long as its
+    run API connection, ends with its run, and is not in the grants file.
+    The kernel never sees it: no kernel policy, and clamps skip the
+    kernel for it.
+  - `agentctl session [--profile p] -- cmd` runs a command as a session,
+    nesting in the session its proxy settings name, if any.
+    `agentctl events` marks a session's timeline.
+- **Envoy's tunnel pool key holds the credential as well as the client.**
+  Two sessions' CONNECTs on one client connection (HTTP/2), or two
+  credential runs', must not share a tunnel, as 6.6's runs must not.
+- **The LangGraph server's `sessions` mode** mints a session per LangGraph
+  session. With cgroup identity, one LangGraph process's two concurrent
+  sessions each had a nested timeline, and session B was refused
+  `/secret` by its own `tp-session` profile. The run's timeline still
+  shows both requests, from the kernel's TLS probes. Those are the run's
+  view. 7.0's open finding, sessions not nested, is closed in both modes.
+
+Verified:
+
+- `TestSessions` (credential identity, no kernel): narrowing both ways,
+  the token as proof, a session in a session, ending with its connection
+  and with its run, each timeline's parent and decisions. Without
+  `policy.Nested` it fails.
+- Integration, both suites: a session asking for more in one way and less
+  in another gets only what both allow, and a session inside it no more.
+  Each has a timeline marked as its parent's session. In transparent mode
+  another run presenting the session's credential is refused, and
+  without the proxy's check that its home run is the sending socket's,
+  the request went through, and the test failed.
+- `make check`; `make integration` (17 passed) and
+  `make integration-transparent` (32); the LangGraph checks in both
+  suites with `CLOVISOR_IT_PYDEPS`.
+
+Still to do:
+- Actor identity (Substrate): read the Actor from Substrate's
+  certificate, check it against its API, and bind profiles by
+  ActorTemplate and atespace;
+- the MCP gateway still knows a session as its run: with cgroup identity
+  it identifies by cgroup alone.
+
 ---
 
 ## 11. Non-goals and honest limits

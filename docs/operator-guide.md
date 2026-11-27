@@ -620,6 +620,49 @@ shared across the tree:
   directly anyway. One the nested run's first process already holds is
   refused at start, as for any run.
 
+**Sessions** (either identity, milestone 7.3). A process that runs many
+agent sessions, a LangGraph server for instance, can give each session
+its own policy and timeline without a process of its own. A session is a
+nested run with a proxy credential instead of a cgroup:
+
+```sh
+agentctl session --profile research -- ./one-task.sh   # inside a run
+```
+
+`agentctl session` mints the session and runs the command with the
+session's proxy URL and trust settings. A server mints its sessions itself
+over the run API: op `session`, with the profile it asks for. With
+credential identity it sends `token`, its run's credential from the proxy
+URL `agentctl run` gave it. Then it sends each session's requests through
+that session's proxy URL (for example httpx's `proxy=`), and ends the
+session with op `end` or by closing the connection.
+`spikes/phase7/langgraph/server.py` does this (mode `sessions`). Rules:
+
+- Requests through a session's proxy URL are decided by the run's layers
+  and the session's together, as for a nested run. A session can only
+  narrow its run.
+- Each session has a timeline of its own, with `session: true` and
+  `parent` set, holding the requests decided as the session's. The run's
+  timeline lists it among its `children`.
+- A session is minted only from inside a run, by the run's owner. With
+  cgroup identity the caller's cgroup must be the run's. With credential
+  identity the run's token is the only proof.
+- With cgroup identity, the proxy accepts a session's credential only on
+  connections from its run's cgroup. Presented by another run, or naming
+  no live session, the request is refused (`bad session credential`),
+  not decided as the sending run's. Other proxy credentials are ignored,
+  as before.
+- A session nests in a session by that session's token (`agentctl
+  session` inside a session does this). The 3-deep limit counts sessions.
+- A session ends with its connection, with op `end`, or with its run. It
+  does not outlive a node agent restart.
+- Only the proxy knows sessions. The kernel's view (execs, connects, DNS,
+  TLS plaintext from probes) stays the run's: the run's policy applies
+  there, and the run's timeline records it. A session's requests made
+  without its proxy URL are the run's. With credential identity, a
+  session's credential, like a run's, is the identity: whoever holds it
+  is the session.
+
 Tested clients: curl, Python requests and urllib (3.11+), and git (smart and
 dumb HTTP; git authenticates to the proxy after a `407` challenge). Node's
 built-in `fetch` does not read proxy variables by default. Configure the
@@ -669,13 +712,14 @@ under their own rules, so you can keep or drop each.
 
 **Many sessions in one process.** A server that runs several agent
 sessions in one process, a LangGraph server for instance, is one run:
-one policy and one timeline for all of them (design §5.8). With credential
-identity, each session can have a run of its own. The session opens a run
-API connection, `create`s a run with the profile it asks for, sends
-through the run's proxy URL (for example httpx's `proxy=`), and `end`s
-the run when done. `spikes/phase7/langgraph/server.py` shows it in about
-thirty lines (`SessionRun`). Those runs are not nested in the process's
-run, so a session can ask for any profile its user's ceiling allows.
+one policy and one timeline for all of them (design §5.8), unless each
+session is a session of the run (§7 Sessions). Then each is decided by
+the run's policy and its own, and has a timeline of its own, with either
+identity. `spikes/phase7/langgraph/server.py` shows both in about thirty
+lines (`SessionRun`, modes `shared` and `sessions`). With credential
+identity a session can instead `create` a run of its own (mode
+`per-session`). That run is not nested in the process's, so it can ask
+for any profile its user's ceiling allows.
 
 ## 8. From observation to enforcement
 
@@ -1559,8 +1603,15 @@ ignore the proxy, it checks:
 
   In transparent mode, each agent's own TLS stack is listed as expected
   (§11 TLS plaintext). With `CLOVISOR_IT_PYDEPS` naming a Docker volume
-  of LangGraph's packages, a LangGraph server's sessions run shared, and
-  in explicit mode each with a run of its own;
+  of LangGraph's packages, a LangGraph server's sessions run shared,
+  then each as a session of the process's run (refused by its own profile,
+  with its own timeline), and in explicit mode also each with a run of
+  its own;
+- sessions: in a run, a session asking for a profile that allows more in
+  one way and less in another got only what both allow, and a session
+  inside it no more. Each had a timeline marked as a session of its
+  parent. In transparent mode (cgroup identity), another run that
+  presented the session's credential was refused;
 - restart, capturing: a Python process in a run that captures TLS
   plaintext made a request before the restart and one after; both were
   recorded, the new node agent having probed the running process again;

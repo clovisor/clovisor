@@ -39,6 +39,8 @@ func printUsage(code int) {
 	fmt.Println("  agentctl run [--profile p] [--no-proxy] [--mcp-config file] [--] <command> [args...]")
 	fmt.Println("                                    Run a command as a governed run")
 	fmt.Println("  agentctl call [--name n] -- cmd   Inside a run: run cmd as a tool call, in a cgroup of its own")
+	fmt.Println("  agentctl session [--profile p] -- cmd")
+	fmt.Println("                                    Inside a run: run cmd as a session, with a proxy credential of its own")
 	fmt.Println("  agentctl status                   Show the node's enforcement state")
 	fmt.Println("  agentctl profiles                 Show which profiles you may request")
 	fmt.Println("  agentctl clamp <run-id> <profile> Intersect a profile into a live run (remove-only)")
@@ -723,7 +725,9 @@ func listRuns(dir string) error {
 }
 
 func printTimeline(tl *clovisor.RunTimeline) {
-	if strings.HasPrefix(tl.CgroupPath, clovisor.CredentialRunsDir+"/") {
+	if tl.Session {
+		fmt.Printf("Run       %s (a session in run %s: its proxied requests only; the kernel audit is the run's)\n", tl.RunID, tl.Parent)
+	} else if strings.HasPrefix(tl.CgroupPath, clovisor.CredentialRunsDir+"/") {
 		fmt.Printf("Run       %s (credential identity: no cgroup, no kernel audit)\n", tl.RunID)
 	} else {
 		fmt.Printf("Run       %s (cgroup %d, %s)\n", tl.RunID, tl.CgroupID, tl.CgroupPath)
@@ -1306,6 +1310,13 @@ func main() {
 			os.Exit(1)
 		}
 		os.Exit(code)
+	case "session":
+		code, err := sessionCommand(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(code)
 	case "call":
 		code, err := callCommand(os.Args[2:])
 		if err != nil {
@@ -1419,6 +1430,78 @@ func callCommand(argv []string) (int, error) {
 		fmt.Fprintf(os.Stderr, "agentctl: ending call %s: %v\n", c.CallID, err)
 	}
 	return code, nil
+}
+
+// sessionCommand runs cmd as a session inside the caller's run (milestone
+// 7.3): no cgroup of its own, but a proxy credential, so that its
+// requests are decided by the run's policy and the session's profile
+// together, and recorded in a timeline of its own. Inside a session it
+// mints a session in that one. Only what cmd sends through the proxy is
+// the session's; the kernel still knows it as the run.
+func sessionCommand(argv []string) (int, error) {
+	fs := flag.NewFlagSet("session", flag.ContinueOnError)
+	profile := fs.String("profile", "", "the profile to ask for: it can only narrow the run's")
+	if err := fs.Parse(argv); err != nil {
+		return 1, err
+	}
+	args := fs.Args()
+	if len(args) == 0 {
+		return 1, fmt.Errorf("usage: agentctl session [--profile p] -- command [args...]")
+	}
+	path, err := exec.LookPath(args[0])
+	if err != nil {
+		return 1, err
+	}
+	api, err := clovisor.DialRunAPI(socketPath())
+	if err != nil {
+		return 1, err
+	}
+	defer api.Close() // closing without end ends the session too
+	s, err := api.Session(proxyToken(os.Environ()), *profile)
+	if err != nil {
+		return 1, err
+	}
+	fmt.Fprintf(os.Stderr, "agentctl: session %s in run %s, %s; egress via %s\n", s.RunID, s.Parent, describePolicy(s.Policy), redactProxy(s.Proxy))
+	env := proxyEnv(os.Environ(), s.Proxy)
+	if s.TrustBundle != "" {
+		env = trustEnv(env, s.TrustBundle, s.NodeCACert)
+	}
+	cmd := exec.Command(path, args[1:]...)
+	cmd.Args[0] = args[0]
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = append(env, "CLOVISOR_SESSION="+s.RunID)
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+	code, err := exitCode(cmd.Wait())
+	if err != nil {
+		return 1, err
+	}
+	if reason, err := api.End(&code); reason != "" {
+		fmt.Fprintf(os.Stderr, "agentctl: session %s was ended by the node agent: %s\n", s.RunID, reason)
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "agentctl: ending session %s: %v\n", s.RunID, err)
+	}
+	return code, nil
+}
+
+// proxyToken is the run's or session's credential in the proxy settings
+// agentctl gave the environment, or "": with cgroup identity a run's proxy
+// URL carries none.
+func proxyToken(env []string) string {
+	for _, k := range []string{"https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"} {
+		for _, kv := range env {
+			v, ok := strings.CutPrefix(kv, k+"=")
+			if !ok {
+				continue
+			}
+			if u, err := url.Parse(v); err == nil && u.User != nil && strings.HasPrefix(u.User.Username(), clovisor.RunPrefix) {
+				p, _ := u.User.Password()
+				return p
+			}
+		}
+	}
+	return ""
 }
 
 // printVisibility shows, per destination, how much of what the run did

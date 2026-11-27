@@ -83,6 +83,9 @@ func TestTransparent(t *testing.T) {
 	t.Run("exec-hash", e.testExecHash)
 	t.Run("tls-plaintext", e.testTLSPlaintext)
 	t.Run("tunnel-identity", e.testTunnelIdentity)
+	t.Run("sessions", func(t *testing.T) {
+		e.testSessions(t, "tp", "tp-sub", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; ", true)
+	})
 	t.Run("forged-identity", func(t *testing.T) {
 		e.forgedIdentity(t, "tp-agents", "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; ")
 	})

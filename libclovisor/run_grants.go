@@ -83,6 +83,9 @@ func (s *RunAPIServer) saveGrants() {
 	f := grantFile{Version: grantFileVersion, Profiles: map[string]*policy.AgentProfile{}}
 	s.mu.Lock()
 	for runID := range s.active {
+		if _, session := s.sessions[runID]; session {
+			continue // a session ends with its connection, so with the node agent
+		}
 		g := runGrant{RunID: runID, CgroupID: s.runCg[runID], Parent: s.parentOf[runID], Creator: s.creators[runID]}
 		if p, ok := s.cm.GetRunCgroupPath(runID); ok {
 			if rel, err := filepath.Rel(s.cm.GetAgentsDir(), p); err == nil {

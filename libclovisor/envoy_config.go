@@ -154,9 +154,12 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	// 6.6 used the upstream server name, before Envoy had one; Agent
 	// Substrate keys its tunnels the same way, 7.0). Shared once, it
 	// reaches the connection to the terminating listener and no further.
+	// The credential is in the key too, as the identity is: one client
+	// connection's CONNECTs for two sessions (7.3) or two credential runs
+	// must not share a tunnel either.
 	poolKey := func(client string) obj {
 		return obj{"object_key": "clovisor.pool", "factory_key": "envoy.hashable_string", "shared_with_upstream": "ONCE",
-			"format_string": obj{"text_format_source": obj{"inline_string": client}}}
+			"format_string": obj{"text_format_source": obj{"inline_string": client + "|%REQ(PROXY-AUTHORIZATION)%"}}}
 	}
 	setState := func(client string) obj {
 		return obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(

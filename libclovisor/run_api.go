@@ -59,7 +59,7 @@ const maxAPIMessage = 64 << 10
 
 // RunAPIRequest is a client message.
 type RunAPIRequest struct {
-	Op       string   `json:"op"` // create, attach, end, call, call_end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status, pending, ask_decide
+	Op       string   `json:"op"` // create, session, attach, end, call, call_end, profiles, clamp, revoke, mcp_register, pins, pin_approve, status, pending, ask_decide
 	Command  []string `json:"command,omitempty"`
 	Cwd      string   `json:"cwd,omitempty"`
 	ExitCode *int     `json:"exit_code,omitempty"`
@@ -87,6 +87,11 @@ type RunAPIRequest struct {
 	Approve  bool   `json:"approve,omitempty"`
 	Remember bool   `json:"remember,omitempty"`
 	AsksAll  bool   `json:"asks_all,omitempty"`
+	// Token is the credential of the run or session a new session is
+	// minted in (op session): required with credential identity, where
+	// it is the only proof of being inside the run; with cgroup identity,
+	// it names a session of the caller's run to nest in.
+	Token string `json:"token,omitempty"`
 }
 
 // RunAPIResponse is the agent's reply to each request.
@@ -292,17 +297,21 @@ type RunAPIServer struct {
 	// TrustBundle and NodeCACert are handed to runs when the proxy
 	// terminates TLS.
 	TrustBundle, NodeCACert string
-	// Events receives run start and end with credential identity, where
-	// no cgroup mkdir or rmdir reports them.
+	// Events receives run start and end with credential identity, and
+	// for sessions, where no cgroup mkdir or rmdir reports them.
 	Events chan<- AuditEvent
 	// GrantsPath is where live runs' grants are kept across node agent
 	// restarts (milestone 6.1); "" keeps none.
 	GrantsPath string
 	grantMu    sync.Mutex
 
-	nextCg uint64            // credential identity: synthetic run ids
-	tokens map[string]string // credential identity: token -> run id
+	nextCg uint64            // credential identity and sessions: synthetic run ids
+	tokens map[string]string // credential identity and sessions: token -> run id
 	tokOf  map[string]string // run id -> token
+	// Sessions inside a run (milestone 7.3): runs with a credential and no
+	// process, each mapped to the run whose cgroup its requests must come
+	// from ("" with credential identity, where there is none).
+	sessions map[string]string
 	// Tool calls (milestone 4.5), per run: the last call number given, and
 	// how many are open.
 	callSeq   map[string]int
@@ -536,6 +545,7 @@ func NewRunAPIServer(path string, cm *CgroupManager, reg *RunRegistry) (*RunAPIS
 		restored:   map[string]time.Time{},
 		creators:   map[string]procIdentity{},
 		nextCg:     credentialCgBase,
+		sessions:   map[string]string{},
 		done:       make(chan struct{}),
 	}, nil
 }
@@ -695,7 +705,35 @@ func (s *RunAPIServer) emit(typ int, runID string, cg uint64) {
 		return
 	}
 	s.Events <- AuditEvent{Type: typ, Timestamp: time.Now(), CgroupID: cg, RunCgroupID: cg,
-		Data: RunData{CgroupPath: CredentialRunsDir + "/" + RunPrefix + runID}}
+		Data: RunData{CgroupPath: s.virtualPath(runID)}}
+}
+
+// virtualPath is where the recorder files a run without a cgroup of its
+// own: a credential run under CredentialRunsDir; a session with cgroup
+// identity below the run its requests come from, as a nested run would
+// be (no such directory exists).
+func (s *RunAPIServer) virtualPath(runID string) string {
+	s.mu.Lock()
+	home := s.sessions[runID]
+	s.mu.Unlock()
+	if s.cm != nil && home != "" {
+		if p, ok := s.cm.GetRunCgroupPath(home); ok {
+			if rel, err := filepath.Rel(CgroupV2Root, p); err == nil {
+				return "/" + rel + "/" + RunPrefix + runID
+			}
+		}
+		return s.agentsRel + "/" + RunPrefix + home + "/" + RunPrefix + runID
+	}
+	return CredentialRunsDir + "/" + RunPrefix + runID
+}
+
+// SessionHome reports whether runID is a session, and the run whose
+// cgroup its requests must come from ("" with credential identity).
+func (s *RunAPIServer) SessionHome(runID string) (home string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	home, ok = s.sessions[runID]
+	return home, ok
 }
 
 func (s *RunAPIServer) inAgents(cg string) bool {
@@ -717,6 +755,9 @@ type apiConn struct {
 	// parent is the run this connection's run is nested in, if any: its
 	// process must come from inside that run.
 	parent string
+
+	// session_ marks this connection's run as a session (op session).
+	session_ bool
 
 	// A tool call (op call) instead of a run: the caller is inside the run.
 	callID   string
@@ -777,7 +818,12 @@ func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 	switch req.Op {
 	case "create":
 		return ac.create(req)
+	case "session":
+		return ac.session(req)
 	case "attach":
+		if ac.session_ {
+			return fail("run %s is a session: it has no process to attach", ac.runID)
+		}
 		if ac.s.cm == nil {
 			return fail("runs have credential identity here: there is no cgroup to attach to, start the process with the run's proxy settings")
 		}
@@ -993,6 +1039,150 @@ func (ac *apiConn) create(req RunAPIRequest) RunAPIResponse {
 			u.User = url.UserPassword(RunPrefix+runID, token)
 			resp.Proxy = u.String()
 		}
+	}
+	return resp
+}
+
+// session mints a session inside the caller's run (milestone 7.3): a
+// nested run with a proxy credential and no process, for an agent server
+// that runs many sessions in one process. Its requests are decided by the
+// run's policy and the session's together, so a session can only narrow
+// the run, and are recorded in a timeline of its own. With cgroup
+// identity the caller must be in the run, and the proxy accepts the
+// session's credential only on connections from the run's cgroup. With
+// credential identity the caller proves it is in the run by its token.
+// The session lasts as long as this connection, or until op end, and ends
+// with its run.
+func (ac *apiConn) session(req RunAPIRequest) RunAPIResponse {
+	if ac.runID != "" {
+		return fail("this connection already has run %s", ac.runID)
+	}
+	if ac.s.ProxyURL == "" {
+		return fail("sessions need the proxy: this node agent runs none")
+	}
+	s := ac.s
+	var parent, home string
+	if s.cm != nil {
+		cg, err := procCgroup(int(ac.cred.Pid))
+		if err != nil {
+			return fail("cannot read caller's cgroup: %v", err)
+		}
+		home = s.runOfCgroupPath(cg)
+		if home == "" {
+			return fail("a session is minted from inside a run, and the caller is in none (%s)", cg)
+		}
+		parent = home
+	} else if req.Token == "" {
+		return fail("runs have credential identity here: a session needs the token of the run it is minted in")
+	}
+	if req.Token != "" {
+		s.mu.Lock()
+		named, found := s.tokens[req.Token]
+		namedHome, namedSession := s.sessions[named]
+		s.mu.Unlock()
+		switch {
+		case !found:
+			return fail("the token names no live run")
+		case s.cm != nil && !(namedSession && namedHome == home):
+			return fail("the token names no session of the caller's run %s", home)
+		}
+		parent = named
+	}
+	s.mu.Lock()
+	live := s.active[parent]
+	var parentEff *policy.Effective
+	if b := s.bound[parent]; b != nil {
+		parentEff = b.eff
+	}
+	s.mu.Unlock()
+	pm, ok := s.reg.Get(parent)
+	switch {
+	case !live || !ok:
+		return fail("run %s is not live", parent)
+	case pm.UID != int(ac.cred.Uid):
+		return fail("run %s belongs to another user", parent)
+	}
+	if d := len(s.chain(parent)); d > maxNest {
+		return fail("a session in run %s would be nested %d deep; runs nest at most %d deep", parent, d, maxNest)
+	}
+
+	var binding *policy.Binding
+	if set := s.policy.Load(); set != nil {
+		caller, err := ac.caller()
+		if err != nil {
+			return fail("%v", err)
+		}
+		binding, err = set.Resolve(caller, req.Profile)
+		if errors.Is(err, policy.ErrNoCeiling) {
+			binding, err = nil, nil
+		}
+		if err != nil {
+			return fail("%v", err)
+		}
+	} else if req.Profile != "" {
+		return fail("the node agent has no policy loaded, so it cannot grant profile %q", req.Profile)
+	}
+	var eff *policy.Effective
+	if binding != nil {
+		eff = binding.Effective
+	}
+	eff = policy.Nested(parentEff, eff)
+
+	runID, err := NewRunID()
+	if err != nil {
+		return fail("%v", err)
+	}
+	var t [16]byte
+	if _, err := rand.Read(t[:]); err != nil {
+		return fail("%v", err)
+	}
+	token := hex.EncodeToString(t[:])
+	s.mu.Lock()
+	if !s.active[parent] {
+		s.mu.Unlock()
+		return fail("run %s ended", parent)
+	}
+	s.nextCg++
+	id := s.nextCg
+	s.tokens[token] = runID
+	s.tokOf[runID] = token
+	s.sessions[runID] = home
+	s.active[runID] = true
+	s.creators[runID] = procIdentityOf(ac.cred.Pid)
+	s.runByCg[id] = runID
+	s.runCg[runID] = id
+	if eff != nil {
+		b := &boundRun{runID: runID, uid: int(ac.cred.Uid), cgroupID: id, eff: eff, started: time.Now()}
+		s.bound[runID] = b
+		s.byCg[id] = b
+	}
+	s.parentOf[runID] = parent
+	s.children[parent] = append(s.children[parent], runID)
+	s.mu.Unlock()
+	ac.runID, ac.cgID, ac.parent, ac.session_ = runID, id, parent, true
+	if s.OnRunStart != nil {
+		s.OnRunStart(runID, id)
+	}
+
+	rp := nestedPolicyRecord(parent, pm.Policy, binding, eff)
+	cmd := req.Command
+	if len(cmd) == 0 {
+		cmd = []string{"(session)"}
+	}
+	s.reg.PutNested(RunMeta{RunID: runID, Command: cmd, Cwd: req.Cwd, UID: int(ac.cred.Uid),
+		StartedAt: time.Now().UTC(), Policy: rp, Parent: parent, Session: true}, id)
+	s.emit(EventRunStart, runID, id)
+	granted := "unprofiled"
+	if binding != nil {
+		g := binding.Effective.Layers[0]
+		granted = g.Profile.Name + "@" + g.Profile.Profile.ShortVersion() + " (" + binding.Reason + ")"
+	}
+	log.Printf("run api: session %s created in run %s for uid %d pid %d: %s", runID, parent, ac.cred.Uid, ac.cred.Pid, granted)
+	resp := RunAPIResponse{OK: true, RunID: runID, Policy: rp, Proxy: s.ProxyURL,
+		TrustBundle: s.TrustBundle, NodeCACert: s.NodeCACert, Identity: "session", Parent: parent}
+	if u, err := url.Parse(s.ProxyURL); err == nil {
+		u.User = url.UserPassword(RunPrefix+runID, token)
+		resp.Proxy = u.String()
 	}
 	return resp
 }
@@ -1234,6 +1424,9 @@ func (s *RunAPIServer) applyLayer(runID string, layer policy.Layer, permit func(
 	}
 	if s.OnPolicy != nil {
 		for _, u := range updates {
+			if _, session := s.SessionHome(u.b.runID); session {
+				continue // no cgroup: the proxy alone decides a session's requests
+			}
 			if err := s.OnPolicy(u.b.cgroupID, u.b.uid, u.eff, s.isNested(u.b.runID)); err != nil {
 				log.Printf("run api: run %s: kernel policy after %s: %v", u.b.runID, layer.Source, err)
 			}
@@ -1365,7 +1558,10 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 	if s.MCP != nil {
 		s.MCP.EndRun(runID)
 	}
-	if s.cm != nil {
+	s.mu.Lock()
+	_, session := s.sessions[runID]
+	s.mu.Unlock()
+	if s.cm != nil && !session {
 		if err := s.cm.DestroyRunCgroup(runID); err != nil {
 			log.Printf("run api: run %s: %v", runID, err)
 		}
@@ -1398,6 +1594,7 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 	delete(s.callSeq, runID)
 	delete(s.liveCalls, runID)
 	delete(s.children, runID)
+	delete(s.sessions, runID)
 	nested := false
 	if p, ok := s.parentOf[runID]; ok {
 		nested = true
@@ -1412,7 +1609,7 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 	}
 	s.mu.Unlock()
 	s.saveGrants()
-	if nested && s.OnNestedEnd != nil {
+	if nested && !session && s.OnNestedEnd != nil {
 		s.OnNestedEnd(cgID)
 	}
 }
@@ -1490,6 +1687,19 @@ func (rc *RunAPIClient) call(req RunAPIRequest, fds ...int) (RunAPIResponse, err
 // Create asks for a new run, optionally requesting a profile.
 func (rc *RunAPIClient) Create(command []string, cwd, profile string) (RunAPIResponse, error) {
 	resp, err := rc.call(RunAPIRequest{Op: "create", Command: command, Cwd: cwd, Profile: profile})
+	if err == nil {
+		rc.runID = resp.RunID
+	}
+	return resp, err
+}
+
+// Session mints a session inside the caller's run (milestone 7.3),
+// optionally requesting a profile, which can only narrow the run's. token
+// is the run's or a session's credential: required with credential
+// identity; with cgroup identity, "" mints it in the caller's run. The
+// session lasts as long as this connection.
+func (rc *RunAPIClient) Session(token, profile string) (RunAPIResponse, error) {
+	resp, err := rc.call(RunAPIRequest{Op: "session", Token: token, Profile: profile})
 	if err == nil {
 		rc.runID = resp.RunID
 	}

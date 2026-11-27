@@ -19,10 +19,14 @@ concurrently, in threads.
     server.py per-session  each session creates a run of its own through
                            the run API, and sends through that run's proxy
                            URL: one run per session (credential identity)
+    server.py sessions     each session mints a session inside the
+                           process's run (op session, milestone 7.3), and
+                           sends through its proxy URL: nested in the run,
+                           with either identity
 
 Each session is NAME=PATH[=PROFILE]: its tool fetches
-https://origin.test/PATH; per-session, its run requests PROFILE (default:
-the second argument).
+https://origin.test/PATH; per-session and sessions, its run or session
+requests PROFILE (default: the second argument).
 """
 
 import json
@@ -31,6 +35,7 @@ import socket
 import ssl
 import sys
 import threading
+import urllib.parse
 
 import httpx
 from langchain_core.tools import tool
@@ -49,17 +54,32 @@ def trust(cafile):
     return ctx
 
 
-class SessionRun:
-    """A run of the session's own, held for its life on a run API
-    connection, as agentctl holds a run (credential identity)."""
+def proxy_token():
+    """The process's run credential, from the proxy URL agentctl set:
+    with credential identity, the proof a session is minted inside the
+    run. With cgroup identity there is none, and none is needed."""
+    for k in ("https_proxy", "HTTPS_PROXY"):
+        u = urllib.parse.urlsplit(os.environ.get(k, ""))
+        if u.username and u.username.startswith("run-"):
+            return urllib.parse.unquote(u.password or "")
+    return ""
 
-    def __init__(self, name, profile):
+
+class SessionRun:
+    """A run of the session's own (op create, credential identity), or a
+    session inside the process's run (op session), held for its life on a
+    run API connection, as agentctl holds a run."""
+
+    def __init__(self, name, profile, op="create"):
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         self.s.connect(SOCK)
-        r = self.call({"op": "create", "command": ["langgraph-session", name], "profile": profile})
+        req = {"op": op, "command": ["langgraph-session", name], "profile": profile}
+        if op == "session" and proxy_token():
+            req["token"] = proxy_token()
+        r = self.call(req)
         if not r.get("ok"):
-            raise RuntimeError("create: %s" % r.get("error"))
-        if r.get("identity") != "credential":
+            raise RuntimeError("%s: %s" % (op, r.get("error")))
+        if op == "create" and r.get("identity") != "credential":
             raise RuntimeError("the node knows runs by %s, not by credential" % r.get("identity"))
         self.run_id, self.proxy, self.bundle = r["run_id"], r["proxy"], r.get("trust_bundle")
 
@@ -74,8 +94,8 @@ class SessionRun:
 
 def session(name, path, mode, profile, out):
     run = None
-    if mode == "per-session":
-        run = SessionRun(name, profile)
+    if mode in ("per-session", "sessions"):
+        run = SessionRun(name, profile, "session" if mode == "sessions" else "create")
         client = httpx.Client(proxy=run.proxy, verify=trust(run.bundle), timeout=20)
     else:
         # The process's own settings: what agentctl gave the whole run.

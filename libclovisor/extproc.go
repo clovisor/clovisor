@@ -592,12 +592,34 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	default:
 		err = fmt.Errorf("no client address")
 	}
+	var badSession string
 	if err == nil && !s.api.CredentialIdentity() {
 		runID, runCg, eff, isRun = s.api.RunFor(cg)
 		if !isRun {
 			if p := findRunCgroupPath(s.agentsDir, cg); p != "" {
 				// A run from before this node agent started: unprofiled.
 				runID, runCg, isRun = strings.TrimPrefix(p[strings.LastIndex(p, "/")+1:], RunPrefix), cg, true
+			}
+		}
+		// A session inside the run (milestone 7.3): its credential, on the
+		// request or carried from the CONNECT, counts only from the run's
+		// own cgroup. Other proxy credentials are not Clovisor's, and are
+		// ignored as before; a run- credential that names no session of
+		// this run is refused, rather than decided as the run.
+		auth := headerValue(hm, "proxy-authorization")
+		if inner {
+			auth = headerValue(hm, hdrCred)
+		}
+		if user, token, ok := parseProxyBasic(auth); ok && isRun && strings.HasPrefix(user, RunPrefix) {
+			sid, scg, seff, found := s.api.RunForCredential(user, token)
+			home, isSession := s.api.SessionHome(sid)
+			switch {
+			case !found || !isSession:
+				badSession = "The proxy credential names no live session."
+			case home != runID:
+				badSession = "The proxy credential is a session of another run, and is accepted only from that run."
+			default:
+				runID, runCg, eff, cg = sid, scg, seff, scg
 			}
 		}
 	}
@@ -620,6 +642,10 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			}
 		}
 		return s.denyUnrecorded(d, fmt.Sprintf("client %v, cgroup %d", src, cg)), headerOutcome{}
+	case badSession != "":
+		d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, "bad session credential", badSession
+		s.record(cg, runCg, runID, d)
+		return s.deny(d, runID), headerOutcome{}
 	}
 
 	reason := s.guard(ctx, host, ip)

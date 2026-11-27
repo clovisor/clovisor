@@ -155,6 +155,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("ask", e.testAsk)
 	t.Run("sampling-ask", e.testSamplingAsk)
 	t.Run("tunnel-identity", e.testTunnelIdentityExplicit)
+	t.Run("sessions", func(t *testing.T) { e.testSessions(t, "it", "it-sub", "", false) })
 	t.Run("forged-identity", func(t *testing.T) { e.forgedIdentity(t, "it-agents", "") })
 	t.Run("agents", func(t *testing.T) { e.runAgents(t, agentSuite{audit: "it-agents", enforce: "it-agents-enforce"}) }) // before pin-drift restarts the origin
 	t.Run("langgraph", func(t *testing.T) { e.runLangGraph(t, "it-agents", "", true) })
