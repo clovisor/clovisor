@@ -5203,15 +5203,19 @@ Done so far:
   | 6.12, RHEL 9.7 | `on_lsm_unix_may_send`, `on_lsm_unix_stream_connect` | the return value outside [-4095, 0] | `lsm_refuse`: one of two constants, chosen by a branch in inline assembly. Compiled from C, "deny ? -EPERM : 0" became `-(deny & 1)`, which those verifiers cannot bound. A 64-bit version of the same arithmetic did not help: the bound, not the width, was the problem |
   | 5.15 | `on_getsockopt` (transparent mode) | `bpf_get_current_ancestor_cgroup_id` not allowed there | documented: transparent mode needs 6.1 |
 
-  Kernels 6.6 and 6.18 passed after the first two fixes. The rest is in
-  this commit. 5.10, below the floor, passes as designed: its failures are
+  Kernels 6.6 and 6.18 passed after the first two fixes. 5.15 and 6.1
+  passed after the change time and the transparent-mode floor. 6.12 and
+  RHEL 9.7 passed once `lsm_refuse` chose between constants: a 64-bit
+  version of the same arithmetic had not helped. Now every kernel
+  passes. 5.10, below the floor, passes as designed: its failures are
   reported. A program that takes the verifier too long would cancel the
   job, as `on_lsm_exec` did on 5.15 before its fix. The loader does not
   time programs out yet.
 
 Still to do:
-- the kernel matrix passing everywhere, with these fixes;
-- a full run with BPF LSM on x86;
+- a full run with BPF LSM on x86: the matrix loads programs, but does not
+  attach them or run the suites;
+- the loader timing out a program that takes the verifier too long;
 - a `LICENSE` file: the sources' headers name Apache 2.0, "which
   accompanies this distribution", and none does.
 
