@@ -850,7 +850,9 @@ in a container or a systemd unit of its own, so its connects can be gated
 (see below).
 
 The kernel needs BTF (`/sys/kernel/btf/vmlinux`) and the features below. By
-the releases that introduced them, the floor is **5.12**. Only 7.0 (aarch64)
+the releases that introduced them, the floor is **5.12**, and **6.1** for
+transparent mode: its `cgroup/getsockopt` program needs a helper that 5.15
+does not allow there. Only 7.0 (aarch64)
 has been tested; run `make integration-transparent` (§16) on a kernel before
 relying on it.
 
@@ -859,7 +861,7 @@ relying on it.
 | `cgroup/connect4,6`, `sockops` | redirect-or-deny, original destination | 4.17, 4.13 |
 | `cgroup/sendmsg4,6` | unconnected UDP, DNS | 4.18 |
 | `cgroup/recvmsg4,6`, socket storage, socket lookup from cgroup hooks | DNS replies, stashes, same-run loopback | 5.2 |
-| `cgroup/getsockopt` | `SO_ORIGINAL_DST` for Envoy | 5.3 |
+| `cgroup/getsockopt`, with `bpf_get_current_ancestor_cgroup_id` | `SO_ORIGINAL_DST` for Envoy (transparent mode) | 6.1 (refused on 5.15) |
 | `tp_btf` tracing | exec and run events | 5.5 |
 | `bpf_get_current_ancestor_cgroup_id`, BPF links and link update, `INET_DIAG_CGROUP_ID` | run identity, fail-closed pins, socket lookup | 5.7 |
 | `cgroup/getpeername4,6`, ring buffer | original peer, events | 5.8 |
@@ -870,8 +872,9 @@ relying on it.
 | uprobe-multi links with cookies | TLS plaintext (`-uprobes`) | 6.6 |
 
 CI loads every BPF program on 5.15, 6.1, 6.6, 6.12, 6.18 and RHEL 9.7's
-kernel, each in a VM (`kernels` workflow, `TestBPFLoad`), and on 5.10
-below the floor. That tests loading, not attaching or the suites.
+kernel (5.14 with backports), each in a VM (`kernels` workflow,
+`TestBPFLoad`), and on 5.10 below the floor. That tests loading, not
+attaching or the suites.
 
 **Enabling BPF LSM.** Transparent mode works without it, but socket
 families, foreign sockets, Unix sockets and exec are then not governed. The

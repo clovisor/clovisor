@@ -186,9 +186,15 @@ struct timespec64___c {
     long tv_nsec;
 };
 
-/* Before 6.11 the change time was one timespec64. */
+/* Before 6.11 the change time was one timespec64: __i_ctime from 6.6,
+ * i_ctime before (7.2: 6.1 refused the program for lacking both newer
+ * names). */
 struct inode___ctime {
     struct timespec64___c __i_ctime;
+} __attribute__((preserve_access_index));
+
+struct inode___ctime_old {
+    struct timespec64___c i_ctime;
 } __attribute__((preserve_access_index));
 
 struct dentry {
@@ -1792,6 +1798,17 @@ static __always_inline int lsm_prev(long ret)
     return ret < 0 && ret >= -4095 ? (int)ret : -EPERM_;
 }
 
+/* -EPERM where deny, else 0, as an LSM program must return it. Computed
+ * in 64 bits and kept there: with -mcpu=v3's 32-bit arithmetic, "deny ?
+ * -EPERM_ : 0" could reach exit as 0xffffffff, which 6.12 and RHEL 9.7
+ * refuse as outside [-4095, 0] (7.2). */
+static __always_inline int lsm_refuse(int deny)
+{
+    long r = deny ? -EPERM_ : 0;
+    barrier_var(r);
+    return r;
+}
+
 /* The id of cg's ancestor at level (cg itself at its own level), or 0. */
 static __always_inline __u64 cgroup_ancestor_id(struct cgroup *cg, __u32 level)
 {
@@ -1859,7 +1876,7 @@ int on_lsm_socket_create(__u64 *ctx)
         return 0;
     int enforce = cfg->mode == MODE_ENFORCE;
     emit_socket(cfg, run, family, type, protocol, SOCK_OP_CREATE, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, 0);
-    return enforce ? -EPERM_ : 0;
+    return lsm_refuse(enforce);
 }
 
 /* A network socket used by a task in a run must have been created in that
@@ -1884,7 +1901,7 @@ static __always_inline int foreign_socket(struct socket *sock, __u32 op)
     int enforce = cfg->mode == MODE_ENFORCE;
     __u64 sk_cg = cg ? BPF_CORE_READ(cg, kn, id) : 0;
     emit_socket(cfg, run, family, 0, 0, op, enforce ? V_SOCK_DENY : V_AUDIT_SOCK, sk_cg);
-    return enforce ? -EPERM_ : 0;
+    return lsm_refuse(enforce);
 }
 
 /* ---- Exec (milestone 4.4) ---- */
@@ -2196,10 +2213,14 @@ static __always_inline int exec_validators(struct inode *in, struct exec_ino *k,
     if (bpf_core_field_exists(in->i_ctime_sec)) {
         s->ctime_sec = BPF_CORE_READ(in, i_ctime_sec);
         s->ctime_nsec = BPF_CORE_READ(in, i_ctime_nsec) & 0x7fffffff;
-    } else {
+    } else if (bpf_core_field_exists(((struct inode___ctime *)in)->__i_ctime)) {
         struct inode___ctime *o = (void *)in;
         s->ctime_sec = BPF_CORE_READ(o, __i_ctime.tv_sec);
         s->ctime_nsec = BPF_CORE_READ(o, __i_ctime.tv_nsec) & 0x7fffffff;
+    } else {
+        struct inode___ctime_old *o = (void *)in;
+        s->ctime_sec = BPF_CORE_READ(o, i_ctime.tv_sec);
+        s->ctime_nsec = BPF_CORE_READ(o, i_ctime.tv_nsec) & 0x7fffffff;
     }
     int local = magic == EXT4_MAGIC_ || magic == XFS_MAGIC_ || magic == BTRFS_MAGIC_ || magic == TMPFS_MAGIC_;
     return local && (flags & SB_I_VERSION_) && BPF_CORE_READ(in, i_writecount.counter) <= 0;
@@ -2309,7 +2330,7 @@ static __always_inline int exec_check(struct linux_binprm *bprm, int ret, const 
     struct exec_task *t = bpf_task_storage_get(&exec_scratch, bpf_get_current_task_btf(), 0,
                                                BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!t)
-        return pol && cfg->mode == MODE_ENFORCE ? -EPERM_ : 0; /* out of memory: fail closed */
+        return lsm_refuse(pol && cfg->mode == MODE_ENFORCE); /* out of memory: fail closed */
     struct exec_path *p = &t->p;
     __builtin_memset(p, 0, sizeof(*p));
     t->flags = 0;
@@ -2352,7 +2373,7 @@ static __always_inline int exec_check(struct linux_binprm *bprm, int ret, const 
     __u32 verdict = refuse ? V_EXEC_DENY : (deny ? V_AUDIT_EXEC : V_EXEC_OK);
 
     exec_report(t, run, verdict);
-    return refuse ? -EPERM_ : 0;
+    return lsm_refuse(refuse);
 }
 
 /* Exec policy with hashes (milestone 5.7): sleepable for
@@ -2458,7 +2479,7 @@ static __always_inline int unix_decide(struct sock *peer, __u32 dgram)
             }
         }
     }
-    return enforce ? -EPERM_ : 0;
+    return lsm_refuse(enforce);
 }
 
 /* security_unix_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk) */

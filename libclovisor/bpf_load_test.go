@@ -94,6 +94,10 @@ func minKernel(section string) int {
 		return 6<<16 | 6<<8 // TLS plaintext (-uprobes)
 	case strings.HasPrefix(section, "lsm.s/"):
 		return 5<<16 | 19<<8 // exec hashes: bpf_ima_file_hash (5.18), the TAI clock (5.19)
+	case section == "cgroup/getsockopt":
+		// Transparent mode: the cgroup ancestor helper in a getsockopt
+		// program is refused on 5.15 and allowed on 6.1 (7.2's matrix).
+		return 6<<16 | 1<<8
 	}
 	return 5<<16 | 12<<8 // the floor
 }
