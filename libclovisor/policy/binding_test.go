@@ -282,3 +282,81 @@ func TestNested(t *testing.T) {
 		t.Error("Nested mutated the parent")
 	}
 }
+
+// Actor identity (milestone 7.3): ceilings select Actors by atespace, or
+// by ActorTemplate in an atespace, the more specific first; and the two
+// kinds of selector belong to their own identity modes.
+func TestActorCeilings(t *testing.T) {
+	docs := []string{research, light,
+		ceilingDoc("researchers", "{ atespace: team, actorTemplate: researcher }", "[research, light]", "research", ""),
+		ceilingDoc("team", "{ atespace: team }", "[light]", "light", ""),
+	}
+	var ps []*AgentProfile
+	var cs []*ProfileCeiling
+	for _, d := range docs {
+		p, c, err := ParseDocument([]byte(d))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p != nil {
+			ps = append(ps, p)
+		} else {
+			cs = append(cs, c)
+		}
+	}
+	s, diags := NewSet(Options{Actors: true}, ps, cs, nil, nil)
+	if len(diags) > 0 {
+		t.Fatal(diags)
+	}
+	for _, c := range []struct {
+		caller  Caller
+		ceiling string
+		granted string
+	}{
+		{Caller{Atespace: "team", ActorTemplate: "researcher"}, "researchers", "research"},
+		{Caller{Atespace: "team", ActorTemplate: "writer"}, "team", "light"},
+	} {
+		b, err := s.Resolve(c.caller, "")
+		if err != nil || b.Ceiling != c.ceiling || b.Granted().Name != c.granted {
+			t.Errorf("%+v: %+v %v", c.caller, b, err)
+		}
+	}
+	if _, err := s.Resolve(Caller{Atespace: "other", ActorTemplate: "researcher"}, ""); err != ErrNoCeiling {
+		t.Errorf("Actor of another atespace: %v", err)
+	}
+	if _, err := s.Resolve(Caller{Atespace: "other", ActorTemplate: "x"}, "light"); err == nil || !strings.Contains(err.Error(), "atespace other") {
+		t.Errorf("request with no ceiling: %v", err)
+	}
+
+	_, diags = NewSet(Options{Actors: true}, ps, []*ProfileCeiling{
+		parseCeiling(t, ceilingDoc("host", "{ uid: 5 }", "[light]", "", "")),
+		parseCeiling(t, ceilingDoc("loose", "{ actorTemplate: researcher }", "[light]", "", "")),
+		parseCeiling(t, ceilingDoc("again", "{ atespace: team }", "[light]", "", "")),
+		parseCeiling(t, ceilingDoc("again2", "{ atespace: team }", "[light]", "", "")),
+	}, nil, nil)
+	_, hostDiags := newSet(t, light, ceilingDoc("actors", "{ atespace: team }", "[light]", "", ""))
+	var all []string
+	for _, d := range append(diags, hostDiags...) {
+		all = append(all, d.Error())
+	}
+	text := strings.Join(all, "\n")
+	for _, want := range []string{
+		"ceiling host: spec.appliesTo: Actors have no uid or group",
+		"ceiling loose: spec.appliesTo.actorTemplate: names a template in an atespace",
+		"ceiling again2: spec.appliesTo: selects the same callers as ceiling again",
+		"ceiling actors: spec.appliesTo: atespace and actorTemplate select Agent Substrate Actors, which need Actor identity",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+}
+
+func parseCeiling(t *testing.T, doc string) *ProfileCeiling {
+	t.Helper()
+	_, c, err := ParseDocument([]byte(doc))
+	if err != nil || c == nil {
+		t.Fatalf("%v\n%s", err, doc)
+	}
+	return c
+}

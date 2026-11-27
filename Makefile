@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent format doc
+.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi format doc
 
 # Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
 # clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
@@ -116,6 +116,17 @@ check: cross
 # DOCKER="sudo docker" where the docker CLI needs it.
 integration:
 	CLOVISOR_IT_ENVOY_IMAGE=$(ENVOY_IMAGE) $(GO) test -tags integration -count=1 -v ./integration/
+
+# Actor identity end to end (milestone 7.3), alone: Actors with mTLS
+# certificates, a fake Substrate API. make integration runs it too.
+integration-actors:
+	CLOVISOR_IT_ENVOY_IMAGE=$(ENVOY_IMAGE) $(GO) test -tags integration -count=1 -v -run TestActors ./integration/
+
+# Regenerate Clovisor's copy of Substrate's Control API (milestone 7.3)
+# from libclovisor/substrateapi/ateapi.proto. Needs buf, protoc-gen-go
+# v1.36.4 and protoc-gen-go-grpc v1.5.1 on PATH.
+substrateapi:
+	cd libclovisor/substrateapi && buf generate
 
 # Transparent enforce mode end to end (milestone 3.7): a privileged
 # container sharing the host's cgroup and PID namespaces, BPF, cgroup v2.

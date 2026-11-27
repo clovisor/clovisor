@@ -44,6 +44,8 @@ type RunTimeline struct {
 	Children []string `json:"children,omitempty"`
 	// Session marks a session inside its parent run (milestone 7.3).
 	Session bool `json:"session,omitempty"`
+	// Actor is the Agent Substrate Actor that is this run (milestone 7.3).
+	Actor *ActorInfo `json:"actor,omitempty"`
 	// EndReason, EgressBytes and Limits are from the run's limits
 	// (milestone 5.2): why the node agent ended it, what it sent, and the
 	// limits it reached.
@@ -1260,7 +1262,7 @@ func (r *RunRecorder) mergeMeta(tl *RunTimeline) {
 	if m.Policy != nil {
 		tl.Policy = m.Policy
 	}
-	tl.Parent, tl.Session = m.Parent, m.Session
+	tl.Parent, tl.Session, tl.Actor = m.Parent, m.Session, m.Actor
 	if len(m.Children) > 0 {
 		tl.Children = m.Children
 	}

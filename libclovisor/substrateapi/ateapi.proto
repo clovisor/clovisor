@@ -1,0 +1,53 @@
+// The part of Agent Substrate's Control API that Clovisor calls (milestone
+// 7.3): GetActor, and the fields of an Actor Clovisor reads. Copied from
+// api/ateapi/v1/ateapi.proto at github.com/agent-substrate/substrate
+// 7319f1af (Apache License 2.0), keeping the package, service, message
+// names and field numbers, so that it is wire-compatible; fields Clovisor
+// does not read are left out, and are skipped as unknown fields.
+// Regenerate with `make substrateapi`.
+
+syntax = "proto3";
+
+package substrate.ateapi.v1;
+
+option go_package = "github.com/clovisor/clovisor/libclovisor/substrateapi";
+
+service Control {
+  rpc GetActor(GetActorRequest) returns (Actor);
+}
+
+message ObjectRef {
+  string atespace = 1;
+  string name = 2;
+}
+
+message GetActorRequest {
+  ObjectRef actor = 1;
+}
+
+message ResourceMetadata {
+  string atespace = 1;
+  string name = 2;
+  string uid = 3;
+}
+
+message Actor {
+  ResourceMetadata metadata = 1;
+  ObjectRef actor_template = 2;
+  ActorStatus status = 5;
+}
+
+message ActorStatus {
+  ActorState state = 1;
+}
+
+enum ActorState {
+  ACTOR_STATE_UNSPECIFIED = 0;
+  ACTOR_STATE_RESUMING = 1;
+  ACTOR_STATE_RUNNING = 2;
+  ACTOR_STATE_SUSPENDING = 3;
+  ACTOR_STATE_SUSPENDED = 4;
+  ACTOR_STATE_CRASHED = 5;
+  ACTOR_STATE_DELETING = 6;
+  ACTOR_STATE_REVERTING = 7;
+}

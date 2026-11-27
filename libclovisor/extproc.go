@@ -87,6 +87,11 @@ type ExtProcServer struct {
 	// NonRunAllowed lets clients outside any run use the proxy. Off by
 	// default: the proxy exists for runs.
 	NonRunAllowed bool
+	// With Actor identity (milestone 7.3): Actors verifies the client
+	// certificate Envoy forwarded, and Directory says whether the Actor
+	// it names exists and is placed.
+	Actors    *ActorVerifier
+	Directory ActorDirectory
 
 	events  chan<- AuditEvent
 	dropped atomic.Uint64
@@ -576,6 +581,27 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		dst, err2 = attrAddrPort(req, "destination.address", "destination.port")
 	}
 	switch {
+	case s.api.ActorIdentity():
+		// The Actor's certificate chain, as Envoy forwarded it from the
+		// mTLS handshake, or, inside a terminated tunnel, carried from the
+		// CONNECT (trusted only on that hop).
+		xfcc := headerValue(hm, "x-forwarded-client-cert")
+		if inner {
+			xfcc = headerValue(hm, hdrXFCC)
+		}
+		var code typev3.StatusCode
+		var why string
+		runID, runCg, eff, code, why = s.actorRun(ctx, xfcc, inner)
+		if why != "" {
+			d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, "actor: "+why, "Egress refused: "+why+"."
+			if runID != "" {
+				s.record(runCg, runCg, runID, d)
+			} else {
+				log.Printf("ext_proc: refused %s %s:%d%s, recorded in no run: %s", d.Method, d.Host, d.Port, d.Path, d.Reason)
+			}
+			return s.denyStatus(d, runID, code), headerOutcome{}
+		}
+		isRun, cg = true, runCg
 	case s.api.CredentialIdentity():
 		// The run's secret, from the proxy URL agentctl gave it: on the
 		// request itself, or, inside a terminated tunnel, as Envoy carried
@@ -593,7 +619,7 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		err = fmt.Errorf("no client address")
 	}
 	var badSession string
-	if err == nil && !s.api.CredentialIdentity() {
+	if err == nil && !s.api.CredentialIdentity() && !s.api.ActorIdentity() {
 		runID, runCg, eff, isRun = s.api.RunFor(cg)
 		if !isRun {
 			if p := findRunCgroupPath(s.agentsDir, cg); p != "" {
@@ -789,6 +815,42 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	return &extprocv3.ProcessingResponse{Response: &extprocv3.ProcessingResponse_RequestHeaders{
 		RequestHeaders: &extprocv3.HeadersResponse{},
 	}}, out
+}
+
+// actorRun identifies the Actor behind a request (milestone 7.3): its
+// certificate, then Substrate's view of it. why is "" for a placed Actor,
+// whose run is returned; otherwise it says why the request is refused,
+// with code, and names the Actor's run if it has one (a suspended Actor's
+// requests are recorded in its timeline).
+func (s *ExtProcServer) actorRun(ctx context.Context, xfcc string, inner bool) (runID string, runCg uint64, eff *policy.Effective, code typev3.StatusCode, why string) {
+	if s.Actors == nil || s.Directory == nil {
+		return "", 0, nil, typev3.StatusCode_ServiceUnavailable, "the proxy has no Actor CA or directory"
+	}
+	ref, err := s.Actors.Verify(xfcc)
+	if err != nil {
+		return "", 0, nil, typev3.StatusCode_Forbidden, err.Error()
+	}
+	var maxAge time.Duration
+	if inner {
+		maxAge = InnerActorMaxAge
+	}
+	a, err := s.Directory.Actor(ctx, ref, maxAge)
+	switch {
+	case errors.Is(err, ErrActorNotFound):
+		return "", 0, nil, typev3.StatusCode_Forbidden, "Actor " + ref.String() + " does not exist"
+	case err != nil:
+		// Substrate failed, not the Actor: refuse, and say so.
+		log.Printf("ext_proc: Actor %s: %v", ref, err)
+		return "", 0, nil, typev3.StatusCode_ServiceUnavailable, "the Actor directory is unavailable"
+	case !a.Placed():
+		id, cg, _ := s.api.ActorRun(a.UID)
+		return id, cg, nil, typev3.StatusCode_Forbidden, fmt.Sprintf("Actor %s is %s, not placed on a Worker", ref, a.State)
+	}
+	runID, runCg, eff, err = s.api.RunForActor(a)
+	if err != nil {
+		return "", 0, nil, typev3.StatusCode_Forbidden, err.Error()
+	}
+	return runID, runCg, eff, 0, ""
 }
 
 // parseProxyBasic decodes a Basic Proxy-Authorization value.

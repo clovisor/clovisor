@@ -124,6 +124,62 @@ A node agent run as an ordinary user says so at start. The user can stop it
 or edit its files, so its policy is advisory: useful for observing and
 shaping agent behaviour, not for containing a hostile one.
 
+### Agent Substrate (Actor identity)
+
+With Actor identity (milestone 7.3), runs are Agent Substrate Actors.
+Actors connect to the proxy over mTLS with the certificates Substrate
+gives them, and the node agent checks each one against Substrate's
+Control API:
+
+```sh
+bin/node-agent -identity actor \
+  -policy-dir /etc/clovisor/policy \
+  -proxy-listen 0.0.0.0:18443 \
+  -actor-ca /etc/clovisor/actor-ca.pem \
+  -actor-proxy-cert /etc/clovisor/proxy.crt -actor-proxy-key /etc/clovisor/proxy.key \
+  -substrate-api ate-apiserver.ate-system:443 -substrate-ca /etc/clovisor/ate-ca.pem \
+  -substrate-cert /etc/clovisor/ate-client.crt -substrate-key /etc/clovisor/ate-client.key
+```
+
+- **Who an Actor is.** Envoy requires a client certificate from
+  `-actor-ca`, and forwards its chain to ext_proc, replacing any
+  `x-forwarded-client-cert` the client sent. ext_proc verifies the chain
+  again, as Substrate's own gateway does. The certificate must be
+  signed by the Actor CA, not be a CA itself, be valid now, allow client
+  authentication, and have exactly one URI:
+  `spiffe://<trust domain>/worker-for-actor/<atespace>/<actor>`
+  (`-actor-trust-domain`, default `substrate-actor.local`).
+- **Whether it may send.** On every CONNECT and plain request, ext_proc
+  asks Substrate for the Actor (`GetActor`). An Actor Substrate does not
+  have is refused (`403`). So is one that is not on a Worker: only
+  `RUNNING` and `RESUMING` may send. If Substrate's API fails, the request
+  is refused with `503`. Requests inside a terminated tunnel reuse an
+  answer up to 2 seconds old, since their CONNECT just asked.
+- **The run is the Actor's UID.** An Actor's first request starts its
+  run. Its timeline spans suspend, resume and moves between Workers, and
+  records the refusals while it was suspended. The run ends when
+  Substrate no longer has the Actor, or has it under a new UID (deleted
+  and created again), checked every `-actor-check` (30s). Its timeline
+  says why (`end_reason`), and holds the Actor's atespace, name, UID and
+  ActorTemplate.
+- **Which profile.** An Actor asks for none: its ceiling's `default`
+  applies. Ceilings select Actors by `appliesTo: { atespace: team }`, or
+  `{ atespace: team, actorTemplate: researcher }`, the more specific
+  first, or `any: true` (§5). uid and group selectors do not apply to
+  Actors. An Actor no ceiling covers is unprofiled: recorded, not
+  enforced.
+- **What it is not.** There is no kernel part: no cgroup, exec, DNS or
+  connect audit. Runs come only from Actors, so `agentctl run`, `call`
+  and `session` are refused. The MCP gateway and transparent mode are
+  not available. Actor runs do not survive a node agent restart: an
+  Actor's next request starts a new run.
+- **Where it sits.** In Agent Substrate, the egress gateway is
+  Substrate's. 7.3 runs Clovisor's own mTLS listener, tested with a fake
+  of Substrate's API. Placing Clovisor beside Substrate's gateway is
+  milestone 7.4. `libclovisor/substrateapi` holds the part of Substrate's
+  API Clovisor calls, copied from its `ateapi.proto` at 7319f1af
+  (`make substrateapi` regenerates it).
+
 ### Directories
 
 | | As root | As a user (Linux) | As a user (macOS) |
@@ -239,14 +295,16 @@ anything.
 kind: ProfileCeiling
 metadata: { name: developers }
 spec:
-  appliesTo: { group: developers }   # or uid:, user:, gid:, any: true
+  appliesTo: { group: developers }   # or uid:, user:, gid:, any: true; Actors: atespace:, actorTemplate:
   allow: [research, ci]               # profiles these callers may request
   default: research                   # granted when none is requested
   clamp: baseline                     # optional: always layered on top
 ```
 
-Ceilings are matched by uid, then group, then `any`. A caller no ceiling
-matches gets unprofiled runs: audited, not enforced.
+Ceilings are matched by uid, then group, then `any`. With Actor identity
+(§4) they are matched by ActorTemplate within an atespace, then atespace,
+then `any`. A caller no ceiling matches gets unprofiled runs: audited,
+not enforced.
 
 ```yaml
 # /etc/clovisor/policy/research.yaml
@@ -1477,7 +1535,20 @@ agentctl events --json <run-id>
 make check                               # unit tests and the macOS cross-build
 DOCKER="sudo docker" make integration    # end to end in Docker
 DOCKER="sudo docker" make integration-transparent  # transparent mode; Linux, privileged
+DOCKER="sudo docker" make integration-actors       # Actor identity alone (make integration runs it too)
 ```
+
+The Actor suite (milestone 7.3) plays Actors with curl and certificates
+from a test Actor CA, against a fake of Substrate's Control API. It checks:
+- an Actor of the `researcher` template gets its ceiling's narrower
+  profile, and one of another template its atespace's;
+- no certificate, or one from another CA, gets no TLS handshake;
+- a valid certificate for an Actor Substrate lacks is refused;
+- a client's own `x-forwarded-client-cert` is replaced (r1 claiming w1's
+  chain is decided as r1; with the header passed through, the check
+  fails);
+- a suspended Actor is refused and, resumed, is the same run; a deleted
+  Actor's run ends with the reason, and its timeline names the Actor.
 
 The integration tests are self-contained once their images are built.
 Credential identity needs no privileges. They start three containers:

@@ -38,6 +38,18 @@ type EnvoyConfig struct {
 	// 127.0.0.1 and ::1 (milestone 3.2), where the connect hooks send
 	// every TCP connect from a run.
 	TransparentPort uint16
+	// ActorTLS, if set, makes the proxy listener mTLS for Agent Substrate
+	// Actors (milestone 7.3): a client certificate from the Actor CA is
+	// required, and its chain is forwarded to ext_proc, which verifies it
+	// again.
+	ActorTLS *ActorListenerTLS
+}
+
+// ActorListenerTLS is the proxy listener's TLS with Actor identity, as
+// Envoy sees the file system.
+type ActorListenerTLS struct {
+	CertPath, KeyPath string // the proxy's own certificate
+	ClientCA          string // the Actor CA
 }
 
 // TerminatedHost is one terminated pattern and its leaf certificate.
@@ -72,11 +84,12 @@ const (
 	hdrCred    = "x-clovisor-cred"     // the outer request's Proxy-Authorization (credential identity)
 	hdrOrigDst = "x-clovisor-orig-dst" // the address a transparent connection was made to
 	hdrSNI     = "x-clovisor-sni"      // its TLS server name, if any
+	hdrXFCC    = "x-clovisor-xfcc"     // the CONNECT's client certificate chain (Actor identity)
 )
 
 // ownHeaders are the headers only Envoy may set; clients' copies are
 // removed, and none reach an origin.
-var ownHeaders = []string{hdrClient, hdrConnect, hdrCred, hdrOrigDst, hdrSNI, "x-clovisor-run"}
+var ownHeaders = []string{hdrClient, hdrConnect, hdrCred, hdrOrigDst, hdrSNI, hdrXFCC, "x-clovisor-run"}
 
 type obj = map[string]interface{}
 type arr = []interface{}
@@ -159,7 +172,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	// must not share a tunnel either.
 	poolKey := func(client string) obj {
 		return obj{"object_key": "clovisor.pool", "factory_key": "envoy.hashable_string", "shared_with_upstream": "ONCE",
-			"format_string": obj{"text_format_source": obj{"inline_string": client + "|%REQ(PROXY-AUTHORIZATION)%"}}}
+			"format_string": obj{"text_format_source": obj{"inline_string": client + "|%REQ(PROXY-AUTHORIZATION)%|%REQ(X-FORWARDED-CLIENT-CERT)%"}}}
 	}
 	setState := func(client string) obj {
 		return obj{"name": "envoy.filters.http.set_filter_state", "typed_config": typed(
@@ -171,6 +184,8 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 				// With credential identity the run's secret is on the CONNECT
 				// only; the requests inside a terminated tunnel need it too.
 				fsEntry("clovisor.cred", "%REQ(PROXY-AUTHORIZATION)%"),
+				// Likewise an Actor's certificate chain (Actor identity).
+				fsEntry("clovisor.xfcc", "%REQ(X-FORWARDED-CLIENT-CERT)%"),
 			}})}
 	}
 	var terminateRoutes arr
@@ -190,7 +205,7 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 	// annotations; ext_proc trusts only attributes. The router applies
 	// this after ext_proc, which has read the run's credential by then: it
 	// must not reach the origin.
-	routerStrip := append(append(arr{}, strSlice(ownHeaders)...), "proxy-authorization")
+	routerStrip := append(append(arr{}, strSlice(ownHeaders)...), "proxy-authorization", "x-forwarded-client-cert")
 	// connectHCM is the CONNECT and plain-HTTP pipeline: on the explicit
 	// listener, and on the internal listener transparent TLS and TCP are
 	// tunnelled into.
@@ -219,13 +234,28 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		})
 	}
 	hcm := connectHCM("proxy", arr{stripOwn, setState("%DOWNSTREAM_REMOTE_ADDRESS%,%DOWNSTREAM_LOCAL_ADDRESS%"), extproc, dfpFilter, router})
+	proxyChain := obj{"filters": arr{obj{"name": "envoy.filters.network.http_connection_manager", "typed_config": hcm}}}
+	if t := c.ActorTLS; t != nil {
+		// Envoy is the only writer of x-forwarded-client-cert: whatever a
+		// client sent is replaced with this connection's chain.
+		hcm["forward_client_cert_details"] = "SANITIZE_SET"
+		hcm["set_current_client_cert_details"] = obj{"uri": true, "cert": true, "chain": true}
+		proxyChain["transport_socket"] = obj{"name": "envoy.transport_sockets.tls", "typed_config": typed(
+			"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext", obj{
+				"require_client_certificate": true,
+				"common_tls_context": obj{
+					"alpn_protocols":     arr{"http/1.1"},
+					"tls_certificates":   arr{obj{"certificate_chain": obj{"filename": t.CertPath}, "private_key": obj{"filename": t.KeyPath}}},
+					"validation_context": obj{"trusted_ca": obj{"filename": t.ClientCA}},
+				},
+			})}
+	}
 
 	listeners := arr{obj{
 		"name": "proxy",
 		"address": obj{"socket_address": obj{
 			"address": c.ProxyListen.Addr().String(), "port_value": c.ProxyListen.Port()}},
-		"filter_chains": arr{obj{"filters": arr{obj{
-			"name": "envoy.filters.network.http_connection_manager", "typed_config": hcm}}}},
+		"filter_chains": arr{proxyChain},
 	}}
 	clusters := arr{}
 	internal := len(c.Terminate) > 0
@@ -360,7 +390,8 @@ func EnvoyBootstrap(c EnvoyConfig) ([]byte, error) {
 		setHeaders := headerMutation(append(remove(hdrOrigDst, hdrSNI, "x-clovisor-run"),
 			overwrite(hdrClient, "%FILTER_STATE(clovisor.client:PLAIN)%"),
 			overwrite(hdrConnect, "%FILTER_STATE(clovisor.connect:PLAIN)%"),
-			overwrite(hdrCred, "%FILTER_STATE(clovisor.cred:PLAIN)%")))
+			overwrite(hdrCred, "%FILTER_STATE(clovisor.cred:PLAIN)%"),
+			overwrite(hdrXFCC, "%FILTER_STATE(clovisor.xfcc:PLAIN)%")))
 		for i, th := range c.Terminate {
 			name := fmt.Sprintf("mitm-%d", i)
 			inner := typed("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager", obj{

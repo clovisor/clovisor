@@ -172,7 +172,7 @@ func (e *env) build() {
 	t := e.t
 	bin := filepath.Join(e.dir, "bin")
 	root, _ := filepath.Abs("..")
-	for _, pkg := range []string{"./cmd/node-agent", "./cmd/agentctl", "./integration/origin"} {
+	for _, pkg := range []string{"./cmd/node-agent", "./cmd/agentctl", "./integration/origin", "./integration/fakesubstrate"} {
 		cmd := exec.Command("go", "build", "-o", filepath.Join(bin, filepath.Base(pkg)), pkg)
 		cmd.Dir = root
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)

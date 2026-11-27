@@ -22,7 +22,8 @@ import (
 )
 
 var (
-	identity = flag.String("identity", "", "How runs are known: cgroup (Linux, kernel audit) or credential (anywhere, a per-run proxy secret; a claim). Default: cgroup on Linux, credential elsewhere")
+	identity = flag.String("identity", "", "How runs are known: cgroup (Linux, kernel audit), credential (anywhere, a per-run proxy secret; a claim) "+
+		"or actor (Agent Substrate Actors, by their mTLS certificates, checked against Substrate). Default: cgroup on Linux, credential elsewhere")
 	rtDir    = flag.String("runtime-dir", "", "Directory for sockets and generated files (default /run/clovisor as root, a per-user directory otherwise)")
 	stDir    = flag.String("state-dir", "", "Directory for timelines, the node CA and tool pins (default /var/lib/clovisor as root, a per-user directory otherwise)")
 	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object (cgroup identity)")
@@ -50,6 +51,19 @@ var (
 	uprobeLibs = flag.String("uprobe-libs", "", "Comma-separated TLS libraries to probe with -uprobes (default: libssl and libgnutls in the usual library directories)")
 	quic       = flag.Bool("quic", false, "Relay QUIC (UDP 443) from runs by the server name in its Initial, decided as TLS by name is (transparent enforce only); otherwise QUIC is refused and clients use TCP")
 	quicP      = flag.Uint("quic-port", clovisor.DefaultQUICPort, "QUIC relay port, on 127.0.0.1 and ::1 (with -quic)")
+
+	// Actor identity (milestone 7.3).
+	actorCA     = flag.String("actor-ca", "", "Actor identity: the CA that issues Actors' certificates (PEM)")
+	actorCert   = flag.String("actor-proxy-cert", "", "Actor identity: the proxy listener's certificate, which Actors verify (PEM)")
+	actorKey    = flag.String("actor-proxy-key", "", "Actor identity: the proxy listener's key (PEM)")
+	actorDomain = flag.String("actor-trust-domain", clovisor.DefaultActorTrustDomain, "Actor identity: the SPIFFE trust domain of Actor certificates")
+	actorCheck  = flag.Duration("actor-check", clovisor.DefaultActorCheck, "Actor identity: how often live Actors are checked against Substrate, ending the runs of deleted ones")
+	subAddr     = flag.String("substrate-api", "", "Actor identity: Substrate's Control API, host:port")
+	subCA       = flag.String("substrate-ca", "", "Actor identity: the CA that verifies Substrate's API server (PEM)")
+	subName     = flag.String("substrate-server-name", "", "Actor identity: the API server's name in its certificate, if not the address's host")
+	subCert     = flag.String("substrate-cert", "", "Actor identity: the node agent's client certificate for Substrate's API (PEM), if it asks for one")
+	subKey      = flag.String("substrate-key", "", "Actor identity: the key for -substrate-cert")
+	subPlain    = flag.Bool("substrate-insecure", false, "Actor identity: reach Substrate's API in plaintext (tests only)")
 )
 
 // defaultEnvoyUIDs is the uid of the official Envoy image's user when the
@@ -149,7 +163,14 @@ func main() {
 		Transparent: clovisor.TransparentOptions{Mode: *transp, Port: uint16(*tPort), DNSPort: uint16(*tDNS), Stale: *tStale,
 			UDPExceptions: addrList("-udp-allow", *udpOK), QUICPort: quicPort(*quic, *quicP),
 			TLSCapture: *uprobes, TLSLibraries: splitList(*uprobeLibs)},
-		DNSUpstreams: splitList(*dnsUp),
+		DNSUpstreams:     splitList(*dnsUp),
+		ActorCA:          *actorCA,
+		ActorProxyCert:   *actorCert,
+		ActorProxyKey:    *actorKey,
+		ActorTrustDomain: *actorDomain,
+		ActorCheck:       *actorCheck,
+		Substrate: clovisor.SubstrateOptions{Addr: *subAddr, CAFile: *subCA, ServerName: *subName,
+			CertFile: *subCert, KeyFile: *subKey, Insecure: *subPlain},
 	})
 	// A policy that does not load is fatal at start: running without it
 	// would silently leave runs unprofiled.

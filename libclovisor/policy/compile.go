@@ -71,6 +71,9 @@ type Options struct {
 	// bpf_ima_file_hash, Linux 5.18, and the TAI clock, 5.19), so
 	// exec.allow hashes are verified where exec is enforceable.
 	ExecHash bool
+	// Actors: runs are Agent Substrate Actors (milestone 7.3, -identity
+	// actor), so ceilings select them by atespace and ActorTemplate.
+	Actors bool
 }
 
 // Diagnostic is one compile error.

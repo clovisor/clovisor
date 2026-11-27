@@ -66,9 +66,20 @@ type NodeAgentOptions struct {
 	// Identity is how the proxy and the MCP gateway know a run: "cgroup"
 	// (Linux; kernel audit and enforcement-grade identity) or
 	// "credential" (anywhere; a per-run secret in the proxy URL, which is
-	// a claim, design §4.3). Empty means cgroup on Linux, credential
-	// elsewhere.
+	// a claim, design §4.3) or "actor" (Agent Substrate Actors, known by
+	// their mTLS certificates and checked against Substrate, milestone
+	// 7.3). Empty means cgroup on Linux, credential elsewhere.
 	Identity string
+	// Actor identity: the Actor CA, the proxy listener's own certificate
+	// (Actors connect to it over TLS), the SPIFFE trust domain
+	// (DefaultActorTrustDomain if empty), Substrate's API, and how often
+	// live Actors are checked (DefaultActorCheck if 0).
+	ActorCA          string
+	ActorProxyCert   string
+	ActorProxyKey    string
+	ActorTrustDomain string
+	Substrate        SubstrateOptions
+	ActorCheck       time.Duration
 	// Dirs holds sockets, generated files and state; DefaultDirs() if
 	// empty. Paths below left empty are derived from it.
 	Dirs Dirs
@@ -165,10 +176,22 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			return nil, fmt.Errorf("cgroup identity needs Linux; use credential identity")
 		}
 	case "credential":
+	case "actor":
+		switch {
+		case !opts.ProxyListen.IsValid():
+			return nil, fmt.Errorf("Actor identity needs the proxy (-proxy-listen): Actors are known only there")
+		case opts.ActorCA == "" || opts.ActorProxyCert == "" || opts.ActorProxyKey == "":
+			return nil, fmt.Errorf("Actor identity needs the Actor CA and the proxy's certificate and key (-actor-ca, -actor-proxy-cert, -actor-proxy-key)")
+		case opts.MCPListen.IsValid():
+			return nil, fmt.Errorf("the MCP gateway does not know Actors yet: leave -mcp-listen unset with Actor identity")
+		}
 	default:
-		return nil, fmt.Errorf("identity must be cgroup or credential, not %q", opts.Identity)
+		return nil, fmt.Errorf("identity must be cgroup, credential or actor, not %q", opts.Identity)
 	}
-	credential := opts.Identity == "credential"
+	actor := opts.Identity == "actor"
+	// Actor identity has no kernel part either: what follows treats it as
+	// credential identity does, except where it says otherwise.
+	credential := opts.Identity == "credential" || actor
 	d := opts.Dirs
 	if opts.OutDir == "" {
 		opts.OutDir = d.Runs()
@@ -210,7 +233,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if t.TLSCapture && credential {
 		return nil, fmt.Errorf("-uprobes needs cgroup identity: probes are attached to a run's processes")
 	}
-	set, err := loadNodePolicy(opts.PolicyDir, !credential, t.DeploymentMode(), lsm, quic, t.ExecHash, t.TLSCapture)
+	set, err := loadNodePolicy(opts.PolicyDir, !credential, actor, t.DeploymentMode(), lsm, quic, t.ExecHash, t.TLSCapture)
 	if err != nil {
 		return nil, err
 	}
@@ -320,6 +343,20 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if set != nil {
 		api.SetPolicy(set)
 	}
+	var actors *ActorVerifier
+	var directory ActorDirectory
+	if actor {
+		if actors, err = NewActorVerifier(opts.ActorCA, opts.ActorTrustDomain); err == nil {
+			directory, err = DialSubstrate(opts.Substrate)
+		}
+		if err != nil {
+			api.Close()
+			closeAudit()
+			return nil, fmt.Errorf("Actor identity: %w", err)
+		}
+		api.EnableActors(directory, opts.ActorCheck)
+		fmt.Printf("actors: certificates from %s (trust domain %s); Substrate's API at %s\n", opts.ActorCA, actors.TrustDomain, opts.Substrate.Addr)
+	}
 
 	var xp *ExtProcServer
 	var proxyCA *NodeCA
@@ -374,6 +411,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		}
 		api.Pins = xp.Pins
 		xp.NonRunAllowed = opts.NonRunProxy
+		xp.Actors, xp.Directory = actors, directory
 		xp.MaxBody = opts.MaxInspectBody
 		if err := xp.Listen(opts.ExtProcSocket, opts.EnvoyUIDs); err != nil {
 			api.Close()
@@ -381,6 +419,9 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			return nil, err
 		}
 		api.ProxyURL = "http://" + opts.ProxyListen.String()
+		if actor {
+			api.ProxyURL = "https://" + opts.ProxyListen.String()
+		}
 		recorder.ProxyAddrs = map[string]bool{opts.ProxyListen.String(): true}
 		fmt.Printf("proxy: ext_proc on %s; Envoy bootstrap %s (proxy %s)\n", opts.ExtProcSocket, opts.EnvoyConfig, opts.ProxyListen)
 		if t.Mode != TransparentOff {
@@ -559,7 +600,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 // force stays, so a bad edit never leaves the node without policy; runs
 // already bound keep their versions either way.
 func (na *NodeAgent) ReloadPolicy() error {
-	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.deployment, na.lsm, na.quic, na.execHash, na.uprobes)
+	set, err := loadNodePolicy(na.policyDir, na.cmgr != nil, na.identity == "actor", na.deployment, na.lsm, na.quic, na.execHash, na.uprobes)
 	if err != nil {
 		return err
 	}
@@ -664,6 +705,22 @@ func writeEnvoyConfig(opts NodeAgentOptions, ca *NodeCA, set *policy.Set) ([]str
 	}
 	ec := EnvoyConfig{ProxyListen: opts.ProxyListen, ExtProcSocket: opts.ExtProcSocket,
 		AdminSocket: opts.EnvoyAdmin, Terminate: hosts, UpstreamCA: opts.EnvoyUpstreamCA}
+	if opts.Identity == "actor" {
+		// Copied where Envoy reads its other certificates, in the
+		// directory it shares with the node agent.
+		at := &ActorListenerTLS{CertPath: filepath.Join(tlsDir, "proxy.crt"), KeyPath: filepath.Join(tlsDir, "proxy.key"),
+			ClientCA: filepath.Join(tlsDir, "actor-ca.pem")}
+		for src, dst := range map[string]string{opts.ActorProxyCert: at.CertPath, opts.ActorProxyKey: at.KeyPath, opts.ActorCA: at.ClientCA} {
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return nil, err
+			}
+			if err := writeFileAtomicOwned(dst, data, 0o600, envoyUID); err != nil {
+				return nil, err
+			}
+		}
+		ec.ActorTLS = at
+	}
 	if opts.Transparent.Mode != "" && opts.Transparent.Mode != TransparentOff {
 		ec.TransparentPort = opts.Transparent.Port
 	}
@@ -689,13 +746,13 @@ func lsmFor(t TransparentOptions, credential bool) bool {
 	return !credential && t.Mode != TransparentOff && BPFLSMActive()
 }
 
-func loadNodePolicy(dir string, kernelIdentity bool, mode policy.DeploymentMode, lsm, quic, execHash, uprobes bool) (*policy.Set, error) {
+func loadNodePolicy(dir string, kernelIdentity, actors bool, mode policy.DeploymentMode, lsm, quic, execHash, uprobes bool) (*policy.Set, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		fmt.Printf("policy: %s does not exist; runs are unprofiled\n", dir)
 		return nil, nil
 	}
 	set, err := LoadPolicyDir(dir, policy.Options{Mode: mode, Linux: kernelIdentity, KernelLSM: lsm, QUIC: quic, ExecHash: execHash,
-		Uprobes: uprobes}, os.Geteuid() == 0)
+		Uprobes: uprobes, Actors: actors}, os.Geteuid() == 0)
 	if err != nil {
 		return nil, err
 	}

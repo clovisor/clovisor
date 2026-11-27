@@ -725,7 +725,10 @@ func listRuns(dir string) error {
 }
 
 func printTimeline(tl *clovisor.RunTimeline) {
-	if tl.Session {
+	if a := tl.Actor; a != nil {
+		fmt.Printf("Run       %s (Agent Substrate Actor %s/%s, uid %s, template %s: its proxied requests; no kernel audit)\n",
+			tl.RunID, a.Atespace, a.Name, a.UID, a.Template)
+	} else if tl.Session {
 		fmt.Printf("Run       %s (a session in run %s: its proxied requests only; the kernel audit is the run's)\n", tl.RunID, tl.Parent)
 	} else if strings.HasPrefix(tl.CgroupPath, clovisor.CredentialRunsDir+"/") {
 		fmt.Printf("Run       %s (credential identity: no cgroup, no kernel audit)\n", tl.RunID)

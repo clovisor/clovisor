@@ -1,0 +1,12 @@
+# What a researcher Actor gets: less than the rest of its atespace.
+kind: AgentProfile
+metadata: { name: ac-narrow }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-allowed
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed"] }
+        action: allow

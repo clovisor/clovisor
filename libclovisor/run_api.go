@@ -312,6 +312,8 @@ type RunAPIServer struct {
 	// process, each mapped to the run whose cgroup its requests must come
 	// from ("" with credential identity, where there is none).
 	sessions map[string]string
+	// actors holds Actor identity's runs (milestone 7.3).
+	actors actorState
 	// Tool calls (milestone 4.5), per run: the last call number given, and
 	// how many are open.
 	callSeq   map[string]int
@@ -670,7 +672,7 @@ func (s *RunAPIServer) Close() {
 
 // CredentialIdentity reports whether runs are known by proxy credential
 // rather than by cgroup.
-func (s *RunAPIServer) CredentialIdentity() bool { return s.cm == nil }
+func (s *RunAPIServer) CredentialIdentity() bool { return s.cm == nil && !s.ActorIdentity() }
 
 // RunForCredential returns the live run a proxy credential (user
 // run-<id>, password the run's token) names.
@@ -815,6 +817,12 @@ func fail(format string, a ...interface{}) RunAPIResponse {
 
 func (ac *apiConn) dispatch(req RunAPIRequest, fds []int) RunAPIResponse {
 	defer closeFDs(fds)
+	switch req.Op {
+	case "create", "session", "attach", "call":
+		if why := ac.s.actorRefuse(req.Op); why != "" {
+			return fail("%s", why)
+		}
+	}
 	switch req.Op {
 	case "create":
 		return ac.create(req)
@@ -1595,6 +1603,10 @@ func (s *RunAPIServer) endRun(runID string, exitCode *int) {
 	delete(s.liveCalls, runID)
 	delete(s.children, runID)
 	delete(s.sessions, runID)
+	if a, ok := s.actors.info[runID]; ok {
+		delete(s.actors.info, runID)
+		delete(s.actors.byUID, a.UID)
+	}
 	nested := false
 	if p, ok := s.parentOf[runID]; ok {
 		nested = true

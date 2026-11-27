@@ -1,0 +1,17 @@
+# What an Actor of the team atespace gets (milestone 7.3).
+kind: AgentProfile
+metadata: { name: ac }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: origin-read
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { methods: [GET], paths: ["/allowed", "/headers"] }
+        action: allow
+      - name: no-secret
+        to: { fqdn: ["origin.test"], ports: [443] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "The secret endpoint is off limits for Actors."

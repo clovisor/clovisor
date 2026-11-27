@@ -5219,12 +5219,13 @@ Still to do:
 - a `LICENSE` file: the sources' headers name Apache 2.0, "which
   accompanies this distribution", and none does.
 
-#### 7.3 status (2026-11-27, in progress)
+#### 7.3 status (2026-11-27)
 
-Sessions inside a run come first: they can be built and tested here.
-Actor identity needs Agent Substrate on kind.
+Sessions inside a run came first: they can be built and tested here.
+Actor identity is tested through Clovisor's own mTLS listener, against a
+fake of Substrate's API. Behind Substrate's gateway, on kind, is 7.4.
 
-Done so far:
+Done:
 
 - **Sessions inside a run.** Run API op `session` mints a session: a
   nested run with a proxy credential and no process or cgroup.
@@ -5276,12 +5277,76 @@ Verified:
   `make integration-transparent` (32); the LangGraph checks in both
   suites with `CLOVISOR_IT_PYDEPS`.
 
+- **Actor identity** (`-identity actor`): runs are Agent Substrate
+  Actors.
+  - The proxy listener requires a client certificate from the Actor CA.
+    Envoy replaces any `x-forwarded-client-cert` a client sends with the
+    connection's chain (`SANITIZE_SET`). It carries the chain into
+    terminated tunnels as filter state, as it does credentials.
+  - ext_proc verifies the chain again, as Substrate's gateway does
+    (`verifyActorCertificate`): the Actor CA, not a CA, valid now, client
+    authentication, exactly one URI,
+    `spiffe://<trust domain>/worker-for-actor/<atespace>/<actor>`. Then
+    it asks Substrate's Control API (`GetActor`) on every CONNECT and
+    plain request, and accepts only `RUNNING` and `RESUMING`, as
+    Substrate does. Inside a tunnel an answer up to 2s old is reused. An
+    unknown Actor gets `403`, Substrate failing `503`.
+  - The run is the Actor's UID: started by its first request, kept across
+    suspend, resume and Worker moves, ended when Substrate no longer has
+    it, has it under a new UID, or is deleting it (checked every
+    `-actor-check`). The timeline holds the Actor and the reason it
+    ended, and a suspended Actor's refusals.
+  - Ceilings select Actors by `atespace`, or `actorTemplate` within one,
+    more specific first. They are compiled only with Actor identity, and
+    uid and group selectors are refused there. An Actor asks for no
+    profile: its ceiling's default applies.
+  - No kernel part. Run API ops that make runs are refused. The MCP
+    gateway and transparent mode are not available.
+- **Substrate's API, Clovisor's copy.** `libclovisor/substrateapi` holds
+  `GetActor` and the Actor fields Clovisor reads, copied from Substrate's
+  `ateapi.proto` at 7319f1af with the same package, names and field
+  numbers, generated with protoc-gen-go v1.36.4 and protoc-gen-go-grpc
+  v1.5.1 (`make substrateapi`). Requiring Substrate's module would have
+  raised Clovisor to Go 1.27 and grpc 1.85.
+- **Found on the way:** with a 2s cache on every lookup, a suspended
+  Actor's CONNECT went through on the earlier answer. CONNECTs and plain
+  requests now always ask. And `x-forwarded-client-cert` is decoded with
+  `PathUnescape`: `QueryUnescape` turns base64's `+` into spaces (Substrate
+  notes the same).
+
+Verified (Actor identity):
+
+- `TestActorVerify`: each refusal (none, another CA, a CA, server-only,
+  expired, two URIs, none, another trust domain, not an Actor's ID, a bad
+  name, two XFCC elements). A literal `+` in the chain decodes. Without
+  the CA check, the test fails.
+- `TestSubstrateDirectory`, over gRPC: UID, template, state; `NotFound`;
+  caching by age; failures not cached.
+- `TestActorIdentity`: the template's and the atespace's ceilings; the
+  inner hop trusts Envoy's header, not the client's; refusals with no
+  certificate, for an unknown Actor, with Substrate down. A suspended
+  Actor is refused, in its run's timeline. Resumed, the same run.
+  Recreated, a new run, and the old one ends. Deleted, it ends at the next
+  check. `create` is refused. Without the placement check, the test fails.
+- `TestActorCeilings`: selection order, and each selector refused in the
+  other mode.
+- `TestActors`, end to end (Envoy 1.39.5, mTLS, curl as Actors, the fake
+  API): profiles by template; no certificate and another CA's refused at
+  the handshake; an unknown Actor `403`; r1 with w1's chain in a forged
+  header decided as r1 (with the header passed through, `FORWARD_ONLY`,
+  r1 became w1 and the test failed); suspended refused, resumed the same
+  run; deleted, the runs end, with their reasons and Actors.
+- `make check`, `make cross`, `make integration` (21 passed, the Actor
+  suite included) and `make integration-transparent` (32).
+
 Still to do:
-- Actor identity (Substrate): read the Actor from Substrate's
-  certificate, check it against its API, and bind profiles by
-  ActorTemplate and atespace;
+- 7.4: Clovisor beside Substrate's gateway: the second `ext_proc` hook
+  (an upstream proposal and a local patch), on kind, against Substrate's
+  real API. That checks the copied API on the wire too;
+- Actor runs across a node agent restart: an Actor's next request now
+  starts a new run;
 - the MCP gateway still knows a session as its run: with cgroup identity
-  it identifies by cgroup alone.
+  it identifies by cgroup alone, and it does not know Actors.
 
 ---
 

@@ -58,6 +58,10 @@ type AppliesTo struct {
 	// node agent.
 	Namespace      string `yaml:"namespace,omitempty" json:"namespace,omitempty"`
 	ServiceAccount string `yaml:"serviceAccount,omitempty" json:"serviceAccount,omitempty"`
+	// Agent Substrate Actors (milestone 7.3, Actor identity only): every
+	// Actor in an atespace, or those of one ActorTemplate in it.
+	Atespace      string `yaml:"atespace,omitempty" json:"atespace,omitempty"`
+	ActorTemplate string `yaml:"actorTemplate,omitempty" json:"actorTemplate,omitempty"`
 }
 
 // ParseDocument decodes one policy file, which holds either an
@@ -94,19 +98,28 @@ func ParseDocument(data []byte) (*AgentProfile, *ProfileCeiling, error) {
 type Caller struct {
 	UID  int
 	GIDs []int // primary and supplementary
+	// An Actor's atespace and ActorTemplate (Actor identity): it has no
+	// uid or gids.
+	Atespace, ActorTemplate string
 }
 
 type ceiling struct {
 	name  string
-	level int // 3 uid, 2 gid, 1 any
+	level int // 5 ActorTemplate, 4 atespace, 3 uid, 2 gid, 1 any
 	uid   int
 	gid   int
-	spec  CeilingSpec
-	net   NetGrant
+	// atespace and template select Actors (levels 5 and 4).
+	atespace, template string
+	spec               CeilingSpec
+	net                NetGrant
 }
 
 func (c *ceiling) matches(caller Caller) bool {
 	switch c.level {
+	case 5:
+		return caller.Atespace == c.atespace && caller.ActorTemplate == c.template
+	case 4:
+		return caller.Atespace == c.atespace
 	case 3:
 		return caller.UID == c.uid
 	case 2:
@@ -166,6 +179,22 @@ func NewSet(opts Options, profiles []*AgentProfile, ceilings []*ProfileCeiling,
 		if a.Namespace != "" || a.ServiceAccount != "" {
 			errf("spec.appliesTo", "namespace and serviceAccount need Kubernetes identity, which a host node agent does not have")
 		}
+		host := a.User != "" || a.UID != nil || a.Group != "" || a.GID != nil
+		switch {
+		case opts.Actors && host:
+			errf("spec.appliesTo", "Actors have no uid or group: select them by atespace, actorTemplate or any")
+		case !opts.Actors && (a.Atespace != "" || a.ActorTemplate != ""):
+			errf("spec.appliesTo", "atespace and actorTemplate select Agent Substrate Actors, which need Actor identity (-identity actor)")
+		case a.ActorTemplate != "" && a.Atespace == "":
+			errf("spec.appliesTo.actorTemplate", "names a template in an atespace: set atespace too")
+		}
+		if a.Atespace != "" {
+			n++
+			rc.level, rc.atespace = 4, a.Atespace
+			if a.ActorTemplate != "" {
+				rc.level, rc.template = 5, a.ActorTemplate
+			}
+		}
 		if a.User != "" {
 			n++
 			uid, err := lookupUser(a.User)
@@ -195,9 +224,13 @@ func NewSet(opts Options, profiles []*AgentProfile, ceilings []*ProfileCeiling,
 			rc.level = 1
 		}
 		if n != 1 {
-			errf("spec.appliesTo", "needs exactly one of user, uid, group, gid or any")
+			if opts.Actors {
+				errf("spec.appliesTo", "needs exactly one of atespace (with or without actorTemplate) or any")
+			} else {
+				errf("spec.appliesTo", "needs exactly one of user, uid, group, gid or any")
+			}
 		}
-		key := fmt.Sprintf("%d/%d/%d", rc.level, rc.uid, rc.gid)
+		key := fmt.Sprintf("%d/%d/%d/%s/%s", rc.level, rc.uid, rc.gid, rc.atespace, rc.template)
 		if prev, ok := sameSelector[key]; ok && n == 1 {
 			errf("spec.appliesTo", "selects the same callers as ceiling %s", prev)
 		}
@@ -302,6 +335,9 @@ func (s *Set) Resolve(c Caller, requested string) (*Binding, error) {
 	rc, err := s.ceilingFor(c)
 	if err != nil {
 		if errors.Is(err, ErrNoCeiling) && requested != "" {
+			if c.Atespace != "" {
+				return nil, fmt.Errorf("no ceiling grants profiles to Actors of template %s in atespace %s", c.ActorTemplate, c.Atespace)
+			}
 			return nil, fmt.Errorf("no ceiling grants profiles to uid %d", c.UID)
 		}
 		return nil, err

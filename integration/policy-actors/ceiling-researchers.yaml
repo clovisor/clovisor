@@ -1,0 +1,5 @@
+kind: ProfileCeiling
+metadata: { name: researchers }
+spec:
+  appliesTo: { atespace: team, actorTemplate: researcher }
+  default: ac-narrow
