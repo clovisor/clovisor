@@ -1,0 +1,31 @@
+# Clovisor node agent (milestone 7.2). Root: it loads BPF, creates the
+# runs' cgroups and attaches their hooks. Flags in /etc/default/clovisor.
+[Unit]
+Description=Clovisor node agent (agent egress policy)
+Documentation=https://github.com/clovisor/clovisor/blob/master/docs/operator-guide.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/clovisor
+ExecStart=/usr/bin/node-agent -bpf /usr/lib/clovisor/agent_audit.o $CLOVISOR_NODE_AGENT_ARGS
+# SIGHUP reloads policy; a policy that does not load keeps the one in force.
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGINT, as an operator would: the node agent continues held processes
+# and saves what it must (operator guide §4).
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+# Runs' grants survive a restart (milestone 6.1); timelines live here.
+StateDirectory=clovisor
+StateDirectoryMode=0755
+RuntimeDirectory=clovisor
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

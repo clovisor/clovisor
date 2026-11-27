@@ -1,0 +1,29 @@
+# Envoy for Clovisor (milestone 7.2), from the bootstrap the node agent
+# writes, as the clovisor-envoy user (named in -envoy-uids). Needs Envoy
+# 1.39 or later at /usr/bin/envoy; see operator guide §5 for Docker.
+[Unit]
+Description=Envoy for the Clovisor node agent
+Documentation=https://github.com/clovisor/clovisor/blob/master/docs/operator-guide.md
+After=clovisor-node-agent.service
+BindsTo=clovisor-node-agent.service
+
+[Service]
+Type=simple
+User=clovisor-envoy
+Group=clovisor-envoy
+# The node agent writes the bootstrap once it is up.
+ExecStartPre=/bin/sh -c 'for i in $$(seq 100); do [ -f /run/clovisor/envoy.json ] && exit 0; sleep 0.1; done; echo "no /run/clovisor/envoy.json from the node agent" >&2; exit 1'
+ExecStart=/usr/bin/envoy -c /run/clovisor/envoy.json --log-level warn
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Envoy writes only in /run/clovisor/envoy, which the node agent creates
+# for this user; the rest of /run/clovisor is root's.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=clovisor-node-agent.service

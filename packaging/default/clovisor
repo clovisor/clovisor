@@ -1,0 +1,10 @@
+# Flags for the Clovisor node agent (clovisor-node-agent.service), besides
+# -bpf. See operator guide §4. After a change: systemctl restart
+# clovisor-node-agent (flags) or systemctl reload clovisor-node-agent
+# (policy in /etc/clovisor/policy).
+#
+# The explicit proxy, with Envoy (clovisor-envoy.service) as the
+# clovisor-envoy user. For transparent enforce mode add:
+#   -transparent enforce
+# and see operator guide §11 (BPF LSM, kernel features).
+CLOVISOR_NODE_AGENT_ARGS="-proxy-listen 127.0.0.1:18000 -envoy-uids clovisor-envoy"

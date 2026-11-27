@@ -1,0 +1,63 @@
+# Clovisor's Debian and RPM packages (milestone 7.2), built by
+# `make package` with nfpm, for the architecture building them (the BPF
+# object is compiled per architecture). Envoy 1.39 or later is not
+# packaged here: install it at /usr/bin/envoy, or run its image (operator
+# guide §5).
+name: clovisor
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+prerelease: ${PKG_PRERELEASE}
+section: net
+priority: optional
+maintainer: Clovisor <clovisorproject@gmail.com>
+description: |
+  Agent egress policy: a node agent that runs coding agents in cgroups it
+  governs, decides their egress per request through Envoy, and records
+  each run's timeline.
+vendor: Clovisor
+homepage: https://github.com/clovisor/clovisor
+license: Apache-2.0
+
+contents:
+  - src: dist/bin/node-agent
+    dst: /usr/bin/node-agent
+    file_info: { mode: 0755 }
+  - src: dist/bin/agentctl
+    dst: /usr/bin/agentctl
+    file_info: { mode: 0755 }
+  - src: dist/bin/audit-sink
+    dst: /usr/bin/audit-sink
+    file_info: { mode: 0755 }
+  - src: libclovisor/ebpf/agent_audit.o
+    dst: /usr/lib/clovisor/agent_audit.o
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/clovisor-node-agent.service
+    dst: /usr/lib/systemd/system/clovisor-node-agent.service
+    file_info: { mode: 0644 }
+  - src: packaging/systemd/clovisor-envoy.service
+    dst: /usr/lib/systemd/system/clovisor-envoy.service
+    file_info: { mode: 0644 }
+  - src: packaging/default/clovisor
+    dst: /etc/default/clovisor
+    type: config|noreplace
+    file_info: { mode: 0644 }
+  # Root-owned, as the node agent requires of its policy directory.
+  - dst: /etc/clovisor/policy
+    type: dir
+    file_info: { mode: 0755, owner: root, group: root }
+  - src: packaging/policy/observe.yaml
+    dst: /etc/clovisor/policy/observe.yaml
+    type: config|noreplace
+    file_info: { mode: 0644, owner: root, group: root }
+  - src: packaging/policy/ceilings.yaml
+    dst: /etc/clovisor/policy/ceilings.yaml
+    type: config|noreplace
+    file_info: { mode: 0644, owner: root, group: root }
+  - src: docs/operator-guide.md
+    dst: /usr/share/doc/clovisor/operator-guide.md
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh

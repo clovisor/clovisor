@@ -71,6 +71,34 @@ go build -o bin/node-agent ./cmd/node-agent
 gateway build for Linux and macOS (amd64 and arm64). `make check` keeps it
 that way.
 
+### Packages
+
+```sh
+make package          # dist/clovisor_<version>_<arch>.deb and .rpm, for this machine
+make package-test     # install each in a clean Debian and Fedora container, and check
+```
+
+The packages are built for the architecture building them, because the BPF
+object is compiled for it. They install:
+
+| Path | What |
+|---|---|
+| `/usr/bin/node-agent`, `agentctl`, `audit-sink` | The binaries |
+| `/usr/lib/clovisor/agent_audit.o` | The BPF object |
+| `/usr/lib/systemd/system/clovisor-node-agent.service` | The node agent, as root. Its flags are in `/etc/default/clovisor`. `systemctl reload` sends `SIGHUP`, which reloads policy. |
+| `/usr/lib/systemd/system/clovisor-envoy.service` | Envoy from the node agent's bootstrap, as the `clovisor-envoy` user, which the package creates and the default flags name in `-envoy-uids`. Envoy 1.39 or later must be at `/usr/bin/envoy`; it is not packaged. |
+| `/etc/default/clovisor` | The node agent's flags: the explicit proxy on `127.0.0.1:18000` by default. A configuration file, kept on upgrade. |
+| `/etc/clovisor/policy/` | Root-owned. `observe` (audit, allowing everything) for everyone, so the first runs are recorded and nothing is refused. Learn drafts a real profile from them (§8). Kept on upgrade. |
+
+Nothing starts on install. When Envoy is in place:
+
+```sh
+sudo systemctl enable --now clovisor-node-agent clovisor-envoy
+```
+
+Removing the package stops and disables both. The run state in
+`/var/lib/clovisor` stays.
+
 ## 4. Run the node agent
 
 ### Linux server or CI host (cgroup identity)
@@ -114,7 +142,7 @@ node agent's socket first, then the system's; `CLOVISOR_SOCKET` and
 |---|---|
 | `-proxy-listen addr` | Enable the proxy. Without it runs are audited only (cgroup identity) and nothing is enforced. |
 | `-mcp-listen addr` | Enable the local MCP gateway. Must be loopback. |
-| `-envoy-uids 101` | Uids admitted to the `ext_proc` socket besides root and the node agent's own. Whoever can talk to `ext_proc` can write into any run's timeline. |
+| `-envoy-uids 101` | Uids, or user names, admitted to the `ext_proc` socket besides root and the node agent's own. Whoever can talk to `ext_proc` can write into any run's timeline. |
 | `-envoy-upstream-ca file` | The trust store Envoy verifies origins with, behind termination, as Envoy sees it (a path inside its container). |
 | `-proxy-non-run` | Let processes outside any run use the proxy (decided as unprofiled). Off by default. |
 | `-inspect-max-body 8388608` | The largest request body, in bytes, the proxy checks for content rules or remote MCP. Larger ones are refused with 413 (§10). |

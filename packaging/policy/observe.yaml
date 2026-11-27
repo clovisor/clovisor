@@ -1,0 +1,8 @@
+# A starting profile (milestone 7.2): audit, allowing everything, so that
+# runs are recorded and nothing is refused. Learn drafts a real profile
+# from what they did: agentctl learn --all (operator guide §8).
+kind: AgentProfile
+metadata: { name: observe }
+spec:
+  mode: audit
+  egress: { default: allow }

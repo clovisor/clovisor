@@ -5172,10 +5172,39 @@ Done so far:
     on 7.0, all 33 load.
   - `agents`: the 7.1 checks, weekly and by hand.
 
+- **Packaging.** `make package` builds a `.deb` and an `.rpm` with nfpm
+  (v2.49.0), for the building machine's architecture, since the BPF
+  object is compiled for it. They contain:
+  - the three binaries and the BPF object;
+  - `clovisor-node-agent.service`: root, flags in `/etc/default/clovisor`,
+    `reload` as `SIGHUP`, `SIGINT` to stop;
+  - `clovisor-envoy.service`: native Envoy (1.39 or later, not packaged)
+    as the `clovisor-envoy` user the package creates, bound to the node
+    agent, writing only in `/run/clovisor/envoy`;
+  - a root-owned policy directory, offering everyone `observe` (audit,
+    allowing everything), so the first runs are recorded and learned
+    from.
+
+  Nothing starts on install. `-envoy-uids` now takes user names as well as
+  uids, so the defaults name `clovisor-envoy`. `make package-test`
+  installs each package in a clean Debian bookworm or Fedora 43
+  container. It checks every file, the user and the policy directory's
+  ownership, that the node agent runs and the installed policy compiles,
+  and that removal removes. Both pass. Both units pass `systemd-analyze
+  verify`.
+- **The kernel matrix ran.** With dated little-vm-helper images, the VMs
+  boot (the action names an image's file by its version less a date, so
+  `-main` tags did not). 5.10 passes: below the floor, its failures are
+  reported, not failed. On 6.6, 6.12, 6.18 and RHEL 9.7, `on_ingress` and
+  `on_lsm_exec` fail to load; on 7.0 they load. The loader now prints the
+  verifier's reason.
+
 Still to do:
-- packaging: a systemd unit, an Envoy setup, a distribution package;
-- the kernel matrix's first results;
-- a full run with BPF LSM on x86.
+- why `on_ingress` and `on_lsm_exec` fail to load before 7.0, and the fix
+  or a raised floor;
+- a full run with BPF LSM on x86;
+- a `LICENSE` file: the sources' headers name Apache 2.0, "which
+  accompanies this distribution", and none does.
 
 ---
 

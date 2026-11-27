@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent format doc
+.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent format doc
 
 # Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
 # clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
@@ -47,7 +47,7 @@ node-agent:
 # Clean build artifacts
 clean:
 	rm -f $(BPF_OBJ)
-	rm -rf bin/
+	rm -rf bin/ dist/
 
 # Install (copy binaries to /usr/local/bin)
 install: build
@@ -73,6 +73,29 @@ envoy:
 run-agent:
 	bin/agentctl run -- $(CMD)
 
+
+# Debian and RPM packages for this machine's architecture (milestone 7.2),
+# in dist/: the BPF object is compiled for it. See packaging/.
+PKG_VERSION ?= 0.7.0
+PKG_PRERELEASE ?= dev.$(shell git rev-parse --short HEAD)
+PKG_ARCH ?= $(shell $(GO) env GOARCH)
+NFPM ?= $(GO) run github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.49.0
+
+# Go's temporary build files go in dist/tmp, not /tmp.
+package: bpf
+	mkdir -p dist/bin dist/tmp
+	for c in node-agent agentctl audit-sink; do GOTMPDIR=$(CURDIR)/dist/tmp CGO_ENABLED=0 GOOS=linux GOARCH=$(PKG_ARCH) \
+		$(GO) build -trimpath -o dist/bin/$$c ./cmd/$$c || exit 1; done
+	for p in deb rpm; do GOTMPDIR=$(CURDIR)/dist/tmp PKG_ARCH=$(PKG_ARCH) PKG_VERSION=$(PKG_VERSION) PKG_PRERELEASE=$(PKG_PRERELEASE) \
+		$(NFPM) package -f packaging/nfpm.yaml -p $$p -t dist/ || exit 1; done
+	ls -l dist/*.deb dist/*.rpm
+
+# Install the packages in clean Debian and Fedora containers and check what
+# they put where (DOCKER="sudo docker" if needed).
+DOCKER ?= docker
+package-test: package
+	$(DOCKER) run --rm -v $(CURDIR):/src:ro debian:bookworm-slim sh /src/packaging/test-install.sh deb
+	$(DOCKER) run --rm -v $(CURDIR):/src:ro fedora:43 sh /src/packaging/test-install.sh rpm
 
 # Generate documentation
 doc:

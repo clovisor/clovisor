@@ -1,0 +1,8 @@
+# Who may request which profile (operator guide §6). As installed: everyone
+# may run under observe, which records and refuses nothing.
+kind: ProfileCeiling
+metadata: { name: everyone }
+spec:
+  appliesTo: { any: true }
+  allow: [observe]
+  default: observe
