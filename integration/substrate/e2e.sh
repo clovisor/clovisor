@@ -37,6 +37,13 @@ TARGET=whoami.${TARGET_NS}.svc.cluster.local
 PEER=spiffe://cluster.local/ns/${NS}/sa/clovisor
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/clovisor-e2e.XXXXXX")
 PORT=18199
+# The sandbox audit (milestone 7.5), on Substrate's sandbox demo.
+SBX_NS=ate-demo-sandbox
+SBX_POOL=sandbox-workerpool
+SBX_TEMPLATE=sandbox-template
+SBX_ACTOR=${SBX_ACTOR:-clovisor-sbx}
+SBX_PORT=18299
+ORIG_ANN=clovisor.dev/original-worker-image
 
 for t in kubectl kubectl-ate curl python3; do
   command -v "$t" >/dev/null || { echo "e2e: needs $t" >&2; exit 1; }
@@ -58,9 +65,23 @@ cleanup() {
   stop_proxy
   ${K} -n "${NS}" delete pod clovisor-probe --ignore-not-found --wait=false >/dev/null 2>&1 || true
   ${KATE} delete actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
+  ${KATE} delete actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
+
+# restore_pool puts the sandbox pool back on Substrate's own worker image.
+# It must precede removing the sink: a sandbox of Clovisor's image does not
+# start without it.
+restore_pool() {
+  local orig
+  orig=$(${K} -n "${SBX_NS}" get workerpool "${SBX_POOL}" -o jsonpath="{.metadata.annotations.${ORIG_ANN//./\\.}}" 2>/dev/null || true)
+  [[ -n "${orig}" ]] || return 0
+  ${K} -n "${SBX_NS}" patch workerpool "${SBX_POOL}" --type=json -p \
+    "[{\"op\":\"replace\",\"path\":\"/spec/workerImage\",\"value\":\"${orig}\"},{\"op\":\"remove\",\"path\":\"/metadata/annotations/${ORIG_ANN/\//~1}\"}]" >/dev/null
+  ${K} -n "${SBX_NS}" rollout status "deployment/${SBX_POOL}" --timeout=300s >/dev/null
+  info "the ${SBX_NS}/${SBX_POOL} WorkerPool is back on ${orig}"
+}
 
 # grant add|remove: Clovisor as a viewer in Substrate's global access
 # policy. The global policy cannot be deleted, only updated.
@@ -99,12 +120,14 @@ PY
 }
 
 if [[ "${1:-}" == "--cleanup" ]]; then
-  log "remove Clovisor, its grant, the Actor and the target"
+  log "remove Clovisor, its grant, the Actors and the target"
   ${KATE} delete actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
+  ${KATE} delete actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
+  restore_pool
   grant remove
   ${KATE} get access-policy --global -o yaml 2>/dev/null | grep -q "${PEER}" && { echo "e2e: ${PEER} is still in the global access policy" >&2; exit 1; }
   ${K} delete namespace "${NS}" "${TARGET_NS}" --ignore-not-found --wait=true --timeout=180s >/dev/null
-  info "removed: namespaces ${NS} and ${TARGET_NS}, the Actor ${ATESPACE}/${ACTOR}, ${PEER}'s grant"
+  info "removed: namespaces ${NS} and ${TARGET_NS}, the Actors, ${PEER}'s grant"
   exit 0
 fi
 [[ $# -eq 0 ]] || { echo "usage: $0 [--cleanup]" >&2; exit 2; }
@@ -113,14 +136,48 @@ fi
 # agentctl in Clovisor's pod.
 agentctl() { ${K} -n "${NS}" exec deploy/clovisor -- agentctl "$@"; }
 
-# The run Clovisor started for the Actor's UID, from its log.
+# The run Clovisor started for an Actor's UID, from its log (UID
+# [ATESPACE ACTOR]).
 actor_run() {
   ${K} -n "${NS}" logs deploy/clovisor 2>/dev/null |
-    sed -n "s|.*run api: run \([0-9a-f]*\) for Actor ${ATESPACE}/${ACTOR} (uid $1,.*|\1|p" | tail -1
+    sed -n "s|.*run api: run \([0-9a-f]*\) for Actor ${2:-${ATESPACE}}/${3:-${ACTOR}} (uid $1,.*|\1|p" | tail -1
 }
 
+# actor_uid [ATESPACE ACTOR]
 actor_uid() {
-  ${KATE} get actor "${ACTOR}" -a "${ATESPACE}" -o yaml 2>/dev/null | sed -n 's/^ *uid: *//p' | head -1
+  ${KATE} get actor "${2:-${ACTOR}}" -a "${1:-${ATESPACE}}" -o yaml 2>/dev/null | sed -n 's/^ *uid: *//p' | head -1
+}
+
+# run_timeline RUN FILE: wait for the ended run's timeline, then summarize
+# it into FILE.
+run_timeline() {
+  local tl=""
+  for _ in $(seq 1 30); do
+    if tl=$(agentctl events --json "$1" 2>/dev/null) && [[ -n "${tl}" ]]; then break; fi
+    sleep 3
+  done
+  [[ -n "${tl}" ]] || return 1
+  printf '%s' "${tl}" >"$2.json"
+  python3 - "$2.json" >"$2" <<'PY'
+import json, sys
+tl = json.load(open(sys.argv[1]))
+a = tl.get("actor") or {}
+print("actor", a.get("atespace"), a.get("name"), a.get("uid"), a.get("template"))
+print("end", tl.get("end_reason", ""))
+print("gvisor", sum(1 for e in tl.get("events", []) if e.get("source") == "gvisor"))
+for e in tl.get("events", []):
+    t = e.get("type")
+    if t == "http":
+        print("http", e.get("method"), e.get("dst_name") or e.get("dst_ip"), e.get("dst_port"), e.get("path"),
+              e.get("decision"), e.get("rule", ""), e.get("orig_dst", ""))
+    elif e.get("source") == "gvisor" and t == "exec":
+        print("gvisor-exec", e.get("binary"), "sha256=" + (e.get("sha256") or "-"), "pid=%s" % e.get("pid"),
+              "container=" + (e.get("container") or "-"), "argv=" + " ".join(e.get("args") or []))
+    elif e.get("source") == "gvisor" and t == "connect":
+        print("gvisor-connect", e.get("proto"), "%s:%s" % (e.get("dst_ip"), e.get("dst_port")), e.get("result"))
+    elif e.get("source") == "gvisor":
+        print("gvisor-" + t, e.get("note", ""))
+PY
 }
 
 start_actor() {
@@ -200,7 +257,14 @@ UID1=$(actor_uid)
 info "running, uid ${UID1}"
 
 log "decisions: Substrate allows everything, Clovisor's profile less"
-fetch "http://${TARGET}/"
+# Clovisor was just restarted: the gateway refuses (500) until it has
+# reconnected to the new pod.
+for i in $(seq 1 30); do
+  fetch "http://${TARGET}/"
+  [[ "${CODE}" != 500 ]] && break
+  sleep 1
+done
+[[ "${i}" -gt 1 ]] && info "the gateway reached the new Clovisor pod after ${i} tries"
 expect "GET ${TARGET}/, allowed by whoami-read" 200 "Hostname: whoami"
 fetch "http://${TARGET}/secret"
 expect "GET ${TARGET}/secret, refused with no-secret's narration" 403 "off limits for the demo Actor"
@@ -229,29 +293,14 @@ log "lifecycle: the Actor deleted, its run ends, with its timeline"
 stop_proxy
 ${KATE} suspend actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
 ${KATE} delete actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
-TL=
-for _ in $(seq 1 30); do
-  if TL=$(agentctl events --json "${RUN1}" 2>/dev/null) && [[ -n "${TL}" ]]; then break; fi
-  sleep 3
-done
-if [[ -n "${TL}" ]]; then
-  printf '%s' "${TL}" >"${WORK}/tl.json"
-  python3 - "${WORK}/tl.json" >"${WORK}/tl.txt" <<'PY' || true
-import json, sys
-tl = json.load(open(sys.argv[1]))
-a = tl.get("actor") or {}
-print("actor", a.get("atespace"), a.get("name"), a.get("uid"), a.get("template"))
-print("end", tl.get("end_reason", ""))
-for e in tl.get("events", []):
-    if e.get("type") == "http":
-        print("http", e.get("method"), e.get("dst_name") or e.get("dst_ip"), e.get("dst_port"), e.get("path"),
-              e.get("decision"), e.get("rule", ""), e.get("orig_dst", ""))
-PY
+if run_timeline "${RUN1}" "${WORK}/tl.txt"; then
   sed 's/^/   /' "${WORK}/tl.txt"
   grep -q "^actor ${ATESPACE} ${ACTOR} ${UID1} ${TEMPLATE}" "${WORK}/tl.txt" && pass "the timeline names the Actor, its UID and template" || fail "the timeline's Actor is wrong"
   grep -q "^end .*deleted" "${WORK}/tl.txt" && pass "the run ended because the Actor was deleted" || fail "the run's end reason: $(grep ^end "${WORK}/tl.txt")"
   grep -q "^http GET .* /secret deny no-secret" "${WORK}/tl.txt" && pass "the timeline has the refusal by no-secret" || fail "the timeline lacks the refusal by no-secret"
   grep -q "^http GET ${TARGET} 80 / allow whoami-read ${TARGET_IP}:80" "${WORK}/tl.txt" && pass "the timeline has the allow, with the address the Actor dialed" || fail "the timeline lacks the allow by whoami-read at ${TARGET_IP}:80"
+  # The egress pool keeps Substrate's own worker image: no trace session.
+  grep -q "^gvisor 0$" "${WORK}/tl.txt" && pass "no sandbox events from a pool on Substrate's own worker image" || fail "sandbox events from the egress pool: $(grep ^gvisor "${WORK}/tl.txt")"
 else
   fail "run ${RUN1:-?} has no timeline after the Actor was deleted"
 fi
@@ -316,6 +365,77 @@ for _ in $(seq 1 20); do
   sleep 2
 done
 expect "GET ${TARGET}/ with Clovisor back" 200
+
+log "sandbox audit: what an Actor's gVisor sandbox ran, beside what it sent"
+sed "s|\${CLOVISOR_IMAGE}|${CLOVISOR_IMAGE}|" "${ROOT}/deploy/substrate/sandbox-audit.yaml" | ${K} apply -f - >/dev/null
+${K} -n "${NS}" rollout restart daemonset/clovisor-sandbox >/dev/null
+${K} -n "${NS}" rollout status daemonset/clovisor-sandbox --timeout=180s >/dev/null
+pass "the sandbox sink runs on every node"
+BASE=$(${K} -n "${SBX_NS}" get workerpool "${SBX_POOL}" -o jsonpath="{.metadata.annotations.${ORIG_ANN//./\\.}}")
+[[ -n "${BASE}" ]] || BASE=$(${K} -n "${SBX_NS}" get workerpool "${SBX_POOL}" -o jsonpath='{.spec.workerImage}')
+WORKER="${CLOVISOR_IMAGE%:*}-worker:$(printf '%s' "${BASE}" | sha256sum | cut -c1-12)"
+info "$("${ROOT}/deploy/substrate/worker/build.sh" "${BASE}" "${WORKER}")"
+${K} -n "${SBX_NS}" annotate workerpool "${SBX_POOL}" "${ORIG_ANN}=${BASE}" --overwrite >/dev/null
+${K} -n "${SBX_NS}" patch workerpool "${SBX_POOL}" --type=merge -p "{\"spec\":{\"workerImage\":\"${WORKER}\"}}" >/dev/null
+${K} -n "${SBX_NS}" rollout status "deployment/${SBX_POOL}" --timeout=300s >/dev/null
+[[ "$(${K} -n "${SBX_NS}" get deployment "${SBX_POOL}" -o jsonpath='{.spec.template.spec.containers[0].image}')" == "${WORKER}" ]] &&
+  pass "the ${SBX_NS}/${SBX_POOL} WorkerPool runs ${WORKER}" || fail "the ${SBX_POOL} workers do not run ${WORKER}"
+
+${KATE} delete actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
+${KATE} create actor "${SBX_ACTOR}" -a "${SBX_NS}" --template "${SBX_TEMPLATE}" >/dev/null
+${KATE} resume actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
+printf 'rules:\n- http: {hostnames: ["*"], ports: {all: {}}}\n- https: {hostnames: ["*"]}\n' |
+  ${KATE} create egress-policy "${SBX_ACTOR}" -a "${SBX_NS}" -f - >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+  ${KATE} get actors -a "${SBX_NS}" 2>/dev/null | grep -E "^${SBX_NS} +${SBX_ACTOR} " | grep -q ACTOR_STATE_RUNNING && break
+  sleep 3
+done
+if ${KATE} get actors -a "${SBX_NS}" 2>/dev/null | grep -E "^${SBX_NS} +${SBX_ACTOR} " | grep -q ACTOR_STATE_RUNNING; then
+  pass "a sandbox of Clovisor's worker image starts (restored from the template's snapshot)"
+else
+  fail "the sandbox Actor did not reach RUNNING: $(${K} -n "${NS}" logs daemonset/clovisor-sandbox --tail=5 2>&1)"
+fi
+SUID=$(actor_uid "${SBX_NS}" "${SBX_ACTOR}")
+${KATE} proxy actor "${SBX_ACTOR}" "${SBX_PORT}:80" -a "${SBX_NS}" >"${WORK}/pf-sbx.log" 2>&1 &
+PF=$!
+# run CMD...: the Actor runs CMD. EXIT, OUT and ERR are its result.
+run_cmd() {
+  local req out
+  req=$(python3 -c 'import json,sys; print(json.dumps({"command": sys.argv[1:]}))' "$@")
+  out=$(curl -s -m 60 -X POST "http://localhost:${SBX_PORT}/process" -H 'Content-Type: application/json' -d "${req}" || true)
+  EXIT=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1] or "{}").get("exitCode", "none"))' "${out}" 2>/dev/null || echo none)
+  OUT=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1] or "{}").get("stdout", ""))' "${out}" 2>/dev/null || true)
+  ERR=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1] or "{}"); print(d.get("stderr", "") + d.get("error", ""))' "${out}" 2>/dev/null || true)
+}
+for _ in $(seq 1 30); do
+  run_cmd true
+  [[ "${EXIT}" == 0 ]] && break
+  sleep 1
+done
+run_cmd wget -q -O- "http://${TARGET}/"
+[[ "${EXIT}" == 0 ]] && grep -q "Hostname: whoami" <<<"${OUT}" && pass "the Actor ran wget, and its GET ${TARGET}/ was allowed" || fail "wget ${TARGET}/: exit ${EXIT}: ${ERR:0:200}"
+run_cmd wget -q -O- "http://${TARGET}/secret"
+[[ "${EXIT}" != 0 ]] && grep -q "403" <<<"${ERR}" && pass "its wget of /secret was refused at the gateway (403)" || fail "wget ${TARGET}/secret: exit ${EXIT}: ${OUT:0:120} ${ERR:0:200}"
+SRUN=$(actor_run "${SUID}" "${SBX_NS}" "${SBX_ACTOR}")
+[[ -n "${SRUN}" ]] && pass "Clovisor's run ${SRUN} is the sandbox Actor (uid ${SUID})" || fail "no run in Clovisor for uid ${SUID}"
+stop_proxy
+${KATE} suspend actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
+${KATE} delete actor "${SBX_ACTOR}" -a "${SBX_NS}" >/dev/null 2>&1 || true
+if [[ -n "${SRUN}" ]] && run_timeline "${SRUN}" "${WORK}/sbx.txt"; then
+  grep -v "^gvisor-exec .*argv=true$" "${WORK}/sbx.txt" | sed 's/^/   /' | head -30
+  # The binary is the file run, symlinks resolved: Alpine's wget is busybox.
+  grep -qE "^gvisor-exec /\S+ sha256=[0-9a-f]{64} .*argv=wget -q -O- http://${TARGET}/$" "${WORK}/sbx.txt" &&
+    pass "the timeline has the wget the sandbox ran, its argv and binary hash" || fail "the timeline lacks the sandbox's exec of wget"
+  grep -q "^gvisor-connect TCP ${TARGET_IP}:80 " "${WORK}/sbx.txt" &&
+    pass "the timeline has the sandbox's connect to ${TARGET_IP}:80" || fail "the timeline lacks the sandbox's connect to ${TARGET_IP}:80"
+  grep -q "^http GET ${TARGET} 80 / allow whoami-read" "${WORK}/sbx.txt" && grep -q "^http GET ${TARGET} 80 /secret deny no-secret" "${WORK}/sbx.txt" &&
+    pass "beside the gateway's decisions on the same requests" || fail "the timeline lacks the gateway's decisions"
+  grep -q "^gvisor-gap" "${WORK}/sbx.txt" && fail "sandbox events were lost: $(grep ^gvisor-gap "${WORK}/sbx.txt")" || pass "no sandbox events lost"
+else
+  fail "run ${SRUN:-?} has no timeline after the sandbox Actor was deleted"
+fi
+REFUSED=$(${K} -n "${NS}" logs daemonset/clovisor-sandbox 2>/dev/null | grep -c "refused a sandbox" || true)
+[[ "${REFUSED}" == 0 ]] && pass "the sink attributed every sandbox that connected" || fail "the sink refused ${REFUSED} sandboxes: $(${K} -n "${NS}" logs daemonset/clovisor-sandbox | grep 'refused a sandbox' | tail -2)"
 
 log "result: ${PASSED} passed, ${FAILED} failed"
 [[ "${FAILED}" == 0 ]]

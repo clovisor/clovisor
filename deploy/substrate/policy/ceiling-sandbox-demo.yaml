@@ -1,0 +1,7 @@
+# Substrate's sandbox demo (milestone 7.5): its Actors run what they are
+# sent, so they show what a sandbox ran beside what it sent.
+kind: ProfileCeiling
+metadata: { name: sandbox-demo }
+spec:
+  appliesTo: { atespace: ate-demo-sandbox, actorTemplate: sandbox-template }
+  default: egress-demo

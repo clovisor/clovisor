@@ -59,6 +59,7 @@ type NodeAgent struct {
 	running    bool
 	limiter    *Limiter
 	limitDone  chan struct{}
+	sandbox    *SandboxReceiver
 }
 
 // NodeAgentOptions configures where run timelines go.
@@ -74,6 +75,10 @@ type NodeAgentOptions struct {
 	Identity string
 	// Gateway is the ext_proc listener for Substrate's gateway.
 	Gateway GatewayTLS
+	// Sandbox, with Substrate identity, takes the sandbox sinks' points
+	// (milestone 7.5). Files left empty are the Gateway's; Peers defaults
+	// to SandboxSinkPeer.
+	Sandbox GatewayTLS
 	// Actor identity: the Actor CA, the proxy listener's own certificate
 	// (Actors connect to it over TLS), the SPIFFE trust domain
 	// (DefaultActorTrustDomain if empty), Substrate's API, and how often
@@ -473,6 +478,29 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		}
 		fmt.Printf("substrate: ext_proc for Substrate's egress gateway on %s (TLS; clients %v)\n", opts.Gateway.Addr, peers)
 	}
+	var sandbox *SandboxReceiver
+	if opts.Sandbox.Addr.IsValid() {
+		if !gateway {
+			return nil, fmt.Errorf("the sandbox audit (-sandbox-listen) needs Substrate identity: its points name Actors")
+		}
+		sb := opts.Sandbox
+		if sb.CertFile == "" {
+			sb.CertFile, sb.KeyFile = opts.Gateway.CertFile, opts.Gateway.KeyFile
+		}
+		if sb.ClientCA == "" {
+			sb.ClientCA = opts.Gateway.ClientCA
+		}
+		if len(sb.Peers) == 0 {
+			sb.Peers = []string{SandboxSinkPeer}
+		}
+		sandbox = NewSandboxReceiver(api, directory, httpEvents)
+		if err := sandbox.Listen(sb); err != nil {
+			api.Close()
+			closeAudit()
+			return nil, fmt.Errorf("sandbox audit: %w", err)
+		}
+		fmt.Printf("sandbox: points from gVisor sandboxes' sinks on %s (TLS; clients %v)\n", sb.Addr, sb.Peers)
+	}
 
 	var gw *MCPGateway
 	if opts.MCPListen.IsValid() {
@@ -492,6 +520,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	}
 
 	na := &NodeAgent{
+		sandbox:    sandbox,
 		mcp:        gw,
 		resolver:   resolver,
 		identity:   opts.Identity,
@@ -848,6 +877,9 @@ func (na *NodeAgent) Stop() error {
 	if na.extproc != nil {
 		na.extproc.Close()
 	}
+	if na.sandbox != nil {
+		na.sandbox.Close()
+	}
 	if na.mcp != nil {
 		na.mcp.Close()
 	}
@@ -910,6 +942,13 @@ func (na *NodeAgent) Run() error {
 	}
 	if na.resolver != nil {
 		go na.resolver.Serve()
+	}
+	if na.sandbox != nil {
+		go func() {
+			if err := na.sandbox.Serve(); err != nil {
+				fmt.Fprintf(os.Stderr, "sandbox audit: %v\n", err)
+			}
+		}()
 	}
 	if na.relay != nil {
 		go na.relay.Serve()

@@ -78,7 +78,13 @@ var ErrActorNotFound = errors.New("no such Actor")
 // no older than maxAge (0: ask now).
 type ActorDirectory interface {
 	Actor(ctx context.Context, ref ActorRef, maxAge time.Duration) (ActorInfo, error)
+	// ActorByUID finds a live Actor by its UID (milestone 7.5: a sandbox
+	// names only that); ErrActorNotFound if Substrate has none.
+	ActorByUID(ctx context.Context, uid string) (ActorInfo, error)
 }
+
+// actorListMinAge is how often a miss may list every Actor again.
+const actorListMinAge = 5 * time.Second
 
 // SubstrateOptions reach Substrate's Control API.
 type SubstrateOptions struct {
@@ -99,6 +105,10 @@ type substrateDirectory struct {
 	mu      sync.Mutex
 	cache   map[ActorRef]cachedActor
 	timeout time.Duration
+	// byUID is every Actor, as last listed.
+	byUID  map[string]ActorInfo
+	listed time.Time
+	listMu sync.Mutex // one listing at a time
 }
 
 type cachedActor struct {
@@ -363,4 +373,55 @@ func splitXFCC(s string, sep byte) []string {
 		}
 	}
 	return append(out, s[start:])
+}
+
+func (d *substrateDirectory) ActorByUID(ctx context.Context, uid string) (ActorInfo, error) {
+	d.mu.Lock()
+	a, ok := d.byUID[uid]
+	d.mu.Unlock()
+	if ok {
+		return a, nil
+	}
+	d.listMu.Lock()
+	defer d.listMu.Unlock()
+	d.mu.Lock()
+	a, ok = d.byUID[uid]
+	fresh := time.Since(d.listed) < actorListMinAge
+	d.mu.Unlock()
+	switch {
+	case ok:
+		return a, nil
+	case fresh:
+		return ActorInfo{}, ErrActorNotFound
+	}
+	all := map[string]ActorInfo{}
+	token := ""
+	for {
+		cctx, cancel := context.WithTimeout(ctx, d.timeout)
+		resp, err := d.client.ListActors(cctx, &substrateapi.ListActorsRequest{
+			Options: &substrateapi.ListOptions{PageSize: 1000, PageToken: token}})
+		cancel()
+		if err != nil {
+			return ActorInfo{}, fmt.Errorf("Substrate's API: %w", err)
+		}
+		for _, x := range resp.GetActors() {
+			m := x.GetMetadata()
+			info := ActorInfo{ActorRef: ActorRef{Atespace: m.GetAtespace(), Name: m.GetName()}, UID: m.GetUid(),
+				Template: x.GetActorTemplate().GetName(),
+				State:    strings.TrimPrefix(x.GetStatus().GetState().String(), "ACTOR_STATE_")}
+			if info.UID != "" {
+				all[info.UID] = info
+			}
+		}
+		if token = resp.GetNextPageToken(); token == "" {
+			break
+		}
+	}
+	d.mu.Lock()
+	d.byUID, d.listed = all, time.Now()
+	d.mu.Unlock()
+	if a, ok := all[uid]; ok {
+		return a, nil
+	}
+	return ActorInfo{}, ErrActorNotFound
 }

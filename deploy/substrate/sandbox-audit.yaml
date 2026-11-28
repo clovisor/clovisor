@@ -1,0 +1,98 @@
+# Clovisor's sandbox audit (milestone 7.5): a sink on every Worker node that
+# receives the gVisor Runtime Monitoring points of the node's Actor sandboxes
+# and forwards them to Clovisor (clovisor.yaml, -sandbox-listen), which puts
+# them in each Actor's run.
+#
+# Sandboxes send points only from Worker images started with Clovisor's trace
+# session (worker/build.sh); a WorkerPool opts in by naming such an image. A
+# sandbox of that image does not start unless this sink is up on its node, so
+# it runs everywhere Worker pods may, before them.
+#
+# Worker pods mount the node's /var/lib/ate. The sink keeps its socket and the
+# trace session in /var/lib/ate/clovisor. It knows each sandbox's Actor by the
+# runsc that connects: its -root is /var/lib/ate/actors/<actor UID>/runsc-state.
+# Reading that command line needs the node's PID namespace (hostPID).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clovisor-sandbox
+  namespace: clovisor-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: clovisor-sandbox
+  namespace: clovisor-system
+  labels:
+    app: clovisor-sandbox
+spec:
+  selector:
+    matchLabels:
+      app: clovisor-sandbox
+  template:
+    metadata:
+      labels:
+        app: clovisor-sandbox
+    spec:
+      serviceAccountName: clovisor-sandbox
+      automountServiceAccountToken: false
+      hostPID: true
+      # Wherever Worker pods run, tainted sandbox nodes included.
+      tolerations:
+      - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+      - name: sink
+        image: ${CLOVISOR_IMAGE}
+        imagePullPolicy: Always
+        command: ["/usr/local/bin/sandbox-sink"]
+        args:
+        - -dir=/var/lib/ate/clovisor
+        - -actors-dir=/var/lib/ate/actors
+        - -forward=https://clovisor.clovisor-system.svc:9444
+        - -cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+        - -ca=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Root, for a socket only runsc (root in Worker pods) may reach, in
+        # a node directory root owns. No capabilities.
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        readinessProbe:
+          exec:
+            command: ["test", "-S", "/var/lib/ate/clovisor/gvisor.sock"]
+          periodSeconds: 5
+        volumeMounts:
+        - { name: clovisor, mountPath: /var/lib/ate/clovisor }
+        - { name: podidentity, mountPath: /run/podidentity.podcert.ate.dev, readOnly: true }
+        - { name: servicedns, mountPath: /run/servicedns.podcert.ate.dev, readOnly: true }
+      volumes:
+      - name: clovisor
+        hostPath:
+          path: /var/lib/ate/clovisor
+          type: DirectoryOrCreate
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+      - name: servicedns
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem

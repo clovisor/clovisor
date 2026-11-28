@@ -27,7 +27,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Control_GetActor_FullMethodName = "/substrate.ateapi.v1.Control/GetActor"
+	Control_GetActor_FullMethodName   = "/substrate.ateapi.v1.Control/GetActor"
+	Control_ListActors_FullMethodName = "/substrate.ateapi.v1.Control/ListActors"
 )
 
 // ControlClient is the client API for Control service.
@@ -35,6 +36,8 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type ControlClient interface {
 	GetActor(ctx context.Context, in *GetActorRequest, opts ...grpc.CallOption) (*Actor, error)
+	// Milestone 7.5: the sandbox audit knows an Actor only by its UID.
+	ListActors(ctx context.Context, in *ListActorsRequest, opts ...grpc.CallOption) (*ListActorsResponse, error)
 }
 
 type controlClient struct {
@@ -55,11 +58,23 @@ func (c *controlClient) GetActor(ctx context.Context, in *GetActorRequest, opts 
 	return out, nil
 }
 
+func (c *controlClient) ListActors(ctx context.Context, in *ListActorsRequest, opts ...grpc.CallOption) (*ListActorsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListActorsResponse)
+	err := c.cc.Invoke(ctx, Control_ListActors_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
 type ControlServer interface {
 	GetActor(context.Context, *GetActorRequest) (*Actor, error)
+	// Milestone 7.5: the sandbox audit knows an Actor only by its UID.
+	ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -72,6 +87,9 @@ type UnimplementedControlServer struct{}
 
 func (UnimplementedControlServer) GetActor(context.Context, *GetActorRequest) (*Actor, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetActor not implemented")
+}
+func (UnimplementedControlServer) ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListActors not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -112,6 +130,24 @@ func _Control_GetActor_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_ListActors_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListActorsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).ListActors(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_ListActors_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).ListActors(ctx, req.(*ListActorsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -122,6 +158,10 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetActor",
 			Handler:    _Control_GetActor_Handler,
+		},
+		{
+			MethodName: "ListActors",
+			Handler:    _Control_ListActors_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

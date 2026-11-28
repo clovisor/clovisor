@@ -14,6 +14,8 @@ option go_package = "github.com/clovisor/clovisor/libclovisor/substrateapi";
 
 service Control {
   rpc GetActor(GetActorRequest) returns (Actor);
+  // Milestone 7.5: the sandbox audit knows an Actor only by its UID.
+  rpc ListActors(ListActorsRequest) returns (ListActorsResponse);
 }
 
 message ObjectRef {
@@ -50,4 +52,20 @@ enum ActorState {
   ACTOR_STATE_CRASHED = 5;
   ACTOR_STATE_DELETING = 6;
   ACTOR_STATE_REVERTING = 7;
+}
+
+// An empty atespace lists every atespace's Actors.
+message ListActorsRequest {
+  string atespace = 1;
+  ListOptions options = 2;
+}
+
+message ListOptions {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListActorsResponse {
+  repeated Actor actors = 1;
+  string next_page_token = 2;
 }

@@ -70,6 +70,8 @@ var (
 	gwKey       = flag.String("gateway-key", "", "Substrate identity: the key for -gateway-cert, if not in it")
 	gwCA        = flag.String("gateway-client-ca", "", "Substrate identity: the CA of the gateway's client certificate (PEM)")
 	gwPeers     = flag.String("gateway-peers", clovisor.SubstratePeer, "Substrate identity: comma-separated URI names a client certificate must carry one of")
+	sbListen    = flag.String("sandbox-listen", "", "Substrate identity: take gVisor sandbox points from Clovisor's sandbox sinks over TLS here, e.g. 0.0.0.0:9444 (the -gateway-cert and -gateway-client-ca serve it)")
+	sbPeers     = flag.String("sandbox-peers", clovisor.SandboxSinkPeer, "Substrate identity: comma-separated URI names a sink's client certificate must carry one of")
 )
 
 // defaultEnvoyUIDs is the uid of the official Envoy image's user when the
@@ -177,6 +179,7 @@ func main() {
 		ActorCheck:       *actorCheck,
 		Gateway: clovisor.GatewayTLS{Addr: addrFlag("-gateway-listen", *gwListen), CertFile: *gwCert, KeyFile: *gwKey,
 			ClientCA: *gwCA, Peers: splitList(*gwPeers)},
+		Sandbox: clovisor.GatewayTLS{Addr: addrFlag("-sandbox-listen", *sbListen), Peers: splitList(*sbPeers)},
 		Substrate: clovisor.SubstrateOptions{Addr: *subAddr, CAFile: *subCA, ServerName: *subName,
 			CertFile: *subCert, KeyFile: *subKey, Insecure: *subPlain},
 	})

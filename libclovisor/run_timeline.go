@@ -397,6 +397,14 @@ type TimelineEvent struct {
 	// model events (milestone 5.3): the model a request named.
 	Model string `json:"model,omitempty"`
 	Note  string `json:"note,omitempty"`
+	// Sandbox audit (milestone 7.5): "gvisor" for what a gVisor sandbox
+	// reported, with an exec's binary hash and working directory, the
+	// container, and a connect's result.
+	Source    string `json:"source,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+	Container string `json:"container,omitempty"`
+	Result    string `json:"result,omitempty"`
 }
 
 type contentKey struct{ host, layer, rule, reason string }
@@ -746,13 +754,17 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 		st.tl.Summary.Execs++
 		st.binaries[d.BinaryPath] = struct{}{}
 		st.add(TimelineEvent{
-			Time:     ev.Timestamp,
-			Type:     "exec",
-			PID:      ev.PID,
-			PPID:     d.PPID,
-			CgroupID: ev.CgroupID,
-			Binary:   d.BinaryPath,
-			Args:     d.Args,
+			Time:      ev.Timestamp,
+			Type:      "exec",
+			PID:       ev.PID,
+			PPID:      d.PPID,
+			CgroupID:  ev.CgroupID,
+			Binary:    d.BinaryPath,
+			Args:      d.Args,
+			Source:    d.Source,
+			SHA256:    d.SHA256,
+			Cwd:       d.Cwd,
+			Container: d.Container,
 		}, r.MaxEvents)
 
 	case EventConnect:
@@ -807,15 +819,18 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 			ds.names[name] = struct{}{}
 		}
 		st.add(TimelineEvent{
-			Time:     ev.Timestamp,
-			Type:     "connect",
-			PID:      ev.PID,
-			CgroupID: ev.CgroupID,
-			Proto:    d.Protocol,
-			DstIP:    d.DstIP,
-			DstPort:  d.DstPort,
-			DstName:  name,
-			Verdict:  d.Verdict,
+			Time:      ev.Timestamp,
+			Type:      "connect",
+			PID:       ev.PID,
+			CgroupID:  ev.CgroupID,
+			Proto:     d.Protocol,
+			DstIP:     d.DstIP,
+			DstPort:   d.DstPort,
+			DstName:   name,
+			Verdict:   d.Verdict,
+			Source:    d.Source,
+			Result:    d.Result,
+			Container: d.Container,
 		}, r.MaxEvents)
 
 	case EventMCP:
@@ -1166,6 +1181,17 @@ func (r *RunRecorder) Handle(ev AuditEvent) (*RunTimeline, error) {
 		}
 		st.add(TimelineEvent{Time: ev.Timestamp, Type: "socket", PID: ev.PID, CgroupID: ev.CgroupID,
 			Verdict: d.Verdict, Note: note}, r.MaxEvents)
+
+	case EventSandboxLost:
+		d := ev.Data.(SandboxLostData)
+		st := r.state(ev, "")
+		if st == nil {
+			return nil, nil
+		}
+		st.gap = true
+		st.tl.LostEvents += uint64(d.Count)
+		st.add(TimelineEvent{Time: ev.Timestamp, Type: "gap", CgroupID: ev.CgroupID, Source: "gvisor",
+			Note: fmt.Sprintf("%d sandbox events lost: %s", d.Count, d.Why)}, r.MaxEvents)
 
 	case EventDrop:
 		d := ev.Data.(DropData)

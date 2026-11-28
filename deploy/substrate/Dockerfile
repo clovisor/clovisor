@@ -1,9 +1,9 @@
 # Clovisor beside Agent Substrate's egress gateway (milestone 7.4): the
 # node agent in Substrate identity, which serves only ext_proc, and
-# agentctl, for kubectl exec. Built by `make substrate-image`, with
+# agentctl, for kubectl exec; and the sandbox sink (7.5), for the DaemonSet. Built by `make substrate-image`, with
 # dist/substrate, where it puts static binaries, as the context.
 FROM debian:bookworm-slim
-COPY node-agent agentctl /usr/local/bin/
+COPY node-agent agentctl sandbox-sink /usr/local/bin/
 USER 65532:65532
 # The node agent makes these below the volumes mounted at /run/clovisor
 # and /var/lib/clovisor, whose mount points it cannot chmod.

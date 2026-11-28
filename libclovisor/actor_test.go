@@ -21,6 +21,8 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,6 +147,7 @@ type fakeControl struct {
 	actors map[ActorRef]ActorInfo
 	fail   bool
 	calls  atomic.Int32
+	lists  atomic.Int32
 }
 
 func (f *fakeControl) GetActor(_ context.Context, r *substrateapi.GetActorRequest) (*substrateapi.Actor, error) {
@@ -163,6 +166,38 @@ func (f *fakeControl) GetActor(_ context.Context, r *substrateapi.GetActorReques
 		ActorTemplate: &substrateapi.ObjectRef{Atespace: a.Atespace, Name: a.Template},
 		Status:        &substrateapi.ActorStatus{State: substrateapi.ActorState(substrateapi.ActorState_value["ACTOR_STATE_"+a.State])},
 	}, nil
+}
+
+func toActor(a ActorInfo) *substrateapi.Actor {
+	return &substrateapi.Actor{
+		Metadata:      &substrateapi.ResourceMetadata{Atespace: a.Atespace, Name: a.Name, Uid: a.UID},
+		ActorTemplate: &substrateapi.ObjectRef{Atespace: a.Atespace, Name: a.Template},
+		Status:        &substrateapi.ActorStatus{State: substrateapi.ActorState(substrateapi.ActorState_value["ACTOR_STATE_"+a.State])},
+	}
+}
+
+// ListActors pages two at a time, to exercise the client's paging.
+func (f *fakeControl) ListActors(_ context.Context, r *substrateapi.ListActorsRequest) (*substrateapi.ListActorsResponse, error) {
+	f.lists.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return nil, grpcstatus.Error(codes.Unavailable, "down")
+	}
+	var all []ActorInfo
+	for _, a := range f.actors {
+		all = append(all, a)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].UID < all[j].UID })
+	start, _ := strconv.Atoi(r.GetOptions().GetPageToken())
+	resp := &substrateapi.ListActorsResponse{}
+	for i := start; i < len(all) && i < start+2; i++ {
+		resp.Actors = append(resp.Actors, toActor(all[i]))
+	}
+	if start+2 < len(all) {
+		resp.NextPageToken = strconv.Itoa(start + 2)
+	}
+	return resp, nil
 }
 
 func (f *fakeControl) set(a ActorInfo) {

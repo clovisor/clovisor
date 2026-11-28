@@ -17,23 +17,30 @@ import (
 const (
 	EventExec = iota
 	EventConnect
-	EventRunStart   // a run cgroup (agents/<name>) was created
-	EventRunEnd     // a run cgroup was removed; always the run's last event
-	EventDNS        // a resolver reply delivered to a socket in a run
-	EventHTTP       // a request through the node's proxy, and its decision
-	EventMCP        // an MCP operation through the local gateway, and its decision
-	EventDrop       // packets from a run the backstop dropped (milestone 3.3)
-	EventSocket     // a socket refused at creation, connect or send (milestones 4.1, 4.3)
-	EventUnix       // a Unix socket outside the run, first use (milestone 4.2)
-	EventExecPath   // an exec's resolved path, first use per verdict (milestone 4.4)
-	EventContent    // content rules matched a request, or its body could not be checked (milestone 5.1)
-	EventModel      // a request a model rule decided, and the model it named (milestone 5.3)
-	EventUsage      // a budgeted model call's usage and what it was charged (milestone 5.4)
-	EventTLSData    // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
-	EventTLSExit    // a process with TLS probes exited
-	EventTLS        // a request parsed from TLS plaintext
-	EventTLSProgram // a binary with its own TLS stack exec'd in a capturing run, and whether it is probed (milestones 6.3, 6.4)
+	EventRunStart    // a run cgroup (agents/<name>) was created
+	EventRunEnd      // a run cgroup was removed; always the run's last event
+	EventDNS         // a resolver reply delivered to a socket in a run
+	EventHTTP        // a request through the node's proxy, and its decision
+	EventMCP         // an MCP operation through the local gateway, and its decision
+	EventDrop        // packets from a run the backstop dropped (milestone 3.3)
+	EventSocket      // a socket refused at creation, connect or send (milestones 4.1, 4.3)
+	EventUnix        // a Unix socket outside the run, first use (milestone 4.2)
+	EventExecPath    // an exec's resolved path, first use per verdict (milestone 4.4)
+	EventContent     // content rules matched a request, or its body could not be checked (milestone 5.1)
+	EventModel       // a request a model rule decided, and the model it named (milestone 5.3)
+	EventUsage       // a budgeted model call's usage and what it was charged (milestone 5.4)
+	EventTLSData     // plaintext a TLS library wrote or read in a capturing run (milestone 6.2)
+	EventTLSExit     // a process with TLS probes exited
+	EventTLS         // a request parsed from TLS plaintext
+	EventTLSProgram  // a binary with its own TLS stack exec'd in a capturing run, and whether it is probed (milestones 6.3, 6.4)
+	EventSandboxLost // points a gVisor sandbox dropped, or the sink lost (milestone 7.5)
 )
+
+// SandboxLostData is how many of a sandbox's points were lost, and where.
+type SandboxLostData struct {
+	Count uint32
+	Why   string // e.g. "the sandbox dropped them", "the sink could not forward them"
+}
 
 // TLSProgramData is a binary exec'd in a capturing run whose TLS stack is
 // linked into it (milestones 6.3 and 6.4: Go, bundled OpenSSL, Bun,
@@ -130,6 +137,12 @@ type ExecData struct {
 	PID        uint32
 	PPID       uint32
 	Args       []string
+	// From a gVisor sandbox (milestone 7.5): where it came from, the
+	// binary's SHA-256 (hex), the working directory and the container.
+	Source    string
+	SHA256    string
+	Cwd       string
+	Container string
 }
 
 // RunData describes a run cgroup appearing or disappearing.
@@ -148,6 +161,11 @@ type ConnectData struct {
 	// Verdict is what transparent mode did with the connect (milestone
 	// 3.1); empty when it is off.
 	Verdict string
+	// From a gVisor sandbox (milestone 7.5): where it came from, what the
+	// connect returned ("ok", or the errno's name), and the container.
+	Source    string
+	Result    string
+	Container string
 }
 
 // AgentAudit manages audit event collection

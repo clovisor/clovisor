@@ -9,7 +9,8 @@
 # A kind cluster with Agent Substrate for integration/substrate/e2e.sh
 # (milestone 7.4): Substrate at SUBSTRATE_REF, with Clovisor's hook patch
 # (deploy/substrate/ate-setup-hook-attributes.patch), installed with
-# Clovisor as its gateway's additional ext_proc, and its egress demo.
+# Clovisor as its gateway's additional ext_proc, and its egress and sandbox
+# demos.
 #
 #   integration/substrate/setup.sh            # create, or bring up to date
 #   integration/substrate/setup.sh --delete   # delete the cluster and registry
@@ -42,8 +43,14 @@ if [[ "${1:-}" == "--delete" ]]; then
   [[ -d "${SUBSTRATE_DIR}" ]] || die "no Substrate checkout at ${SUBSTRATE_DIR}"
   cd "${SUBSTRATE_DIR}"
   log "delete Substrate and the kind cluster ${KIND_CLUSTER_NAME}"
+  # The registry's images live in an anonymous volume, which Substrate's
+  # script leaves behind (about 0.5 GB a cluster).
+  REGVOL=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/registry"}}{{.Name}}{{end}}{{end}}' kind-registry 2>/dev/null || true)
   go run ./cmd/ate-setup delete all >/dev/null 2>&1 || true
   hack/delete-kind-cluster.sh
+  if [[ -n "${REGVOL}" ]] && docker volume inspect "${REGVOL}" >/dev/null 2>&1; then
+    echo "   the registry's images are left in volume ${REGVOL}: docker volume rm ${REGVOL} to free them"
+  fi
   exit 0
 fi
 [[ $# -eq 0 ]] || die "usage: $0 [--delete]"
@@ -85,6 +92,9 @@ go run ./cmd/ate-setup deploy ate-system --credential-provider='{"name":"k8s.io"
 
 log "install Substrate's egress demo"
 go run ./cmd/ate-setup deploy demo egress
+
+log "install Substrate's sandbox demo (its Actors run what they are sent: the sandbox audit's)"
+go run ./cmd/ate-setup deploy demo sandbox
 
 log "install kubectl-ate"
 go install ./cmd/kubectl-ate

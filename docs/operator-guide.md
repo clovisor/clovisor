@@ -252,7 +252,9 @@ How it works:
   rule: the gateway waits 2s for Clovisor's answer. Rates count
   requests. Response status is not recorded.
 - **Failing closed.** The gateway's filter does not fail open: with
-  Clovisor down, Actors' requests are refused (`500`) until it is back.
+  Clovisor down, Actors' requests are refused (`500`) until it is back,
+  including the first moments after a restart, until the gateway has
+  reconnected to the new pod.
   Run one replica (`strategy: Recreate`): runs are the pod's, and do not
   survive its restart. After a restart, an Actor's next request starts a
   new run.
@@ -273,6 +275,68 @@ filter chain's name. Without the patch, Clovisor cannot know the port,
 and refuses every request (`503`, "did not say which address the Actor
 dialed"), rather than decide on a port the Actor wrote. The patch is
 proposed upstream (design doc, 7.4).
+
+### Sandbox audit (gVisor)
+
+With Clovisor beside Substrate's gateway, an Actor's timeline holds what
+it sent. The sandbox audit (milestone 7.5) adds what its gVisor sandbox
+ran and connected to, from gVisor's Runtime Monitoring: each exec, with
+its path, argv, the binary's SHA-256, cwd and container, and each TCP or
+UDP connect, with its address and result. It is the gVisor counterpart
+of the kernel audit on a node. It is **audit only**: gVisor's points
+cannot refuse anything, and enforcement in the sandbox stays with gVisor
+and Substrate's egress.
+
+Three pieces:
+- **A worker image with Clovisor's trace session.** Substrate passes runsc
+  the flags in its worker image's `internal_flags.json`, with no setting
+  for more. `deploy/substrate/worker/build.sh BASE OUT` builds an image
+  from a WorkerPool's `workerImage` that adds
+  `--pod-init-config=/var/lib/ate/clovisor/session.json` to `create` and
+  `restore`, and changes nothing else. A WorkerPool opts in by naming it:
+  ```sh
+  deploy/substrate/worker/build.sh "$(kubectl -n ate-demo-sandbox get workerpool sandbox-workerpool -o jsonpath='{.spec.workerImage}')" \
+    localhost:5001/clovisor-worker:1
+  kubectl -n ate-demo-sandbox patch workerpool sandbox-workerpool --type=merge -p '{"spec":{"workerImage":"localhost:5001/clovisor-worker:1"}}'
+  ```
+  Rebuild it when Substrate's worker image changes.
+- **A sink on every node** (`deploy/substrate/sandbox-audit.yaml`, a
+  DaemonSet). Worker pods mount the node's `/var/lib/ate`. The sink puts
+  its socket and the trace session in `/var/lib/ate/clovisor`, and each
+  sandbox connects as runsc creates or restores it. The sink knows the
+  Actor from that runsc's command line: Substrate runs it with
+  `-root /var/lib/ate/actors/<actor UID>/runsc-state`. Reading the
+  command line needs the node's PID namespace (`hostPID`). The sink runs
+  as root, with no capabilities, so that only runsc (root in Worker pods)
+  can reach its socket. It forwards to Clovisor over mTLS with its
+  podidentity certificate (`clovisor-sandbox`).
+- **Clovisor** takes the points on `-sandbox-listen` (9444 in
+  `clovisor.yaml`), from `-sandbox-peers` only. It records them in the
+  Actor's run, the same run as the Actor's egress. A sandbox can run
+  before the Actor sends anything, so Clovisor can also start the run,
+  finding the Actor by UID with Substrate's `ListActors` (a viewer may).
+
+What to know:
+- **Fail closed at start.** A sandbox started with the trace session
+  does not start, or restore, unless its node's sink accepts it. That is
+  how a run with no audit is ruled out, and it is also a dependency: with
+  the sink down, Actors of opted-in pools cannot start or resume on that
+  node. A sandbox the sink cannot attribute is refused the same way.
+- **Fail open after.** Once connected, a sandbox keeps running if the
+  sink or Clovisor goes away. Points gVisor could not deliver, and points
+  the sink could not forward, are counted and recorded in the timeline as
+  a `gap`, and the timeline is not `complete`.
+- **Snapshots.** Actors start by restoring a snapshot, on any Worker. A
+  restored sandbox opens a new session, and its processes continue the
+  timeline. Snapshots taken before a pool opted in restore with the
+  session too.
+- **The binary is the file run,** symlinks resolved: Alpine's `wget` is
+  `/bin/busybox`, with argv `wget …`.
+- **What is not covered:** exits, file access and other syscalls (the
+  session asks only for exec, socket and connect); micro-VM sandboxes;
+  and pools on Substrate's own image.
+- **Before removing the sink,** put opted-in pools back on Substrate's
+  image (`make substrate-clean` does).
 
 ### Directories
 
@@ -1631,7 +1695,19 @@ DOCKER="sudo docker" make integration    # end to end in Docker
 DOCKER="sudo docker" make integration-transparent  # transparent mode; Linux, privileged
 DOCKER="sudo docker" make integration-actors       # Actor identity alone (make integration runs it too)
 DOCKER="sudo docker" make substrate-e2e            # beside Substrate's gateway, on kind (below)
+DOCKER="sudo docker" make sandbox-runsc            # the sandbox sink against real gVisor, no cluster
 ```
+
+`make sandbox-runsc` (`integration/substrate/runsc-sink.sh`) runs the
+gVisor release Substrate pins (its SHA-256 checked), as Substrate's
+workers run it, with Clovisor's sink and trace session. A busybox sandbox
+runs `wget` every 2 seconds; it is checkpointed as one Actor's and
+restored as another's. It checks that the sandbox starts, checkpoints and
+restores; that each Actor's execs arrive with argv and busybox's SHA-256,
+and its connects as TCP with `ENETUNREACH`; that the restored processes
+continue the first's; that no points are lost; and that a sandbox the
+sink cannot attribute, or one with no sink, does not start. It needs
+Linux, sudo and Docker.
 
 The Actor suite (milestone 7.3) plays Actors with curl and certificates
 from a test Actor CA, against a fake of Substrate's Control API. It checks:
@@ -1686,7 +1762,19 @@ It checks:
   refused at the handshake;
 - an Actor created again under the same name gets a new run; with
   Clovisor scaled to zero, requests are refused, and pass again once it
-  is back.
+  is back;
+- the sandbox audit, on Substrate's sandbox demo:
+  - the sink runs on every node, and the demo's pool rolls onto a worker
+    image derived from its own;
+  - a sandbox Actor starts from the template's snapshot and runs `wget`.
+    Its GET is allowed and its `/secret` refused at the gateway;
+  - its timeline holds the exec (binary, argv, SHA-256), the connect from
+    inside the sandbox, and the gateway's decisions. No events are lost,
+    and the sink refuses no sandbox;
+  - an Actor of a pool on Substrate's own image sends no sandbox events.
+
+`substrate-clean` also puts the sandbox pool back on Substrate's image,
+before the sink goes.
 
 The integration tests are self-contained once their images are built.
 Credential identity needs no privileges. They start three containers:

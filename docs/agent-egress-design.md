@@ -5502,6 +5502,142 @@ Still to do:
 - the enforcement receipt for an ActorTemplate (`agentctl explain` by
   atespace and template).
 
+#### 7.5 status (2026-11-28)
+
+**Revised on the way in:** no Substrate change is needed to start. 7.0
+found Substrate starts sandboxes with no trace session, and that every
+sandbox's container id is `_sandbox`. 7.5 was to wait for Substrate to
+add a session that names the Actor. A spike with runsc 20261102.0 (the
+release Substrate's default SandboxConfig pins) found three things:
+- **A session survives checkpoint and restore.** The sink stays connected
+  across a checkpoint. A sandbox restored with `--pod-init-config` opens
+  a new session, and its processes continue. That holds for a snapshot
+  taken without a session too, as Substrate's existing golden snapshots
+  were.
+- **The Actor is the connecting runsc's `-root`.** The process that
+  connects to the sink is `runsc create`/`restore`, waiting for the
+  handshake. Substrate runs it with
+  `-root /var/lib/ate/actors/<actor UID>/runsc-state`
+  (`ateletpath.ActorPath`). `SO_PEERCRED` and `/proc/<pid>/cmdline` name
+  the Actor.
+- **Flags and the socket can be reached without Substrate's code.**
+  runsc's flags come from `internal_flags.json` in the worker image's ko
+  data, with no setting for more, but a WorkerPool names its own
+  `workerImage`. Worker pods mount the node's `/var/lib/ate`, where a
+  node-level sink can put its socket.
+
+Decided: a derived worker image now, with the upstream ask drafted; a
+per-node sink that forwards to the central Clovisor, so an Actor's
+sandbox events and egress decisions are one timeline; and Clovisor's own
+copy of gVisor's point protos, keeping Go 1.26 (gvisor.dev needs 1.27).
+
+Implemented:
+- **`libclovisor/gvisorpoints`**: `common`, `container`, `sentry` and
+  `syscall.proto` from gVisor's `pkg/sentry/seccheck/points` at
+  release-20261102.0, with only `go_package` and the import path changed
+  (`make gvisorpoints`).
+- **The sink** (`cmd/sandbox-sink`, `SandboxSink`, Linux).
+  - It writes the trace session: exec with `binary_info` and
+    `binary_sha256`, socket exit, connect exit; context time, group,
+    parent group, container and cwd.
+  - It listens on a `SOCK_SEQPACKET` socket, mode 0600, and attributes
+    each connection before the handshake. One it cannot attribute is
+    refused, so the sandbox does not start.
+  - It decodes the remote sink's framing: an 8-byte header with its own
+    size, the type and the points dropped, then the point.
+  - A connect is TCP or UDP by the socket's type, remembered per thread
+    group and fd, and IP if unknown. Unix connects are skipped. The
+    result is the errno's name.
+- **Forwarding** (`SandboxForwarder`): batches of up to 512, every 250ms,
+  over mTLS with the sink's podidentity certificate, verifying Clovisor's
+  servicedns certificate against the current CA. It never blocks a
+  sandbox. What it cannot send it counts per Actor, and reports later.
+- **The central receiver** (`SandboxReceiver`, `-sandbox-listen`) admits
+  only `clovisor-sandbox`'s certificate.
+  - Events go to the Actor's run by UID. A run is started for an Actor
+    not yet seen, found by `ListActors`, which was added to the Substrate
+    API copy. The listing is paged and cached, and repeated at most every
+    5s on a miss. Events for an Actor Substrate lacks are counted, not
+    recorded.
+  - Exec and connect events carry `source: gvisor`, the hash, cwd,
+    container and result. Lost points are a `gap`, and the timeline is not
+    `complete`.
+- **Kubernetes**: `deploy/substrate/worker/build.sh` (the flag on
+  `create` and `restore`, nothing else); `sandbox-audit.yaml`
+  (DaemonSet: hostPID, the `/var/lib/ate/clovisor` hostPath, root with
+  no capabilities, every node); `clovisor.yaml` with port 9444. The
+  sandbox demo's ceiling is in the example policy.
+
+Tests:
+- `TestActorUIDFromArgs`: `-root` and `--root=` forms; not runsc;
+  outside the Actors' directory; `..`; another suffix; not a UID.
+  Without the runsc check, it fails.
+- `TestPointDecoder`: exec with hash, TCP socket and its refused connect,
+  IPv6 on an unknown socket, a Unix connect skipped, dropped points, and
+  malformed headers.
+- `TestSandboxSink`, over a real socket: the session's endpoint and
+  points; the socket's mode; a sandbox's points attributed; a peer that is
+  not an Actor's runsc gets no handshake. Without the refusal, it fails.
+- `TestSandboxReceiver`, sink to timeline over mTLS: another workload's
+  certificate refused; the Actor found by UID across three pages and its
+  run started; an unknown UID unattributed; the timeline's exec,
+  connect and gap, and not complete. Without the UID lookup, it fails.
+- `TestSandboxSessionFields`: the session names only fields gVisor has.
+  The first session asked for `thread_group_id`, which gVisor calls
+  `group_id`. Every sandbox then started and sent nothing, and only the
+  real-runsc run showed it.
+- `make sandbox-runsc`, the sink against runsc 20261102.0 (13 passed):
+  - start, checkpoint and restore;
+  - each Actor's `wget` execs with argv and busybox's SHA-256, and its
+    TCP connects with `ENETUNREACH`;
+  - the restored processes continue the first's, and no points are lost;
+  - a sandbox the sink cannot attribute does not start, and with no sink,
+    none does.
+- `make check` passes.
+- On kind (`make substrate-setup` then `make substrate-e2e`, with
+  Substrate's sandbox demo): 33 passed, the 21 of 7.4 among them.
+  - The sink runs on every node. The derived image is built from the
+    pool's own `workerImage`, and the pool rolls onto it.
+  - A sandbox of it starts, restored from the template's golden snapshot,
+    which was taken before the pool opted in.
+  - The Actor's `wget` of the whoami service is allowed and its `/secret`
+    refused at the gateway.
+  - Its timeline holds the exec (`/bin/busybox`, the file run, with argv
+    `wget …` and its SHA-256), the TCP connect to the service's address
+    from inside the sandbox, and the gateway's allow and deny on the same
+    requests. Nothing was lost, and the sink refused no sandbox.
+  - The egress pool, still on Substrate's own image, sends no sandbox
+    events.
+  - `make substrate-clean` puts the pool back on Substrate's image before
+    removing the sink.
+
+Upstream asks (not filed):
+- **Runsc flags per WorkerPool or SandboxConfig** (or a trace session
+  setting), so no image is derived.
+- **The Actor in the sandbox**: its atespace and name in the sandbox's
+  OCI annotations, or in the session's container id, so attribution
+  needs neither the process's command line nor `ListActors`.
+
+Found on the way:
+- **The binary is the file run.** gVisor resolves symlinks, so Alpine's
+  `wget` is `/bin/busybox`, with argv `wget …`. Profiles and `learn` that
+  key on exec paths see busybox.
+- **A Clovisor restart drops the gateway's connection.** With `Recreate`,
+  the gateway's first requests after the new pod is ready can fail with
+  `500` until it reconnects. The e2e had passed this by timing. It now
+  waits for the reconnect, and the operator guide says so.
+- **Disk.** Substrate's kind registry keeps its images in an anonymous
+  volume, which its delete script leaves behind (about 0.5 GB per
+  cluster). `setup.sh --delete` now names the volume. The first setup with
+  the sandbox demo filled the disk, uploading micro-VM assets to the
+  cluster's object store.
+
+Still to do:
+- exits, file access and other syscalls, which the session does not ask
+  for yet;
+- the sink's own refusals counted in Clovisor's status, not only its log;
+- micro-VM sandboxes, which have no Runtime Monitoring.
+
 ---
 
 ## 11. Non-goals and honest limits

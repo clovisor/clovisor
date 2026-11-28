@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi substrate-image substrate-e2e substrate-setup substrate-clean substrate-delete format doc
+.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi gvisorpoints substrate-image substrate-e2e substrate-setup substrate-clean substrate-delete sandbox-runsc format doc
 
 # Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
 # clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
@@ -128,6 +128,12 @@ integration-actors:
 substrateapi:
 	cd libclovisor/substrateapi && buf generate
 
+# Regenerate Clovisor's copy of gVisor's Runtime Monitoring points
+# (milestone 7.5) from libclovisor/gvisorpoints/*.proto, copied from gVisor
+# release-20261102.0. Needs buf and protoc-gen-go v1.36.4 on PATH.
+gvisorpoints:
+	cd libclovisor/gvisorpoints && buf generate
+
 # Clovisor beside Agent Substrate's egress gateway (milestone 7.4): the
 # image deploy/substrate/clovisor.yaml runs, pushed to SUBSTRATE_REGISTRY
 # (kind's local registry by default), and the end-to-end check on a kind
@@ -136,7 +142,7 @@ SUBSTRATE_REGISTRY ?= localhost:5001
 CLOVISOR_IMAGE ?= $(SUBSTRATE_REGISTRY)/clovisor:$(shell git describe --always --dirty)
 substrate-image:
 	mkdir -p dist/substrate dist/tmp
-	for c in node-agent agentctl; do GOTMPDIR=$(CURDIR)/dist/tmp CGO_ENABLED=0 GOOS=linux GOARCH=$(PKG_ARCH) \
+	for c in node-agent agentctl sandbox-sink; do GOTMPDIR=$(CURDIR)/dist/tmp CGO_ENABLED=0 GOOS=linux GOARCH=$(PKG_ARCH) \
 		$(GO) build -trimpath -o dist/substrate/$$c ./cmd/$$c || exit 1; done
 	$(DOCKER) build -f deploy/substrate/Dockerfile -t $(CLOVISOR_IMAGE) dist/substrate
 	$(DOCKER) push $(CLOVISOR_IMAGE)
@@ -154,6 +160,11 @@ substrate-clean:
 	integration/substrate/e2e.sh --cleanup
 substrate-delete:
 	integration/substrate/setup.sh --delete
+
+# The sandbox sink (milestone 7.5) against real gVisor, no cluster: Linux,
+# sudo and docker (DOCKER="sudo docker" if needed).
+sandbox-runsc:
+	DOCKER="$(DOCKER)" integration/substrate/runsc-sink.sh
 
 # Transparent enforce mode end to end (milestone 3.7): a privileged
 # container sharing the host's cgroup and PID namespaces, BPF, cgroup v2.

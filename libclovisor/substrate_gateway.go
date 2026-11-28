@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -44,6 +43,9 @@ const (
 	// SubstratePeer is the SPIFFE ID of Substrate's egress gateway pods,
 	// from the podidentity signer.
 	SubstratePeer = "spiffe://cluster.local/ns/ate-system/sa/atenet-egress"
+	// SandboxSinkPeer is the SPIFFE ID of Clovisor's sandbox sinks
+	// (milestone 7.5), the clovisor-sandbox ServiceAccount's.
+	SandboxSinkPeer = "spiffe://cluster.local/ns/clovisor-system/sa/clovisor-sandbox"
 	// SubstrateGatewayAPITimeout bounds a call to Substrate's API while
 	// the gateway waits, 2s, for Clovisor's answer: Clovisor answers that
 	// the directory is unavailable rather than letting the gateway time out.
@@ -87,41 +89,18 @@ func substrateActor(id, trustDomain string) (ActorRef, error) {
 
 // ListenGateway serves ext_proc on TCP for Substrate's Envoy.
 func (s *ExtProcServer) ListenGateway(g GatewayTLS) error {
-	if !g.Addr.IsValid() || g.CertFile == "" || g.ClientCA == "" {
-		return errors.New("ext_proc for Substrate needs an address, a certificate and the CA of the gateway's client certificate")
-	}
-	if g.KeyFile == "" {
-		g.KeyFile = g.CertFile
-	}
 	if len(g.Peers) == 0 {
 		g.Peers = []string{SubstratePeer}
-	}
-	files := &gatewayFiles{g: g}
-	if err := files.load(); err != nil {
-		return err
-	}
-	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2"},
-		ClientAuth: tls.RequireAnyClientCert, // verified below, against the current CA
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			c, _ := files.current()
-			return c, nil
-		},
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			_, roots := files.current()
-			return verifyGatewayPeer(cs.PeerCertificates, roots, g.Peers, time.Now())
-		},
-	}
-	ln, err := net.Listen("tcp", g.Addr.String())
-	if err != nil {
-		return fmt.Errorf("ext_proc: listen %s: %w", g.Addr, err)
 	}
 	// TLS under gRPC rather than gRPC's TLS credentials, which refuse a
 	// client that negotiates no ALPN, as Substrate's Envoy cluster does.
 	// Handlers need nothing from the connection: who may call is decided
 	// in the handshake.
-	s.ln = tls.NewListener(ln, cfg)
+	ln, err := listenTLS(g, []string{"h2"})
+	if err != nil {
+		return fmt.Errorf("ext_proc for Substrate: %w", err)
+	}
+	s.ln = ln
 	s.grpc = grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(s.grpc, s)
 	return nil

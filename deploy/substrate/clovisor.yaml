@@ -37,6 +37,10 @@ spec:
   - name: extproc
     port: 9443
     targetPort: extproc
+  # The sandbox sinks' points (milestone 7.5; sandbox-audit.yaml).
+  - name: sandbox
+    port: 9444
+    targetPort: sandbox
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -75,6 +79,8 @@ spec:
         - -gateway-cert=/run/servicedns.podcert.ate.dev/credential-bundle.pem
         - -gateway-client-ca=/run/podidentity.podcert.ate.dev/trust-bundle.pem
         - -gateway-peers=spiffe://cluster.local/ns/ate-system/sa/atenet-egress
+        - -sandbox-listen=0.0.0.0:9444
+        - -sandbox-peers=spiffe://cluster.local/ns/clovisor-system/sa/clovisor-sandbox
         - -substrate-api=dns:///api.ate-system.svc:443
         - -substrate-server-name=api.ate-system.svc
         - -substrate-ca=/run/servicedns.podcert.ate.dev/trust-bundle.pem
@@ -86,6 +92,8 @@ spec:
         ports:
         - name: extproc
           containerPort: 9443
+        - name: sandbox
+          containerPort: 9444
         # Ready once the run API answers, which is after ext_proc listens.
         readinessProbe:
           exec:
