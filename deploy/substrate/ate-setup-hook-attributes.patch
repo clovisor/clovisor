@@ -1,0 +1,14 @@
+diff --git a/cmd/ate-setup/internal/steps/overlay.go b/cmd/ate-setup/internal/steps/overlay.go
+index f2462156..4785a9fe 100644
+--- a/cmd/ate-setup/internal/steps/overlay.go
++++ b/cmd/ate-setup/internal/steps/overlay.go
+@@ -500,6 +500,9 @@ func emitAdditionalEgressExtprocFilter() string {
+     message_timeout: 2s
+     request_attributes:
+     - filter_state['dev.ate.actor.identity']
++    - filter_state['dev.ate.connect.authority']
++    - connection.requested_server_name
++    - xds.filter_chain_name
+     processing_mode:
+       request_header_mode: SEND
+       response_header_mode: SKIP

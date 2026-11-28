@@ -1,0 +1,5 @@
+kind: ProfileCeiling
+metadata: { name: egress-demo }
+spec:
+  appliesTo: { atespace: ate-demo-egress, actorTemplate: egress }
+  default: egress-demo

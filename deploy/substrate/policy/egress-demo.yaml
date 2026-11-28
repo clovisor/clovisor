@@ -1,0 +1,22 @@
+# What Substrate's egress demo Actor gets from Clovisor, beside the
+# allow-everything EgressPolicy the demo gives it in Substrate.
+kind: AgentProfile
+metadata: { name: egress-demo }
+spec:
+  mode: enforce
+  egress:
+    default: deny
+    rules:
+      - name: whoami-read
+        to: { fqdn: ["whoami.egress-target.svc.cluster.local"], ports: [80] }
+        http: { methods: [GET], paths: ["/", "/allowed"] }
+        action: allow
+      - name: no-secret
+        to: { fqdn: ["whoami.egress-target.svc.cluster.local"], ports: [80] }
+        http: { paths: ["/secret"] }
+        action: deny
+        message: "The secret endpoint is off limits for the demo Actor."
+      - name: example-read
+        to: { fqdn: ["example.com"], ports: [443] }
+        http: { methods: [GET] }
+        action: allow

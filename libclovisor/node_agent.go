@@ -68,8 +68,12 @@ type NodeAgentOptions struct {
 	// "credential" (anywhere; a per-run secret in the proxy URL, which is
 	// a claim, design §4.3) or "actor" (Agent Substrate Actors, known by
 	// their mTLS certificates and checked against Substrate, milestone
-	// 7.3). Empty means cgroup on Linux, credential elsewhere.
+	// 7.3), or "substrate" (Actors behind Substrate's egress gateway,
+	// whose Envoy calls ext_proc on Gateway, milestone 7.4). Empty means
+	// cgroup on Linux, credential elsewhere.
 	Identity string
+	// Gateway is the ext_proc listener for Substrate's gateway.
+	Gateway GatewayTLS
 	// Actor identity: the Actor CA, the proxy listener's own certificate
 	// (Actors connect to it over TLS), the SPIFFE trust domain
 	// (DefaultActorTrustDomain if empty), Substrate's API, and how often
@@ -185,10 +189,18 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 		case opts.MCPListen.IsValid():
 			return nil, fmt.Errorf("the MCP gateway does not know Actors yet: leave -mcp-listen unset with Actor identity")
 		}
+	case "substrate":
+		switch {
+		case !opts.Gateway.Addr.IsValid():
+			return nil, fmt.Errorf("Substrate identity needs the ext_proc listener for its gateway (-gateway-listen)")
+		case opts.ProxyListen.IsValid() || opts.MCPListen.IsValid():
+			return nil, fmt.Errorf("behind Substrate's gateway Clovisor has no proxy or MCP gateway of its own: leave -proxy-listen and -mcp-listen unset")
+		}
 	default:
-		return nil, fmt.Errorf("identity must be cgroup, credential or actor, not %q", opts.Identity)
+		return nil, fmt.Errorf("identity must be cgroup, credential, actor or substrate, not %q", opts.Identity)
 	}
-	actor := opts.Identity == "actor"
+	gateway := opts.Identity == "substrate"
+	actor := opts.Identity == "actor" || gateway
 	// Actor identity has no kernel part either: what follows treats it as
 	// credential identity does, except where it says otherwise.
 	credential := opts.Identity == "credential" || actor
@@ -237,7 +249,7 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	if err != nil {
 		return nil, err
 	}
-	if os.Geteuid() != 0 {
+	if os.Geteuid() != 0 && !gateway {
 		fmt.Printf("identity: %s; the node agent runs as uid %d, so the user can stop it or edit its files: policy is advisory\n",
 			opts.Identity, os.Geteuid())
 	} else {
@@ -346,8 +358,16 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 	var actors *ActorVerifier
 	var directory ActorDirectory
 	if actor {
-		if actors, err = NewActorVerifier(opts.ActorCA, opts.ActorTrustDomain); err == nil {
-			directory, err = DialSubstrate(opts.Substrate)
+		if !gateway {
+			actors, err = NewActorVerifier(opts.ActorCA, opts.ActorTrustDomain)
+		}
+		if err == nil {
+			so := opts.Substrate
+			if gateway && so.Timeout == 0 {
+				// Substrate's gateway waits 2s for each answer.
+				so.Timeout = SubstrateGatewayAPITimeout
+			}
+			directory, err = DialSubstrate(so)
 		}
 		if err != nil {
 			api.Close()
@@ -355,7 +375,11 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			return nil, fmt.Errorf("Actor identity: %w", err)
 		}
 		api.EnableActors(directory, opts.ActorCheck)
-		fmt.Printf("actors: certificates from %s (trust domain %s); Substrate's API at %s\n", opts.ActorCA, actors.TrustDomain, opts.Substrate.Addr)
+		if gateway {
+			fmt.Printf("actors: as Substrate's gateway verified them; Substrate's API at %s\n", opts.Substrate.Addr)
+		} else {
+			fmt.Printf("actors: certificates from %s (trust domain %s); Substrate's API at %s\n", opts.ActorCA, actors.TrustDomain, opts.Substrate.Addr)
+		}
 	}
 
 	var xp *ExtProcServer
@@ -432,6 +456,22 @@ func NewNodeAgentFromOptions(opts NodeAgentOptions) (*NodeAgent, error) {
 			relay.xp = xp
 			fmt.Printf("quic: relay on 127.0.0.1:%d and [::1]:%d; UDP 443 from runs is decided by server name\n", t.QUICPort, t.QUICPort)
 		}
+	}
+
+	if gateway {
+		xp = NewExtProcServer(api, "", httpEvents)
+		xp.Gateway = &SubstrateGateway{TrustDomain: opts.ActorTrustDomain}
+		xp.Directory = directory
+		if err := xp.ListenGateway(opts.Gateway); err != nil {
+			api.Close()
+			closeAudit()
+			return nil, err
+		}
+		peers := opts.Gateway.Peers
+		if len(peers) == 0 {
+			peers = []string{SubstratePeer}
+		}
+		fmt.Printf("substrate: ext_proc for Substrate's egress gateway on %s (TLS; clients %v)\n", opts.Gateway.Addr, peers)
 	}
 
 	var gw *MCPGateway

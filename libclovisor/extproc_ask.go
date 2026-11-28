@@ -64,6 +64,13 @@ func (s *ExtProcServer) ask(ctx context.Context, d *HTTPData, ed policy.Effectiv
 		d.Message = fmt.Sprintf("%s needs a person's approval (profile %s), and this node agent takes none.", what, hit.Layer)
 		return typev3.StatusCode_Forbidden
 	}
+	if s.Gateway != nil {
+		// Substrate's gateway waits 2s for Clovisor's answer, and takes
+		// no request to wait longer.
+		d.Decision, d.Enforced, d.Layer, d.Rule, d.Reason = policy.ActionDeny, true, hit.Layer, hit.Rule, "ask: cannot hold"
+		d.Message = fmt.Sprintf("%s needs a person's approval (profile %s), which Clovisor cannot wait for behind Substrate's gateway.", what, hit.Layer)
+		return typev3.StatusCode_Forbidden
+	}
 	timeout, allowOnTimeout := ed.AskTimeout()
 	extend(ctx, timeout+askMargin)
 	p := PendingAsk{RunID: runID, UID: s.api.ownerOf(runID), Kind: "egress", What: what, Host: policy.NormalizeHost(d.Host),

@@ -27,10 +27,37 @@ const DefaultPolicyDir = "/etc/clovisor/policy"
 // checkTrusted refuses a policy path anyone but root could have written.
 // Ceilings decide who gets which profile; a user able to write one could
 // grant themselves anything.
+//
+// A path on a read-only mount, such as a Kubernetes ConfigMap mounted
+// readOnly, is trusted as its mount is: no one in the container can write
+// it, whatever its modes say. Its symlinks (a ConfigMap's files are) must
+// lead to a read-only mount too, and with requireRoot, to root's files.
+// FUSE does not count: its files are whatever its daemon says.
 func checkTrusted(path string, wantDir, requireRoot bool) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return err
+	}
+	if readOnlyMount(path) {
+		target, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return err
+		}
+		ti, err := os.Stat(target)
+		switch {
+		case err != nil:
+			return err
+		case !readOnlyMount(target):
+			return fmt.Errorf("%s leads to %s, which is not on a read-only mount", path, target)
+		case wantDir && !ti.IsDir():
+			return fmt.Errorf("%s is not a directory", path)
+		case !wantDir && !ti.Mode().IsRegular():
+			return fmt.Errorf("%s is not a regular file", path)
+		}
+		if st, ok := ti.Sys().(*syscall.Stat_t); ok && requireRoot && st.Uid != 0 {
+			return fmt.Errorf("%s is owned by uid %d, not root", target, st.Uid)
+		}
+		return nil
 	}
 	switch {
 	case fi.Mode()&os.ModeSymlink != 0:

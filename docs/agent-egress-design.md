@@ -4980,7 +4980,7 @@ there are going: Agent Substrate.
 | **7.1** | Agent validation | A suite that runs the agents 7.0 says can run in a container (licences, sign-in), with scripted model responses that call tools. Each agent's run must be recorded, governed and learned like the stand-ins. Fixes for what it finds. Each agent's visibility (Phase 6) documented. *Revised after 7.0:* all four CLIs and LangGraph run against the spike's mock (`spikes/phase7/mockmodel`), so 7.1 turns the opt-in `agents` checks into asserted ones. It adds what each agent reaches besides its model, and the settings that stop that (Claude Code's `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`), to the operator guide, and lets learn draft them. | The agents people use are known to work, and how. |
 | **7.2** | Hardening | CI on x86 and arm64, and on kernels from the documented floor. A review of identity across every proxy hop, explicit mode included, with a test per hop. The legacy packages removed, or fenced out of the build. Packaging: a systemd unit, Envoy setup, a distribution package. *Revised after 7.0:* CI is running (x86 and arm64, without BPF LSM). Envoy moves to 1.39 or later, and tunnel pools are keyed with `envoy.hashable_string`, as Substrate's are, in place of 6.6's `upstream_server_name`. | A node can be installed, upgraded and trusted. |
 | **7.3** | Actor identity | A third identity mode beside cgroup and credential: the Actor, read from Substrate's certificate and checked against its API, as its gateway does. The Actor is the run: its timeline spans suspend, resume and Worker moves. Profiles bound by ActorTemplate and atespace: the `namespace` and `serviceAccount` selectors the compiler rejects today. *Revised after 7.0:* confirmed that an Actor keeps its UID across suspend, resume and Worker moves. Also **sessions inside a run**: a run API op that mints a session (a nested run with a credential and no process), accepted by the proxy only from a socket in the run's cgroup and decided by the run's and the session's policy together, so that one process's sessions can be told apart and only narrowed. | Clovisor's records and receipts for Actors. |
-| **7.4** | Substrate egress policy | Clovisor's `ext_proc` as Substrate's egress policy point, in place of `EgressPolicy` or beside it. MCP gateway and tool policy for Actors' remote MCP. The receipt for an ActorTemplate. *Revised after 7.0:* beside it. Substrate's Envoy mode has no hook for another policy point, so 7.4 starts by proposing one upstream: a second `ext_proc` on the egress chains, after Substrate's, given the identity Substrate verified. A local patch to Substrate's xDS proves it first. | Clovisor's policy for agents on Kubernetes, with Substrate's enforcement. |
+| **7.4** | Substrate egress policy | Clovisor's `ext_proc` as Substrate's egress policy point, in place of `EgressPolicy` or beside it. MCP gateway and tool policy for Actors' remote MCP. The receipt for an ActorTemplate. *Revised after 7.0:* beside it. Substrate's Envoy mode has no hook for another policy point, so 7.4 starts by proposing one upstream: a second `ext_proc` on the egress chains, after Substrate's, given the identity Substrate verified. A local patch to Substrate's xDS proves it first. *Revised in 7.4:* Substrate has since added the hook (`--experimental-additional-egress-extproc-service`); 7.4 uses it, with a 3-line patch for the dialed address, proposed upstream. | Clovisor's policy for agents on Kubernetes, with Substrate's enforcement. |
 | **7.5** | Sandbox audit | If 7.0 finds it fit: exec and connect from gVisor Runtime Monitoring, attributed to Actors, in timelines. The equivalent of Phase 1's kernel audit, for gVisor. *Revised after 7.0:* fit, audit only, and needing Substrate to start each Actor's sandbox with a trace session, on restore too, that names the Actor. Optional, after 7.3; it waits on that change. | What Actors ran, not only what they sent. |
 | **7.6** | Tests and docs | Integration tests on a local cluster with Substrate. Operator guide for Kubernetes, and for each validated agent. | Phase 7 ships. |
 
@@ -5347,6 +5347,156 @@ Still to do:
   starts a new run;
 - the MCP gateway still knows a session as its run: with cgroup identity
   it identifies by cgroup alone, and it does not know Actors.
+
+#### 7.4 status (2026-11-28)
+
+**Revised on the way in:** Substrate has the hook already. 7.0 found no
+way for another policy point into Envoy mode. Since then, Substrate's
+`ate-setup` has gained
+`--experimental-additional-egress-extproc-service=NS/SVC:PORT` (see
+Substrate's `docs/security/extensibility.md`, "Augment"). It adds an
+`ext_proc` filter after Substrate's own on the two chains that read
+requests: `egress_tls_mitm` (TLS the gateway terminates) and
+`egress_cleartext`. The filter is called over mTLS, with the gateway's
+podidentity certificate, verifying the processor's servicedns
+certificate. It sends request headers only, and the Actor's identity as
+the attribute `filter_state['dev.ate.actor.identity']`. It does not
+fail open. A request Substrate denies never reaches it. So 7.4 needs
+no second hook, only a smaller change to the one that exists.
+
+Implemented:
+- **Substrate identity** (`-identity substrate`). The node agent serves
+  only ext_proc, on TLS (`-gateway-listen`, `-gateway-cert`,
+  `-gateway-client-ca`, `-gateway-peers`), with no Envoy, proxy or kernel
+  part of its own.
+  - The listener requires a client certificate from the podidentity CA
+    naming `atenet-egress`'s ServiceAccount.
+  - TLS sits under gRPC rather than in gRPC's credentials, which refuse
+    a client that negotiates no ALPN. Substrate's generated cluster sets
+    none.
+  - Certificates are read again as their files change.
+- **Identity from Substrate's Envoy.** The Actor is parsed from the
+  identity attribute, as 7.3 parses an Actor certificate's URI. It is
+  then looked up in Substrate's API and run by its UID, through the same
+  code as Actor identity.
+  - No header counts. Clovisor's own internal headers, which its Envoy
+    writes and strips, are the Actor's here: the inner-hop and
+    transparent paths are off.
+- **The dialed port.** Substrate's gateway dials the port the Actor
+  dialed, and decides on it. A port in the `Host` is never checked.
+  Clovisor does the same, from `filter_state['dev.ate.connect.authority']`,
+  and records the dialed address. Without that attribute, it refuses the
+  request (`503`) rather than decide on a port the Actor wrote.
+- **Headers only.** Policy that needs a body (content rules, a model
+  list, a budget) or responses (remote MCP) is refused, as with an
+  unterminated tunnel. So is an ask rule: the gateway waits 2s and takes
+  no longer timeout. Rates count each request as a request, not a
+  connection.
+- **Calls to Substrate's API time out at 1.5s**, inside the hook's 2s
+  message timeout, so an outage is Clovisor's `503` with a reason.
+- **Kubernetes.** `deploy/substrate/` has the manifest, the Dockerfile,
+  an example policy, and the ate-setup patch.
+  - The pod gets servicedns and podidentity certificates as Substrate's
+    own pods do.
+  - The namespace carries `ate.dev/api-access: "true"`, which Substrate's
+    NetworkPolicy admits to its API.
+  - It is ready when `agentctl status` answers.
+  - Clovisor needs `viewer` on Substrate's global access policy.
+    Substrate's `egress_gateway` system role would also read Actors, but
+    it mints Actor credentials, so it is not used.
+- **Policy on a read-only mount.** A ConfigMap volume's files are
+  symlinks in a world-writable directory, so the policy directory check
+  refused it. A path on a read-only mount (Linux, `statfs`) is now
+  trusted as its mount is, and its symlinks must lead to a read-only
+  mount too. Run as root, the files must still be root's. FUSE does not
+  count, since its daemon serves whatever it likes. Owner and mode checks
+  are unchanged everywhere else.
+- **The patch** (`deploy/substrate/ate-setup-hook-attributes.patch`, 3
+  lines): the hook also sends `filter_state['dev.ate.connect.authority']`,
+  `connection.requested_server_name` and `xds.filter_chain_name`.
+
+Upstream proposal (not filed): **"Additional egress ext_proc: send the
+dialed authority, SNI and chain."**
+- The additional processor gets the Actor but not where it is going.
+  The gateway decides and dials on the CONNECT authority's port
+  (`requestDestination` in `egress/request.go`), not the `Host`'s.
+- A processor deciding on the `Host` port decides on a value the Actor
+  wrote, which Substrate's own policy deliberately ignores.
+- The SNI and the chain name tell terminated TLS from cleartext.
+- The same three lines in `emitAdditionalEgressExtprocFilter` make it
+  see what Substrate's own processor sees.
+- Two further asks, larger, for later:
+  - a processing mode with bodies and response headers, for content
+    rules, model lists, budgets and MCP;
+  - a way to see `tls_passthrough` traffic, whose SNI decision is made
+    before any processor is asked.
+
+Tests:
+- `TestSubstrateGateway`, on a fake Substrate API:
+  - an allowed and a denied host;
+  - the dialed port decides, not the `Host`'s (`github.com:443` dialed on
+    8443 is refused; ignoring the attribute, the allowed request fails);
+  - no dialed address is `503`;
+  - no identity attribute is refused, even with Clovisor's internal
+    headers and a proxy credential forged. Without the gateway check on
+    the inner-hop path, the allowed request fails on the forged tunnel
+    header;
+  - an unknown Actor, another trust domain and a workload SPIFFE ID are
+    refused;
+  - a body for a host with content rules is refused, and requests
+    without one, or to other hosts, are not. Without the refusal, the
+    test fails;
+  - an ask rule is refused: the gateway takes no longer wait;
+  - a suspended Actor is refused in its run;
+  - the timeline records the dialed address.
+- `TestGatewayListener`:
+  - the gateway's certificate is admitted, with ALPN and without. Under
+    gRPC's own TLS credentials, the no-ALPN call fails;
+  - another workload's certificate from the same CA, the right name from
+    another CA, and no certificate are each refused. Without the name
+    check, or the chain check, the test fails.
+- `make substrate-e2e`, on kind: Kubernetes v1.37.0, arm64, gVisor;
+  Substrate at 7319f1af, patched, with its egress demo; the real API and
+  certificates. 21 passed:
+  - Substrate's demo policy allows everything. Clovisor's profile allows
+    `GET /` on the whoami service and `GET` on example.com;
+  - `/secret` is `403` with the rule's narration. `/other`, the service by
+    address and port 8080 are `403`;
+  - `https://example.com/` is `200` inside TLS Substrate terminates;
+    `https://www.iana.org/` is `403`;
+  - the Actor deleted, its run ends, and its timeline names the Actor, its
+    UID and template, with every decision and the address dialed;
+  - another workload's podidentity certificate, and none, are refused at
+    the handshake;
+  - an Actor created again gets a new run;
+  - Clovisor scaled to zero, the Actor's request is refused (`500`); with
+    it back, `200`.
+- `make check` and `make cross` pass.
+
+Found on the way:
+- grpc-go's TLS credentials refuse clients without ALPN, and Envoy's
+  cluster sends none. The first gateway call would have failed. The
+  no-ALPN unit test now covers it.
+- Substrate's NetworkPolicy admits API clients by namespace label. A
+  timeout to the API pod's address was the only symptom.
+- With the API down, a 5s lookup let the gateway's 2s message timeout
+  fire first: the Actor saw `504` with no reason.
+- emptyDir mount points cannot be chmodded by a non-root pod: the node
+  agent's runtime and state directories are subdirectories.
+
+Still to do:
+- the upstream proposal, filed when the user decides;
+- Actor runs across a restart: the pod's runs are in memory, so a
+  restart starts new runs, and the old ones' timelines are lost unless
+  the state directory is a volume;
+- more than one replica: an Actor's requests can reach any replica, so
+  runs would need to be shared, or replicas made sticky by Actor;
+- bodies, responses and passthrough TLS, which need Substrate's help
+  (above);
+- MCP and tool policy for Actors' remote MCP, which needs bodies and
+  responses, and the MCP gateway for Actors;
+- the enforcement receipt for an ActorTemplate (`agentctl explain` by
+  atespace and template).
 
 ---
 

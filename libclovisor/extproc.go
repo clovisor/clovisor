@@ -92,6 +92,10 @@ type ExtProcServer struct {
 	// it names exists and is placed.
 	Actors    *ActorVerifier
 	Directory ActorDirectory
+	// Gateway, if set, makes this ext_proc the additional processor of
+	// Substrate's egress gateway (milestone 7.4): the Actor is the one
+	// Substrate's Envoy asserts, and no header from the request counts.
+	Gateway *SubstrateGateway
 
 	events  chan<- AuditEvent
 	dropped atomic.Uint64
@@ -425,6 +429,17 @@ func (s *ExtProcServer) onHeaders(ctx context.Context, req *extprocv3.Processing
 		d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, reason, msg
 		return s.denyStatus(d, o.runID, code), nil
 	}
+	if s.Gateway != nil && (o.mcp != nil || hasBody) {
+		// Substrate's gateway sends Clovisor request headers only. What
+		// needs a body or a response cannot be checked, so is refused,
+		// as an unterminated tunnel's is.
+		what := "the request body (content rules, its model, or a budget)"
+		if o.mcp != nil {
+			what = "its MCP messages and their answers"
+		}
+		return refuse(typev3.StatusCode_Forbidden, "needs the body",
+			fmt.Sprintf("Policy for %s reads %s, which Substrate's gateway does not send to Clovisor, so the request was not sent.", d.Host, what))
+	}
 	enc := ""
 	if hasBody && !o.content && len(o.models) == 0 {
 		// Budgets alone: an encoding that cannot be read only means the
@@ -524,7 +539,8 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		phase, path = policy.PhaseConnect, ""
 		defPort = 443
 	}
-	if headerValue(hm, hdrConnect) != "" && strings.HasPrefix(attribute(req, "source.address"), "envoy://") {
+	gw := s.Gateway != nil
+	if !gw && headerValue(hm, hdrConnect) != "" && strings.HasPrefix(attribute(req, "source.address"), "envoy://") {
 		defPort = 443 // inside a TLS tunnel, a Host without a port means 443
 	}
 	d.Path = path
@@ -535,6 +551,19 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		return s.denyUnrecorded(d, ""), headerOutcome{}
 	}
 	d.Host, d.Port = host, port
+	if gw {
+		// Substrate's gateway dials the port the Actor dialed, whatever
+		// the Host says, and decided on it: so does Clovisor.
+		dialed, err := netip.ParseAddrPort(attribute(req, SubstrateDialedAttr))
+		if err != nil {
+			d.Decision, d.Enforced, d.Reason = policy.ActionDeny, true, "no dialed address"
+			d.Message = "Substrate's gateway did not say which address the Actor dialed, so the port is unknown. " +
+				"Its additional ext_proc must send " + SubstrateDialedAttr + "."
+			return s.denyStatus(d, "", typev3.StatusCode_ServiceUnavailable), headerOutcome{}
+		}
+		d.Port, port, d.OrigDst = dialed.Port(), dialed.Port(), dialed.String()
+		d.SNI = attribute(req, SubstrateSNIAttr)
+	}
 	ip, _ := netip.ParseAddr(host)
 
 	// Identity: the cgroup of the client's socket (Phase 2 finding 1). On
@@ -542,12 +571,14 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 	// internal address; the real client crossed the hop in x-clovisor-client,
 	// which Envoy wrote, overwriting any client value. Attributes cannot be
 	// set by clients, so the header is trusted only there.
-	inner := strings.HasPrefix(attribute(req, "source.address"), "envoy://")
+	// Behind Substrate's gateway, none of this applies: its Envoy writes
+	// none of these headers, so any are the Actor's.
+	inner := !gw && strings.HasPrefix(attribute(req, "source.address"), "envoy://")
 	// Plain HTTP on the transparent listener arrives from the client
 	// itself, but Envoy wrote the client's socket address into a header,
 	// overwriting any client value, since the local address is the
 	// original destination's. Trusted on that route only.
-	transparentHTTP := !inner && attribute(req, "xds.route_name") == TransparentHTTPRoute
+	transparentHTTP := !gw && !inner && attribute(req, "xds.route_name") == TransparentHTTPRoute
 	if inner || transparentHTTP {
 		if o := headerValue(hm, hdrOrigDst); o != "" {
 			d.Transparent, d.OrigDst, d.SNI = true, o, headerValue(hm, hdrSNI)
@@ -581,6 +612,23 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 		dst, err2 = attrAddrPort(req, "destination.address", "destination.port")
 	}
 	switch {
+	case gw:
+		// The Actor Substrate's Envoy verified on the CONNECT; a tunnel
+		// carries one Actor, and every request here is inside one.
+		ref, rerr := substrateActor(attribute(req, SubstrateActorAttr), s.Gateway.TrustDomain)
+		var code typev3.StatusCode
+		var why string
+		runID, runCg, eff, code, why = s.actorRunFor(ctx, ref, rerr, InnerActorMaxAge)
+		if why != "" {
+			d.Decision, d.Enforced, d.Reason, d.Message = policy.ActionDeny, true, "actor: "+why, "Egress refused: "+why+"."
+			if runID != "" {
+				s.record(runCg, runCg, runID, d)
+			} else {
+				log.Printf("ext_proc: refused %s %s:%d%s, recorded in no run: %s", d.Method, d.Host, d.Port, d.Path, d.Reason)
+			}
+			return s.denyStatus(d, runID, code), headerOutcome{}
+		}
+		isRun, cg = true, runCg
 	case s.api.ActorIdentity():
 		// The Actor's certificate chain, as Envoy forwarded it from the
 		// mTLS handshake, or, inside a terminated tunnel, carried from the
@@ -762,7 +810,9 @@ func (s *ExtProcServer) decideHeaders(ctx context.Context, req *extprocv3.Proces
 			// Limits (milestone 5.2). A connection: a CONNECT, or plain
 			// HTTP from the run itself. A request: anything but a CONNECT
 			// Envoy terminates, whose requests come through here one by one.
-			conn := phase == policy.PhaseConnect || !inner
+			// Behind Substrate's gateway every request is inside a tunnel
+			// Clovisor did not see opened.
+			conn := phase == policy.PhaseConnect || (!inner && !gw)
 			reqs := !(phase == policy.PhaseConnect && terminated)
 			if ok, wait := s.checkRates(&d, ed, eff, runID, conn, reqs); !ok {
 				s.record(cg, runCg, runID, d)
@@ -827,12 +877,20 @@ func (s *ExtProcServer) actorRun(ctx context.Context, xfcc string, inner bool) (
 		return "", 0, nil, typev3.StatusCode_ServiceUnavailable, "the proxy has no Actor CA or directory"
 	}
 	ref, err := s.Actors.Verify(xfcc)
-	if err != nil {
-		return "", 0, nil, typev3.StatusCode_Forbidden, err.Error()
-	}
 	var maxAge time.Duration
 	if inner {
 		maxAge = InnerActorMaxAge
+	}
+	return s.actorRunFor(ctx, ref, err, maxAge)
+}
+
+// actorRunFor is actorRun once the Actor is known (or refErr says why not).
+func (s *ExtProcServer) actorRunFor(ctx context.Context, ref ActorRef, refErr error, maxAge time.Duration) (runID string, runCg uint64, eff *policy.Effective, code typev3.StatusCode, why string) {
+	if refErr != nil {
+		return "", 0, nil, typev3.StatusCode_Forbidden, refErr.Error()
+	}
+	if s.Directory == nil {
+		return "", 0, nil, typev3.StatusCode_ServiceUnavailable, "the proxy has no Actor directory"
 	}
 	a, err := s.Directory.Actor(ctx, ref, maxAge)
 	switch {

@@ -88,14 +88,17 @@ type SubstrateOptions struct {
 	CertFile   string // Clovisor's client certificate, if the API asks for one
 	KeyFile    string
 	Insecure   bool // plaintext, for tests only
-
+	// Timeout bounds each call; 5s if 0. Behind Substrate's gateway it
+	// must be shorter than the gateway's wait for Clovisor's answer.
+	Timeout time.Duration
 }
 
 // substrateDirectory asks Substrate's Control API, caching answers briefly.
 type substrateDirectory struct {
-	client substrateapi.ControlClient
-	mu     sync.Mutex
-	cache  map[ActorRef]cachedActor
+	client  substrateapi.ControlClient
+	mu      sync.Mutex
+	cache   map[ActorRef]cachedActor
+	timeout time.Duration
 }
 
 type cachedActor struct {
@@ -138,7 +141,10 @@ func DialSubstrate(o SubstrateOptions) (ActorDirectory, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &substrateDirectory{client: substrateapi.NewControlClient(conn), cache: map[ActorRef]cachedActor{}}, nil
+	if o.Timeout <= 0 {
+		o.Timeout = 5 * time.Second
+	}
+	return &substrateDirectory{client: substrateapi.NewControlClient(conn), cache: map[ActorRef]cachedActor{}, timeout: o.Timeout}, nil
 }
 
 func (d *substrateDirectory) Actor(ctx context.Context, ref ActorRef, maxAge time.Duration) (ActorInfo, error) {
@@ -148,7 +154,7 @@ func (d *substrateDirectory) Actor(ctx context.Context, ref ActorRef, maxAge tim
 		return c.info, c.err
 	}
 	d.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	a, err := d.client.GetActor(ctx, &substrateapi.GetActorRequest{Actor: &substrateapi.ObjectRef{Atespace: ref.Atespace, Name: ref.Name}})
 	var info ActorInfo

@@ -173,12 +173,106 @@ bin/node-agent -identity actor \
   and `session` are refused. The MCP gateway and transparent mode are
   not available. Actor runs do not survive a node agent restart: an
   Actor's next request starts a new run.
-- **Where it sits.** In Agent Substrate, the egress gateway is
-  Substrate's. 7.3 runs Clovisor's own mTLS listener, tested with a fake
-  of Substrate's API. Placing Clovisor beside Substrate's gateway is
-  milestone 7.4. `libclovisor/substrateapi` holds the part of Substrate's
-  API Clovisor calls, copied from its `ateapi.proto` at 7319f1af
-  (`make substrateapi` regenerates it).
+- **Where it sits.** This is Clovisor's own mTLS listener, for Actors
+  sent to it directly. In an Agent Substrate cluster, the egress gateway
+  is Substrate's, and Clovisor sits beside it (Substrate identity, next).
+  `libclovisor/substrateapi` holds the part of Substrate's API Clovisor
+  calls, copied from its `ateapi.proto` at 7319f1af (`make substrateapi`
+  regenerates it).
+
+### Beside Substrate's egress gateway (Substrate identity)
+
+In an Agent Substrate cluster (milestone 7.4), Actors' traffic already
+goes through Substrate's egress gateway, which verifies each Actor's
+certificate and applies its `EgressPolicy`. Clovisor runs beside it, as
+the gateway's additional `ext_proc`. Substrate decides first. Clovisor
+then decides each request Substrate allowed against the Actor's profile,
+narrates its refusals, and keeps each Actor's timeline. There is no
+Envoy of Clovisor's own, and no proxy URL.
+
+`deploy/substrate/` holds the pieces: `clovisor.yaml` (namespace,
+ServiceAccount, Service, Deployment), a `Dockerfile`, and an example
+policy for Substrate's egress demo. To install:
+
+1. Install Substrate with Clovisor as the gateway's additional processor,
+   and with the patch below:
+   ```sh
+   go run ./cmd/ate-setup deploy ate-system ... \
+     --experimental-additional-egress-extproc-service=clovisor-system/clovisor:9443
+   ```
+2. Build and push the image: `make substrate-image` pushes
+   `$(SUBSTRATE_REGISTRY)/clovisor:<git describe>`, by default to kind's
+   registry, `localhost:5001`.
+3. Put the profiles and ceilings in a ConfigMap, then apply the
+   manifest:
+   ```sh
+   kubectl create namespace clovisor-system
+   kubectl -n clovisor-system create configmap clovisor-policy --from-file=deploy/substrate/policy
+   sed "s|\${CLOVISOR_IMAGE}|$IMAGE|" deploy/substrate/clovisor.yaml | kubectl apply -f -
+   ```
+4. Let Clovisor read Actors. Add its pod identity,
+   `user:spiffe://cluster.local/ns/clovisor-system/sa/clovisor`, as a
+   `viewer` in Substrate's global access policy
+   (`kubectl ate update access-policy --global`). Viewer can read; it
+   cannot change anything. Substrate's `egress_gateway` system role
+   would also let Clovisor mint Actor credentials, so do not use it.
+
+How it works:
+
+- **Who may call Clovisor.** ext_proc listens on TLS
+  (`-gateway-listen`). Its certificate is the pod's servicedns
+  certificate for `clovisor.clovisor-system.svc`, which the gateway
+  verifies. Clovisor requires a client certificate from the podidentity
+  CA (`-gateway-client-ca`) naming the gateway,
+  `spiffe://cluster.local/ns/ate-system/sa/atenet-egress`
+  (`-gateway-peers`). Anything else is refused at the handshake. Both
+  certificates rotate, and are read again as they change.
+- **Who the Actor is.** It is whoever Substrate's Envoy says, in the
+  request attribute `filter_state['dev.ate.actor.identity']`. Envoy set
+  that from the certificate it verified on the Actor's CONNECT, and
+  nothing the Actor sends can set it. Every header is the Actor's own,
+  including Clovisor's internal ones, so none of them count.
+- **Where it is going.** The host is the request's, as Substrate decided
+  it. The port is the one the Actor dialed, from
+  `filter_state['dev.ate.connect.authority']`: the gateway dials that
+  port, whatever the `Host` says. Timelines record the dialed address.
+- **Whether it may send** is checked as with Actor identity: Substrate's
+  API says whether the Actor exists and is placed (answers up to 2s old
+  are reused). The run is keyed by the Actor's UID, and ends when
+  Substrate no longer has the Actor. Calls to Substrate's API time out
+  after 1.5s, inside the gateway's 2s wait, so a Substrate outage is
+  Clovisor's `503` with a reason, not a gateway timeout.
+- **What Clovisor sees.** The gateway calls Clovisor on requests it can
+  read: cleartext HTTP, and TLS it terminates (its `egress_tls_mitm`
+  chain). TLS it relays unread (`tls_passthrough` rules) never reaches
+  Clovisor, and neither do requests Substrate refused. Only request
+  headers are sent. A request whose policy needs its body (content
+  rules, a model list, a budget) or its responses (remote MCP) is
+  refused, as with a tunnel Clovisor cannot terminate. So is an ask
+  rule: the gateway waits 2s for Clovisor's answer. Rates count
+  requests. Response status is not recorded.
+- **Failing closed.** The gateway's filter does not fail open: with
+  Clovisor down, Actors' requests are refused (`500`) until it is back.
+  Run one replica (`strategy: Recreate`): runs are the pod's, and do not
+  survive its restart. After a restart, an Actor's next request starts a
+  new run.
+- **Timelines** are written when a run ends, under
+  `/var/lib/clovisor/agent/runs` in the pod, which is an emptyDir in the
+  example; mount a volume there to keep them. Read them with
+  `kubectl -n clovisor-system exec deploy/clovisor -- agentctl events`.
+  `agentctl status` shows the live runs.
+- **Policy** is the ConfigMap, mounted read-only. Clovisor trusts a
+  policy directory on a read-only mount without its usual owner and mode
+  checks: nothing in the pod can write it. Restart the Deployment to load
+  a change.
+
+**The patch.** Substrate's hook (at 7319f1af) sends the additional
+processor only the Actor's identity. `deploy/substrate/ate-setup-hook-attributes.patch`
+makes it also send the dialed address, the TLS server name and the
+filter chain's name. Without the patch, Clovisor cannot know the port,
+and refuses every request (`503`, "did not say which address the Actor
+dialed"), rather than decide on a port the Actor wrote. The patch is
+proposed upstream (design doc, 7.4).
 
 ### Directories
 
@@ -1536,6 +1630,7 @@ make check                               # unit tests and the macOS cross-build
 DOCKER="sudo docker" make integration    # end to end in Docker
 DOCKER="sudo docker" make integration-transparent  # transparent mode; Linux, privileged
 DOCKER="sudo docker" make integration-actors       # Actor identity alone (make integration runs it too)
+DOCKER="sudo docker" make substrate-e2e            # beside Substrate's gateway, on kind (below)
 ```
 
 The Actor suite (milestone 7.3) plays Actors with curl and certificates
@@ -1549,6 +1644,26 @@ from a test Actor CA, against a fake of Substrate's Control API. It checks:
   fails);
 - a suspended Actor is refused and, resumed, is the same run; a deleted
   Actor's run ends with the reason, and its timeline names the Actor.
+
+`make substrate-e2e` (milestone 7.4) needs a kind cluster with Substrate
+installed with the hook patch and
+`--experimental-additional-egress-extproc-service=clovisor-system/clovisor:9443`,
+and its egress demo (`ate-setup deploy demo egress`). It builds and
+pushes the image, deploys Clovisor, grants it viewer, and has a demo
+Actor, which Substrate lets reach anything, fetch URLs
+(`integration/substrate/e2e.sh`). It checks:
+- an allowed path is `200`; a denied one is `403` with the rule's
+  narration; one no rule allows, the service by address, and another
+  port of an allowed host are `403`;
+- inside TLS Substrate terminates, an allowed site is `200` and another
+  `403` (skipped if the cluster cannot reach the internet);
+- deleting the Actor ends its run, whose timeline names the Actor, its
+  UID and template, each decision and the address dialed;
+- another workload's podidentity certificate, and no certificate, are
+  refused at the handshake;
+- an Actor created again under the same name gets a new run; with
+  Clovisor scaled to zero, requests are refused, and pass again once it
+  is back.
 
 The integration tests are self-contained once their images are built.
 Credential identity needs no privileges. They start three containers:

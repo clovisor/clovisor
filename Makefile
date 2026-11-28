@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi format doc
+.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi substrate-image substrate-e2e format doc
 
 # Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
 # clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
@@ -127,6 +127,22 @@ integration-actors:
 # v1.36.4 and protoc-gen-go-grpc v1.5.1 on PATH.
 substrateapi:
 	cd libclovisor/substrateapi && buf generate
+
+# Clovisor beside Agent Substrate's egress gateway (milestone 7.4): the
+# image deploy/substrate/clovisor.yaml runs, pushed to SUBSTRATE_REGISTRY
+# (kind's local registry by default), and the end-to-end check on a kind
+# cluster with Substrate installed (integration/substrate/e2e.sh).
+SUBSTRATE_REGISTRY ?= localhost:5001
+CLOVISOR_IMAGE ?= $(SUBSTRATE_REGISTRY)/clovisor:$(shell git describe --always --dirty)
+substrate-image:
+	mkdir -p dist/substrate dist/tmp
+	for c in node-agent agentctl; do GOTMPDIR=$(CURDIR)/dist/tmp CGO_ENABLED=0 GOOS=linux GOARCH=$(PKG_ARCH) \
+		$(GO) build -trimpath -o dist/substrate/$$c ./cmd/$$c || exit 1; done
+	$(DOCKER) build -f deploy/substrate/Dockerfile -t $(CLOVISOR_IMAGE) dist/substrate
+	$(DOCKER) push $(CLOVISOR_IMAGE)
+
+substrate-e2e: substrate-image
+	CLOVISOR_IMAGE=$(CLOVISOR_IMAGE) integration/substrate/e2e.sh
 
 # Transparent enforce mode end to end (milestone 3.7): a privileged
 # container sharing the host's cgroup and PID namespaces, BPF, cgroup v2.

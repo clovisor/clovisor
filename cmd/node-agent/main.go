@@ -23,7 +23,8 @@ import (
 
 var (
 	identity = flag.String("identity", "", "How runs are known: cgroup (Linux, kernel audit), credential (anywhere, a per-run proxy secret; a claim) "+
-		"or actor (Agent Substrate Actors, by their mTLS certificates, checked against Substrate). Default: cgroup on Linux, credential elsewhere")
+		"actor (Agent Substrate Actors, by their mTLS certificates, checked against Substrate) "+
+		"or substrate (Actors behind Substrate's egress gateway, which calls ext_proc on -gateway-listen). Default: cgroup on Linux, credential elsewhere")
 	rtDir    = flag.String("runtime-dir", "", "Directory for sockets and generated files (default /run/clovisor as root, a per-user directory otherwise)")
 	stDir    = flag.String("state-dir", "", "Directory for timelines, the node CA and tool pins (default /var/lib/clovisor as root, a per-user directory otherwise)")
 	bpfObj   = flag.String("bpf", "libclovisor/ebpf/agent_audit.o", "Path to the compiled audit BPF object (cgroup identity)")
@@ -64,6 +65,11 @@ var (
 	subCert     = flag.String("substrate-cert", "", "Actor identity: the node agent's client certificate for Substrate's API (PEM), if it asks for one")
 	subKey      = flag.String("substrate-key", "", "Actor identity: the key for -substrate-cert")
 	subPlain    = flag.Bool("substrate-insecure", false, "Actor identity: reach Substrate's API in plaintext (tests only)")
+	gwListen    = flag.String("gateway-listen", "", "Substrate identity: where ext_proc serves Substrate's egress gateway over TLS, e.g. 0.0.0.0:9443")
+	gwCert      = flag.String("gateway-cert", "", "Substrate identity: ext_proc's certificate (PEM), which the gateway verifies; may hold the key too")
+	gwKey       = flag.String("gateway-key", "", "Substrate identity: the key for -gateway-cert, if not in it")
+	gwCA        = flag.String("gateway-client-ca", "", "Substrate identity: the CA of the gateway's client certificate (PEM)")
+	gwPeers     = flag.String("gateway-peers", clovisor.SubstratePeer, "Substrate identity: comma-separated URI names a client certificate must carry one of")
 )
 
 // defaultEnvoyUIDs is the uid of the official Envoy image's user when the
@@ -169,6 +175,8 @@ func main() {
 		ActorProxyKey:    *actorKey,
 		ActorTrustDomain: *actorDomain,
 		ActorCheck:       *actorCheck,
+		Gateway: clovisor.GatewayTLS{Addr: addrFlag("-gateway-listen", *gwListen), CertFile: *gwCert, KeyFile: *gwKey,
+			ClientCA: *gwCA, Peers: splitList(*gwPeers)},
 		Substrate: clovisor.SubstrateOptions{Addr: *subAddr, CAFile: *subCA, ServerName: *subName,
 			CertFile: *subCert, KeyFile: *subKey, Insecure: *subPlain},
 	})
