@@ -5,7 +5,7 @@
 # which accompanies this distribution, and is available at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi substrate-image substrate-e2e format doc
+.PHONY: all build clean install package package-test bpf agentctl audit-sink node-agent run run-agent run-proxy envoy check cross integration integration-transparent integration-actors substrateapi substrate-image substrate-e2e substrate-setup substrate-clean substrate-delete format doc
 
 # Compiler and flags. -mcpu=v3 (kernel 5.1, below the 5.12 floor) is
 # clang 19's default; clang 18, Ubuntu 24.04's, defaults to v1, which has
@@ -143,6 +143,17 @@ substrate-image:
 
 substrate-e2e: substrate-image
 	CLOVISOR_IMAGE=$(CLOVISOR_IMAGE) integration/substrate/e2e.sh
+
+# The kind cluster substrate-e2e runs on: Substrate, patched, with Clovisor
+# as its gateway's additional ext_proc, and its egress demo. substrate-clean
+# removes what substrate-e2e leaves (Clovisor, its grant, the target);
+# substrate-delete deletes the cluster.
+substrate-setup:
+	integration/substrate/setup.sh
+substrate-clean:
+	integration/substrate/e2e.sh --cleanup
+substrate-delete:
+	integration/substrate/setup.sh --delete
 
 # Transparent enforce mode end to end (milestone 3.7): a privileged
 # container sharing the host's cgroup and PID namespaces, BPF, cgroup v2.

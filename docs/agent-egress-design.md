@@ -5472,6 +5472,10 @@ Tests:
   - Clovisor scaled to zero, the Actor's request is refused (`500`); with
     it back, `200`.
 - `make check` and `make cross` pass.
+- The cluster is scripted (`make substrate-setup`: Substrate at the
+  pinned commit, patched, the hook, its egress demo), as is undoing it
+  (`make substrate-clean`, `make substrate-delete`). From a deleted
+  cluster and a fresh clone, setup then `make substrate-e2e` passed.
 
 Found on the way:
 - grpc-go's TLS credentials refuse clients without ALPN, and Envoy's

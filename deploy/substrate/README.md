@@ -16,5 +16,7 @@ Actor's timeline.
   dialed. Without it, Clovisor refuses every request.
 
 Install and operation are in `docs/operator-guide.md`, "Beside
-Substrate's egress gateway". The end-to-end check is `make substrate-e2e`
-(`integration/substrate/e2e.sh`).
+Substrate's egress gateway". The end-to-end check is `make substrate-setup`
+then `make substrate-e2e`, and `make substrate-clean` and
+`make substrate-delete` undo them (`integration/substrate/`; operator
+guide §16).

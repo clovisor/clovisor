@@ -1645,13 +1645,36 @@ from a test Actor CA, against a fake of Substrate's Control API. It checks:
 - a suspended Actor is refused and, resumed, is the same run; a deleted
   Actor's run ends with the reason, and its timeline names the Actor.
 
-`make substrate-e2e` (milestone 7.4) needs a kind cluster with Substrate
-installed with the hook patch and
-`--experimental-additional-egress-extproc-service=clovisor-system/clovisor:9443`,
-and its egress demo (`ate-setup deploy demo egress`). It builds and
-pushes the image, deploys Clovisor, grants it viewer, and has a demo
-Actor, which Substrate lets reach anything, fetch URLs
-(`integration/substrate/e2e.sh`). It checks:
+The Substrate check (milestone 7.4) runs on a kind cluster:
+
+```sh
+make substrate-setup     # kind, Substrate (patched) with the hook, its egress demo
+make substrate-e2e       # build and push the image, deploy Clovisor, check
+make substrate-clean     # remove Clovisor, its grant and the target
+make substrate-delete    # delete the cluster and its registry
+```
+
+- `substrate-setup` (`integration/substrate/setup.sh`) fetches Substrate
+  at the pinned commit into `SUBSTRATE_DIR` (default
+  `dist/substrate-src`), applies `deploy/substrate/ate-setup-hook-attributes.patch`,
+  creates the cluster and its registry on `localhost:5001`, installs
+  Substrate with
+  `--experimental-additional-egress-extproc-service=clovisor-system/clovisor:9443`
+  and its egress demo, and installs `kubectl-ate`. Run again, it brings
+  an existing cluster up to date. It needs Docker with buildx, Go,
+  kubectl, curl, and about 10 GB of disk.
+- If your user is not in the `docker` group, put a `docker` on `PATH`
+  that runs `sudo docker`. Substrate's installer calls `docker` itself.
+- `substrate-e2e` (`integration/substrate/e2e.sh`) needs kubectl,
+  `kubectl-ate` on `PATH`, curl, and Python 3 with PyYAML. It deploys
+  Clovisor, grants it viewer, and has a demo Actor, which Substrate lets
+  reach anything, fetch URLs.
+- A run leaves Clovisor deployed, its grant, and the target, for
+  inspection. `substrate-clean` removes the namespaces `clovisor-system`
+  and `egress-target`, the Actor, and Clovisor's grant in Substrate's
+  global access policy.
+
+It checks:
 - an allowed path is `200`; a denied one is `403` with the rule's
   narration; one no rule allows, the service by address, and another
   port of an allowed host are `403`;

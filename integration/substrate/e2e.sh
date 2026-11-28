@@ -14,8 +14,14 @@
 # everything, and Clovisor's profile allows less.
 #
 #   CLOVISOR_IMAGE=localhost:5001/clovisor:<tag> integration/substrate/e2e.sh
+#   integration/substrate/e2e.sh --cleanup
 #
-# KUBECTL_CONTEXT picks the cluster (kind-kind).
+# integration/substrate/setup.sh makes such a cluster. A run leaves Clovisor
+# deployed, granted, and the target running; --cleanup removes them all:
+# the clovisor-system and egress-target namespaces, the Actor, and
+# Clovisor's grant in Substrate's global access policy. KUBECTL_CONTEXT
+# picks the cluster (kind-kind). Needs kubectl, kubectl-ate, curl, and
+# python3 with PyYAML.
 set -o errexit -o nounset -o pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -31,7 +37,11 @@ TARGET=whoami.${TARGET_NS}.svc.cluster.local
 PEER=spiffe://cluster.local/ns/${NS}/sa/clovisor
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/clovisor-e2e.XXXXXX")
 PORT=18199
-: "${CLOVISOR_IMAGE:?set CLOVISOR_IMAGE (make substrate-e2e does)}"
+
+for t in kubectl kubectl-ate curl python3; do
+  command -v "$t" >/dev/null || { echo "e2e: needs $t" >&2; exit 1; }
+done
+python3 -c 'import yaml' 2>/dev/null || { echo "e2e: needs PyYAML (python3 -m pip install pyyaml, or apt install python3-yaml)" >&2; exit 1; }
 
 log()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
@@ -51,6 +61,54 @@ cleanup() {
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
+
+# grant add|remove: Clovisor as a viewer in Substrate's global access
+# policy. The global policy cannot be deleted, only updated.
+grant() {
+  ${KATE} get access-policy --global -o yaml >"${WORK}/global.yaml" 2>/dev/null || true
+  if ! grep -q "^metadata:" "${WORK}/global.yaml"; then
+    [[ "$1" == remove ]] && return 0
+    printf 'metadata:\n  name: default\nbindings:\n- role: viewer\n  members:\n  - user:%s\n' "${PEER}" >"${WORK}/global-new.yaml"
+    ${KATE} create access-policy --global -f "${WORK}/global-new.yaml" >/dev/null
+    return
+  fi
+  python3 - "$1" "${WORK}/global.yaml" "user:${PEER}" >"${WORK}/global-new.yaml" <<'PY'
+import sys, yaml
+op, path, member = sys.argv[1:4]
+doc = yaml.safe_load(open(path)) or {}
+bindings = doc.get("bindings") or []
+if op == "add":
+    for b in bindings:
+        if b.get("role") == "viewer":
+            b.setdefault("members", [])
+            if member not in b["members"]:
+                b["members"].append(member)
+            break
+    else:
+        bindings.append({"role": "viewer", "members": [member]})
+else:
+    for b in bindings:
+        b["members"] = [m for m in b.get("members") or [] if m != member]
+    bindings = [b for b in bindings if b["members"]]
+doc["bindings"] = bindings
+yaml.safe_dump(doc, sys.stdout)
+PY
+  if [[ "$1" == add ]] && grep -q "${PEER}" "${WORK}/global.yaml"; then return; fi
+  if [[ "$1" == remove ]] && ! grep -q "${PEER}" "${WORK}/global.yaml"; then return; fi
+  ${KATE} update access-policy --global -f "${WORK}/global-new.yaml" >/dev/null
+}
+
+if [[ "${1:-}" == "--cleanup" ]]; then
+  log "remove Clovisor, its grant, the Actor and the target"
+  ${KATE} delete actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
+  grant remove
+  ${KATE} get access-policy --global -o yaml 2>/dev/null | grep -q "${PEER}" && { echo "e2e: ${PEER} is still in the global access policy" >&2; exit 1; }
+  ${K} delete namespace "${NS}" "${TARGET_NS}" --ignore-not-found --wait=true --timeout=180s >/dev/null
+  info "removed: namespaces ${NS} and ${TARGET_NS}, the Actor ${ATESPACE}/${ACTOR}, ${PEER}'s grant"
+  exit 0
+fi
+[[ $# -eq 0 ]] || { echo "usage: $0 [--cleanup]" >&2; exit 2; }
+: "${CLOVISOR_IMAGE:?set CLOVISOR_IMAGE (make substrate-e2e does)}"
 
 # agentctl in Clovisor's pod.
 agentctl() { ${K} -n "${NS}" exec deploy/clovisor -- agentctl "$@"; }
@@ -127,29 +185,7 @@ ${K} -n "${NS}" rollout restart deployment/clovisor >/dev/null
 ${K} -n "${NS}" rollout status deployment/clovisor --timeout=180s
 
 log "grant Clovisor read access to Actors (a global viewer)"
-${KATE} get access-policy --global -o yaml >"${WORK}/global.yaml" 2>/dev/null || true
-if grep -q "^metadata:" "${WORK}/global.yaml"; then
-  python3 - "${WORK}/global.yaml" "user:${PEER}" >"${WORK}/global-new.yaml" <<'PY'
-import sys, yaml
-doc = yaml.safe_load(open(sys.argv[1])) or {}
-member = sys.argv[2]
-bindings = doc.get("bindings") or []
-doc["bindings"] = bindings
-for b in bindings:
-    if b.get("role") == "viewer":
-        b.setdefault("members", [])
-        if member not in b["members"]:
-            b["members"].append(member)
-        break
-else:
-    bindings.append({"role": "viewer", "members": [member]})
-yaml.safe_dump(doc, sys.stdout)
-PY
-  grep -q "${PEER}" "${WORK}/global.yaml" || ${KATE} update access-policy --global -f "${WORK}/global-new.yaml" >/dev/null
-else
-  printf 'metadata:\n  name: default\nbindings:\n- role: viewer\n  members:\n  - user:%s\n' "${PEER}" >"${WORK}/global-new.yaml"
-  ${KATE} create access-policy --global -f "${WORK}/global-new.yaml" >/dev/null
-fi
+grant add
 ${KATE} get access-policy --global -o yaml | grep -q "${PEER}" && pass "${PEER} is a global viewer" || fail "the global access policy lacks ${PEER}"
 
 log "an in-cluster target, and the Actor ${ATESPACE}/${ACTOR}"
